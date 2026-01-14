@@ -1,0 +1,140 @@
+// Shadow <mutex> for single-threaded WASM builds (no pthread support)
+// This header completely replaces the standard <mutex> to avoid pthread dependencies
+
+#ifndef WASM_SHADOW_MUTEX_H
+#define WASM_SHADOW_MUTEX_H
+
+// Block the real mutex headers
+#define _LIBCPP_MUTEX
+#define _GLIBCXX_MUTEX 1
+#define _MUTEX_
+
+#include <chrono>
+
+// Simplified approach: everything in std directly
+namespace std {
+
+class mutex {
+public:
+    constexpr mutex() noexcept {}
+    ~mutex() = default;
+    void lock() {}
+    bool try_lock() { return true; }
+    void unlock() {}
+    mutex(const mutex&) = delete;
+    mutex& operator=(const mutex&) = delete;
+};
+
+class recursive_mutex {
+public:
+    recursive_mutex() = default;
+    ~recursive_mutex() = default;
+    void lock() {}
+    bool try_lock() { return true; }
+    void unlock() {}
+    recursive_mutex(const recursive_mutex&) = delete;
+    recursive_mutex& operator=(const recursive_mutex&) = delete;
+};
+
+class timed_mutex {
+public:
+    timed_mutex() = default;
+    ~timed_mutex() = default;
+    void lock() {}
+    bool try_lock() { return true; }
+    void unlock() {}
+    template<class Rep, class Period>
+    bool try_lock_for(const chrono::duration<Rep, Period>&) { return true; }
+    template<class Clock, class Duration>
+    bool try_lock_until(const chrono::time_point<Clock, Duration>&) { return true; }
+};
+
+class recursive_timed_mutex {
+public:
+    recursive_timed_mutex() = default;
+    ~recursive_timed_mutex() = default;
+    void lock() {}
+    bool try_lock() { return true; }
+    void unlock() {}
+    template<class Rep, class Period>
+    bool try_lock_for(const chrono::duration<Rep, Period>&) { return true; }
+    template<class Clock, class Duration>
+    bool try_lock_until(const chrono::time_point<Clock, Duration>&) { return true; }
+};
+
+struct defer_lock_t { explicit defer_lock_t() = default; };
+struct try_to_lock_t { explicit try_to_lock_t() = default; };
+struct adopt_lock_t { explicit adopt_lock_t() = default; };
+
+constexpr defer_lock_t defer_lock {};
+constexpr try_to_lock_t try_to_lock {};
+constexpr adopt_lock_t adopt_lock {};
+
+template<class Mutex>
+class lock_guard {
+public:
+    using mutex_type = Mutex;
+    explicit lock_guard(Mutex&) {}
+    lock_guard(Mutex&, adopt_lock_t) {}
+    ~lock_guard() = default;
+    lock_guard(const lock_guard&) = delete;
+    lock_guard& operator=(const lock_guard&) = delete;
+};
+
+template<class Mutex>
+class unique_lock {
+    bool owns;
+public:
+    using mutex_type = Mutex;
+    unique_lock() noexcept : owns(false) {}
+    explicit unique_lock(Mutex&) : owns(true) {}
+    unique_lock(Mutex&, defer_lock_t) noexcept : owns(false) {}
+    unique_lock(Mutex&, try_to_lock_t) : owns(true) {}
+    unique_lock(Mutex&, adopt_lock_t) : owns(true) {}
+    template<class Rep, class Period>
+    unique_lock(Mutex&, const chrono::duration<Rep, Period>&) : owns(true) {}
+    template<class Clock, class Duration>
+    unique_lock(Mutex&, const chrono::time_point<Clock, Duration>&) : owns(true) {}
+    ~unique_lock() = default;
+    unique_lock(const unique_lock&) = delete;
+    unique_lock& operator=(const unique_lock&) = delete;
+    unique_lock(unique_lock&& u) noexcept : owns(u.owns) { u.owns = false; }
+    unique_lock& operator=(unique_lock&& u) noexcept { owns = u.owns; u.owns = false; return *this; }
+    void lock() { owns = true; }
+    bool try_lock() { owns = true; return true; }
+    template<class Rep, class Period>
+    bool try_lock_for(const chrono::duration<Rep, Period>&) { owns = true; return true; }
+    template<class Clock, class Duration>
+    bool try_lock_until(const chrono::time_point<Clock, Duration>&) { owns = true; return true; }
+    void unlock() { owns = false; }
+    void swap(unique_lock& u) noexcept { bool t = owns; owns = u.owns; u.owns = t; }
+    Mutex* release() noexcept { owns = false; return nullptr; }
+    bool owns_lock() const noexcept { return owns; }
+    explicit operator bool() const noexcept { return owns; }
+    Mutex* mutex() const noexcept { return nullptr; }
+};
+
+template<class... MutexTypes>
+class scoped_lock {
+public:
+    explicit scoped_lock(MutexTypes&...) {}
+    explicit scoped_lock(adopt_lock_t, MutexTypes&...) {}
+    ~scoped_lock() = default;
+    scoped_lock(const scoped_lock&) = delete;
+    scoped_lock& operator=(const scoped_lock&) = delete;
+};
+
+struct once_flag {
+    constexpr once_flag() noexcept = default;
+    once_flag(const once_flag&) = delete;
+    once_flag& operator=(const once_flag&) = delete;
+};
+
+template<class Callable, class... Args>
+void call_once(once_flag&, Callable&& func, Args&&... args) {
+    func(static_cast<Args&&>(args)...);
+}
+
+} // namespace std
+
+#endif // WASM_SHADOW_MUTEX_H

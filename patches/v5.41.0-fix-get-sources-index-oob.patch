@@ -1,0 +1,64 @@
+diff --git a/src/wallet/tx_builder.cpp b/src/wallet/tx_builder.cpp
+index d53d0e2..9c9c1e1 100644
+--- a/src/wallet/tx_builder.cpp
++++ b/src/wallet/tx_builder.cpp
+@@ -410,14 +410,13 @@
+ }
+ //-------------------------------------------------------------------------------------------------------------------
+ std::vector<cryptonote::tx_source_entry>
+-get_sources(const wallet2::transfer_container &transfers,
+-            const std::vector<std::size_t> &selected_transfers,
++get_sources(const std::vector<std::size_t> &selected_transfers,
+             const std::string &source_asset, wallet2 &w) {
+   // DEBUG: Log entry and parameters
+   fprintf(stderr,
+-          "[WASM DEBUG get_sources] ENTER: transfers.size()=%zu, "
+-          "selected_transfers.size()=%zu, source_asset=%s\n",
+-          transfers.size(), selected_transfers.size(), source_asset.c_str());
++          "[WASM DEBUG get_sources] ENTER: selected_transfers.size()=%zu, "
++          "source_asset=%s\n",
++          selected_transfers.size(), source_asset.c_str());
+   for (size_t i = 0; i < selected_transfers.size() && i < 5; ++i) {
+     fprintf(stderr, "[WASM DEBUG get_sources]   selected_transfer[%zu] = %zu\n",
+             i, selected_transfers[i]);
+@@ -449,11 +448,11 @@
+         "[WASM DEBUG get_sources] Processing transfer idx=%zu, out_index=%zu\n",
+         idx, out_index);
+ 
+-    if (idx >= transfers.size()) {
++    if (idx >= w.get_num_transfer_details()) {
+       fprintf(
+           stderr,
+-          "[WASM DEBUG get_sources] ERROR: idx=%zu >= transfers.size()=%zu\n",
+-          idx, transfers.size());
++          "[WASM DEBUG get_sources] ERROR: idx=%zu >= w.get_num_transfer_details()=%zu\n",
++          idx, w.get_num_transfer_details());
+       fflush(stderr);
+     }
+ 
+@@ -459,7 +458,7 @@
+     sources.resize(sources.size() + 1);
+     cryptonote::tx_source_entry &src = sources.back();
+-    const wallet2::transfer_details &td = transfers[idx];
++    const wallet2::transfer_details &td = w.get_transfer_details(idx);
+ 
+     // Sanity check the asset_type for this TD is correct
+     THROW_WALLET_EXCEPTION_IF(td.asset_type != source_asset,
+@@ -668,7 +667,7 @@
+     fflush(stderr);
+ 
+     tx_proposal.sources = get_sources(
+-        unused_transfers, selected_transfer_indices_sorted, "SAL1", w);
++        selected_transfer_indices_sorted, "SAL1", w);
+ 
+     fprintf(stderr,
+             "[WASM DEBUG carrot_tx] get_sources() returned, "
+@@ -887,7 +886,7 @@
+       selected_transfer_indices_sorted.push_back(w.get_transfer_details(ki));
+     }
+     tx_proposal.sources =
+-        get_sources(transfers, selected_transfer_indices_sorted, "SAL1", w);
++        get_sources(selected_transfer_indices_sorted, "SAL1", w);
+   }
+ 
+   CARROT_CHECK_AND_THROW(ki_idx == input_key_images.size(),

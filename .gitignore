@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+output/
+*.o
+*.a
+*.so
+*.wasm
+*.js
+!src/**/*.js
+!src/**/*.wasm
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Dependencies
+node_modules/
+emsdk/
+salvium/
+boost_*
+libsodium-*
+openssl-*
+
+# IDEs
+.vscode/
+.idea/

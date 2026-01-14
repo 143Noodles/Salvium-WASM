@@ -1,0 +1,34 @@
+// Shadow header for Boost System mutex (single-threaded WASM - no-op implementation)
+// This overrides /opt/boost/include/boost/system/detail/mutex.hpp
+
+#ifndef BOOST_SYSTEM_DETAIL_MUTEX_HPP_INCLUDED
+#define BOOST_SYSTEM_DETAIL_MUTEX_HPP_INCLUDED
+
+// For single-threaded WASM, we provide no-op mutex/lock_guard
+namespace boost {
+namespace system {
+namespace detail {
+
+// No-op mutex for single-threaded WASM
+class mutex {
+public:
+    void lock() {}
+    void unlock() {}
+    bool try_lock() { return true; }
+};
+
+// No-op lock_guard for single-threaded WASM
+template<class Mutex>
+class lock_guard {
+public:
+    explicit lock_guard(Mutex&) {}
+    ~lock_guard() {}
+    lock_guard(const lock_guard&) = delete;
+    lock_guard& operator=(const lock_guard&) = delete;
+};
+
+} // namespace detail
+} // namespace system
+} // namespace boost
+
+#endif // BOOST_SYSTEM_DETAIL_MUTEX_HPP_INCLUDED
