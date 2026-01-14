@@ -1,0 +1,8 @@
+temp_check/
+output/
+*.txt
+*.json
+*.cjs
+*.ps1
+build_*.txt
+*.log
