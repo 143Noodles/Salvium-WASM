@@ -41,8 +41,7 @@ class Donna64Scanner {
         if (!version) {
             throw new Error('donna64 not available in WASM module');
         }
-        console.log(`donna64 initialized, version: ${(version >> 16)}.${(version >> 8) & 0xFF}.${version & 0xFF}`);
-        
+
         // Create function wrappers
         this._fastGenerateKeyDerivation = this.module.cwrap('fast_generate_key_derivation', 
             'number', ['number', 'number', 'number']);

@@ -3425,15 +3425,30 @@ void wallet2::process_new_scanned_transaction(
   if (pool && tx_money_spent_in_ins > 0 && m_unconfirmed_txs.count(txid) == 0) {
     // This is a pool TX that spends our outputs but wasn't created by this wallet
     if (m_pool_external_spends.count(txid) == 0) {
+      // Calculate total received in this TX (change for outgoing transactions)
+      uint64_t total_change_received = 0;
+      for (const auto& subaddr_entry : tx_money_got_in_outs) {
+        for (const auto& asset_entry : subaddr_entry.second) {
+          total_change_received += asset_entry.second;
+        }
+      }
+
       pool_external_spend_details details;
       details.m_txid = txid;
-      details.m_amount = tx_money_spent_in_ins;
       details.m_fee = tx.rct_signatures.txnFee;
+      // v5.52.0: Calculate NET amount sent (inputs - change - fee), not gross inputs
+      // This fixes the bug where mempool outgoing TXs showed inputs + change instead of net sent
+      if (tx_money_spent_in_ins > total_change_received + details.m_fee) {
+        details.m_amount = tx_money_spent_in_ins - total_change_received - details.m_fee;
+      } else {
+        // Fallback: shouldn't happen, but just use inputs if calculation seems wrong
+        details.m_amount = tx_money_spent_in_ins;
+      }
       details.m_asset_type = asset_type_spent;
       details.m_timestamp = std::time(nullptr);
       details.m_double_spend_seen = double_spend_seen;
       m_pool_external_spends[txid] = details;
-      LOG_PRINT_L1("Detected external pool spend: " << txid << " amount=" << print_money(tx_money_spent_in_ins));
+      LOG_PRINT_L1("Detected external pool spend: " << txid << " net_amount=" << print_money(details.m_amount) << " (inputs=" << print_money(tx_money_spent_in_ins) << " change=" << print_money(total_change_received) << " fee=" << print_money(details.m_fee) << ")");
     }
   }
 

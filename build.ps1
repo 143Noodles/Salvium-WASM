@@ -31,9 +31,14 @@ Write-Host ""
 Write-Host "Building Docker image (this may take 10-15 minutes on first run)..." -ForegroundColor Yellow
 Write-Host ""
 
-docker build -t $ImageName .
+# Temporarily disable error action preference for docker commands
+# Docker writes progress to stderr which PowerShell treats as errors
+$ErrorActionPreference = "Continue"
+docker build -t $ImageName . 2>&1 | ForEach-Object { Write-Host $_ }
+$buildExitCode = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
 
-if ($LASTEXITCODE -ne 0) {
+if ($buildExitCode -ne 0) {
     Write-Host ""
     Write-Host "ERROR: Docker build failed!" -ForegroundColor Red
     exit 1
@@ -48,17 +53,32 @@ if (-not (Test-Path $OutputDir)) {
 Write-Host ""
 Write-Host "Extracting WASM files to: $OutputDir" -ForegroundColor Yellow
 
-$ContainerId = (docker create $ImageName) | Out-String
+$ErrorActionPreference = "Continue"
+$ContainerId = (docker create $ImageName 2>&1) | Out-String
 $ContainerId = $ContainerId.Trim()
 
 Write-Host "Created container: $ContainerId" -ForegroundColor Gray
 
 try {
-    docker cp "${ContainerId}:/workspace/build/SalviumWallet.js" "$OutputDir\"
-    docker cp "${ContainerId}:/workspace/build/SalviumWallet.wasm" "$OutputDir\"
+    # Use explicit destination paths for Windows compatibility
+    $jsDest = Join-Path $OutputDir "SalviumWallet.js"
+    $wasmDest = Join-Path $OutputDir "SalviumWallet.wasm"
+
+    Write-Host "Copying SalviumWallet.js to $jsDest..." -ForegroundColor Gray
+    docker cp "${ContainerId}:/workspace/build/SalviumWallet.js" "$jsDest" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: docker cp failed for SalviumWallet.js (exit code: $LASTEXITCODE)" -ForegroundColor Red
+    }
+
+    Write-Host "Copying SalviumWallet.wasm to $wasmDest..." -ForegroundColor Gray
+    docker cp "${ContainerId}:/workspace/build/SalviumWallet.wasm" "$wasmDest" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: docker cp failed for SalviumWallet.wasm (exit code: $LASTEXITCODE)" -ForegroundColor Red
+    }
 } finally {
-    docker rm $ContainerId | Out-Null
+    docker rm $ContainerId 2>&1 | Out-Null
 }
+$ErrorActionPreference = "Stop"
 
 # Verify files exist
 $jsFile = Join-Path $OutputDir "SalviumWallet.js"

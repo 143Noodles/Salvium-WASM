@@ -73,17 +73,8 @@ bool WasmFilesystem::initialize(std::function<void(bool success)> callback) {
         
         // Populate from IndexedDB (load existing data)
         FS.syncfs(true, function(err) {
-            if (err) {
-                console.error('IDBFS mount error:', err);
-                // Call C++ callback with failure
-                if (typeof Module._wasm_on_fs_init !== 'undefined') {
-                    Module._wasm_on_fs_init(0);
-                }
-            } else {
-                console.log('IDBFS mounted successfully');
-                if (typeof Module._wasm_on_fs_init !== 'undefined') {
-                    Module._wasm_on_fs_init(1);
-                }
+            if (typeof Module._wasm_on_fs_init !== 'undefined') {
+                Module._wasm_on_fs_init(err ? 0 : 1);
             }
         });
     });
@@ -169,11 +160,6 @@ void WasmFilesystem::request_async_sync() {
             setTimeout(function() {
                 FS.syncfs(false, function(err) {
                     Module._syncPending = false;
-                    if (err) {
-                        console.error('Async IDBFS sync error:', err);
-                    } else {
-                        console.log('IDBFS async sync complete');
-                    }
                 });
             }, 100);  // Small delay to batch multiple requests
         }
@@ -193,15 +179,10 @@ void WasmFilesystem::start_auto_sync() {
                 Module._syncPending = true;
                 FS.syncfs(false, function(err) {
                     Module._syncPending = false;
-                    if (err) {
-                        console.error('Auto-sync error:', err);
-                    } else {
-                        console.log('Auto-sync complete at', new Date().toISOString());
-                    }
                 });
             }
         }, $0);
-        
+
         // Also sync on page unload
         window.addEventListener('beforeunload', function() {
             // Synchronous sync attempt (may not complete)
@@ -209,8 +190,6 @@ void WasmFilesystem::start_auto_sync() {
                 FS.syncfs(false, function(){});
             } catch(e) {}
         });
-        
-        console.log('Auto-sync started, interval:', $0, 'ms');
     }, AUTO_SYNC_INTERVAL_MS);
 #endif
 }
@@ -224,7 +203,6 @@ void WasmFilesystem::stop_auto_sync() {
         if (Module._autoSyncInterval) {
             clearInterval(Module._autoSyncInterval);
             Module._autoSyncInterval = null;
-            console.log('Auto-sync stopped');
         }
     });
 #endif
@@ -416,12 +394,7 @@ void WasmFilesystem::mark_dirty() {
 EM_ASYNC_JS(int, js_sync_filesystem_impl, (int populate), {
     return new Promise((resolve) => {
         FS.syncfs(populate ? true : false, function(err) {
-            if (err) {
-                console.error('IDBFS sync error:', err);
-                resolve(0);
-            } else {
-                resolve(1);
-            }
+            resolve(err ? 0 : 1);
         });
     });
 });
