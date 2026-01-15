@@ -263,17 +263,6 @@ public:
               body_str.c_str());
     }
 
-    // EM_ASM for guaranteed browser console output (use console.error to bypass
-    // filters)
-#ifdef __EMSCRIPTEN__
-    EM_ASM(
-        {
-          console.error('[WASM HTTP] invoke() called for path:',
-                        UTF8ToString($0));
-        },
-        path.c_str());
-#endif
-
     auto &cache = WasmHttpResponseCache::instance();
     std::lock_guard<std::mutex> lock(cache.mutex);
 

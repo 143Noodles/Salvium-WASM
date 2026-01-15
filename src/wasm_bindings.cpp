@@ -351,8 +351,14 @@ using namespace emscripten;
 //               ALL stake return outputs to get zero key_images → spent detection failed.
 //            2. Extended m_confirmed_txs fallback to Carrot PROTOCOL outputs with zero key_images.
 //            Result: ~158k SAL balance inflation fixed.
+// v5.51.0:   Added create_return_transaction_json() for RETURN tx creation
+//            Allows web wallet to return funds to the original sender.
+//            Takes txid (64 hex chars) and finds transfer indices automatically.
+// v5.52.0:   Added create_sweep_all_transaction_json() for sweep_all functionality
+//            Sweeps ALL unlocked outputs to a destination address.
+//            Uses wallet2::create_transactions_all() internally.
 static const char *WASM_VERSION =
-  "5.50.0"; // Fix Carrot stake return key_image - don't clear return_output_map
+  "5.52.0"; // Add create_sweep_all_transaction_json(dest_address, mixin, priority)
 
 #define WASM_DEBUG_LOGGING 0
 #if WASM_DEBUG_LOGGING
@@ -5394,6 +5400,383 @@ public:
     } catch (...) {
       m_last_error = "Unknown exception during stake transaction creation";
       return R"({"status":"error","error":"Unknown exception during stake transaction creation"})";
+    }
+  }
+
+  // ========================================================================
+  // RETURN TRANSACTION - Return funds to original sender
+  // ========================================================================
+  // Creates a RETURN transaction that sends funds back to the sender of
+  // the original transaction. This is used when you want to refund someone
+  // who sent you funds.
+  //
+  // Parameters:
+  //   txid: The transaction hash (64 hex chars) of the incoming transaction to return
+  //
+  // Returns JSON:
+  // Success: {"status":"success","transactions":[{"tx_blob":"...","tx_key":"...","tx_hash":"...","fee":123,"return_amount":456},...]}
+  // Error: {"status":"error","error":"message"}
+  // ========================================================================
+  std::string create_return_transaction_json(const std::string &txid) {
+    if (!m_initialized) {
+      return R"({"status":"error","error":"Wallet not initialized"})";
+    }
+
+    try {
+      if (txid.empty() || txid.length() != 64) {
+        return R"({"status":"error","error":"Invalid txid. Must be 64 hex characters."})";
+      }
+
+      // Convert txid string to crypto::hash
+      crypto::hash target_txid;
+      if (!epee::string_tools::hex_to_pod(txid, target_txid)) {
+        return R"({"status":"error","error":"Invalid txid format. Must be valid hex."})";
+      }
+
+      // Find all transfer indices that belong to this txid
+      std::vector<size_t> transfer_indices;
+      size_t num_transfers = m_wallet->get_num_transfer_details();
+
+      std_cerr << "[WASM DEBUG] Searching " << num_transfers << " transfers for txid " << txid << std::endl;
+
+      for (size_t i = 0; i < num_transfers; ++i) {
+        const auto& td = m_wallet->get_transfer_details(i);
+        if (td.m_txid == target_txid) {
+          // Check if this output is unspent and unlocked
+          if (!td.m_spent && !td.m_frozen && m_wallet->is_transfer_unlocked(td)) {
+            transfer_indices.push_back(i);
+            std_cerr << "[WASM DEBUG] Found matching transfer at index " << i
+                     << ", amount=" << td.amount() << std::endl;
+          } else {
+            std_cerr << "[WASM DEBUG] Skipping transfer at index " << i
+                     << " (spent=" << td.m_spent
+                     << ", frozen=" << td.m_frozen
+                     << ", unlocked=" << m_wallet->is_transfer_unlocked(td) << ")" << std::endl;
+          }
+        }
+      }
+
+      if (transfer_indices.empty()) {
+        return R"({"status":"error","error":"No returnable outputs found for this transaction. The funds may be spent, locked, or not yet confirmed."})";
+      }
+
+      if (transfer_indices.size() > 15) {
+        return R"({"status":"error","error":"Too many outputs in this transaction. Maximum is 15."})";
+      }
+
+      // Calculate total amount being returned (for response)
+      uint64_t total_return_amount = 0;
+      for (size_t idx : transfer_indices) {
+        const auto& td = m_wallet->get_transfer_details(idx);
+        total_return_amount += td.amount();
+      }
+
+      // DEBUG: Log pre-TX state
+      std_cerr << "[WASM DEBUG] About to call create_transactions_return:" << std::endl;
+      std_cerr << "  transfer_indices=[";
+      for (size_t i = 0; i < transfer_indices.size(); ++i) {
+        if (i > 0) std_cerr << ",";
+        std_cerr << transfer_indices[i];
+      }
+      std_cerr << "]" << std::endl;
+      std_cerr << "  total_return_amount=" << total_return_amount << std::endl;
+
+      // Create RETURN transaction using wallet2's create_transactions_return
+      std::vector<tools::wallet2::pending_tx> ptx_vector =
+          m_wallet->create_transactions_return(transfer_indices);
+
+      std_cerr << "[WASM DEBUG] create_transactions_return returned "
+               << ptx_vector.size() << " transactions" << std::endl;
+
+      if (ptx_vector.empty()) {
+        return R"({"status":"error","error":"No return transactions created"})";
+      }
+
+      // Build JSON response with transaction blobs
+      std::ostringstream json;
+      json << R"({"status":"success","transactions":[)";
+
+      bool first = true;
+      for (const auto &ptx : ptx_vector) {
+        if (!first)
+          json << ",";
+        first = false;
+
+        // Convert the signed TX to a hex blob
+        std::string tx_blob = epee::string_tools::buff_to_hex_nodelimer(
+            cryptonote::tx_to_blob(ptx.tx));
+
+        // Get the Tx Key
+        std::string tx_key = key_to_hex((const unsigned char *)&ptx.tx_key);
+
+        // Get tx hash
+        crypto::hash tx_hash;
+        cryptonote::get_transaction_hash(ptx.tx, tx_hash);
+        std::string tx_hash_str = epee::string_tools::pod_to_hex(tx_hash);
+
+        json << "{"
+             << R"("tx_blob":")" << tx_blob << R"(",)"
+             << R"("tx_key":")" << tx_key << R"(",)"
+             << R"("tx_hash":")" << tx_hash_str << R"(",)"
+             << R"("fee":)" << ptx.fee << ","
+             << R"("return_amount":)" << total_return_amount << "}";
+      }
+
+      json << "]}";
+      return json.str();
+
+    } catch (const tools::error::not_enough_money &e) {
+      m_last_error = "Not enough unlocked balance";
+      return R"({"status":"error","error":"Not enough unlocked balance for return transaction."})";
+    } catch (const tools::error::not_enough_unlocked_money &e) {
+      m_last_error = "Not enough unlocked balance";
+      return R"({"status":"error","error":"Not enough unlocked balance. Wait for funds to unlock."})";
+    } catch (const tools::error::tx_not_possible &e) {
+      m_last_error = "Transaction not possible";
+      return R"({"status":"error","error":"Return transaction not possible with current inputs."})";
+    } catch (const tools::error::no_connection_to_daemon &e) {
+      std::string error_details = e.to_string();
+      m_last_error = "no connection to daemon";
+      size_t pos = 0;
+      while ((pos = error_details.find('"', pos)) != std::string::npos) {
+        error_details.replace(pos, 1, "'");
+        pos += 1;
+      }
+      std::ostringstream err;
+      err << R"({"status":"error","error":"no connection to daemon: )"
+          << error_details << R"("})";
+      return err.str();
+    } catch (const std::exception &e) {
+      m_last_error = e.what() ? e.what() : "Unknown error";
+      std::string error_msg = m_last_error;
+      size_t pos = 0;
+      while ((pos = error_msg.find('"', pos)) != std::string::npos) {
+        error_msg.replace(pos, 1, "\\\"");
+        pos += 2;
+      }
+      std::ostringstream err;
+      err << R"({"status":"error","error":")" << error_msg << R"("})";
+      return err.str();
+    } catch (...) {
+      m_last_error = "Unknown exception during return transaction creation";
+      return R"({"status":"error","error":"Unknown exception during return transaction creation"})";
+    }
+  }
+
+  // ========================================================================
+  // SWEEP ALL Transaction Creation
+  // ========================================================================
+  // Creates a transaction that sweeps ALL unlocked funds to a destination address.
+  // This is useful for emptying a wallet or consolidating all outputs.
+  //
+  // Parameters:
+  // - dest_address_str: Destination address (standard or integrated)
+  // - mixin_count_d: Ring size minus 1 (typically 15)
+  // - priority_d: Fee priority (0-3)
+  //
+  // Returns JSON:
+  // Success:
+  // {"status":"success","transactions":[{"tx_blob":"hex...","tx_hash":"hex...","tx_key":"hex...","fee":1234567,"amount":100000000}],"total_amount":123456789,"total_fee":12345}
+  // Error: {"status":"error","error":"error message"}
+  std::string create_sweep_all_transaction_json(
+      const std::string &dest_address_str,
+      double mixin_count_d, double priority_d) {
+    if (!m_initialized) {
+      return R"({"status":"error","error":"Wallet not initialized"})";
+    }
+
+    try {
+      uint32_t mixin_count = static_cast<uint32_t>(mixin_count_d);
+      uint32_t priority = static_cast<uint32_t>(priority_d);
+
+      // WORKAROUND: If the base_fee for the requested priority is 0,
+      // bump up to a priority that has a valid fee.
+      if (m_wallet->get_base_fee(priority) == 0) {
+        for (uint32_t p = priority + 1; p <= 4; ++p) {
+          if (m_wallet->get_base_fee(p) > 0) {
+            priority = p;
+            break;
+          }
+        }
+        if (m_wallet->get_base_fee(priority) == 0) {
+          priority = 2;
+        }
+      }
+
+      // Check if wallet has any balance (sum both SAL and SAL1)
+      uint64_t balance = m_wallet->balance(0, "SAL", false) +
+                         m_wallet->balance(0, "SAL1", false);
+      uint64_t unlocked = m_wallet->unlocked_balance(0, "SAL", false) +
+                          m_wallet->unlocked_balance(0, "SAL1", false);
+
+      if (balance == 0) {
+        return R"({"status":"error","error":"Wallet has no balance. Need to sync first."})";
+      }
+
+      if (unlocked == 0) {
+        return R"({"status":"error","error":"No unlocked balance. Funds may still be locked."})";
+      }
+
+      // Parse destination address
+      cryptonote::address_parse_info info;
+      if (!cryptonote::get_account_address_from_str(info, m_wallet->nettype(),
+                                                    dest_address_str)) {
+        return R"({"status":"error","error":"Invalid destination address"})";
+      }
+
+      // Extra field for payment ID if integrated address
+      std::vector<uint8_t> extra;
+      if (info.has_payment_id) {
+        std::string extra_nonce;
+        cryptonote::set_encrypted_payment_id_to_tx_extra_nonce(extra_nonce,
+                                                               info.payment_id);
+        if (!cryptonote::add_extra_nonce_to_tx_extra(extra, extra_nonce)) {
+          return R"({"status":"error","error":"Failed to add payment ID to extra"})";
+        }
+      }
+
+      // Determine asset type based on hardfork (SAL1 for Carrot, SAL otherwise)
+      const bool is_carrot_hf = m_wallet->get_current_hard_fork() >= 10;
+      std::string asset_type = is_carrot_hf ? "SAL1" : "SAL";
+
+      // Check if this asset type has balance, otherwise try the other
+      uint64_t asset_unlocked = m_wallet->unlocked_balance(0, asset_type, false);
+      if (asset_unlocked == 0) {
+        // Try the other asset type
+        asset_type = (asset_type == "SAL1") ? "SAL" : "SAL1";
+        asset_unlocked = m_wallet->unlocked_balance(0, asset_type, false);
+        if (asset_unlocked == 0) {
+          return R"({"status":"error","error":"No unlocked balance in any asset type"})";
+        }
+      }
+
+      std_cerr << "[WASM DEBUG] About to call create_transactions_all (sweep_all):"
+               << std::endl;
+      std_cerr << "  asset_type=" << asset_type << std::endl;
+      std_cerr << "  mixin_count=" << mixin_count << std::endl;
+      std_cerr << "  priority=" << priority << std::endl;
+      std_cerr << "  dest_address=" << dest_address_str << std::endl;
+
+      // Create sweep_all transaction using wallet2's create_transactions_all
+      // Parameters:
+      // - below: 0 (sweep ALL outputs regardless of size)
+      // - tx_type: TRANSFER
+      // - asset_type: SAL or SAL1 based on hardfork
+      // - address: destination address
+      // - is_subaddress: from address parsing
+      // - outputs: 1 (single output per tx)
+      // - fake_outs_count: mixin count (ring size - 1)
+      // - unlock_time: 0 (no time lock)
+      // - priority: user-specified (0-3)
+      // - extra: payment ID if any
+      // - subaddr_account: 0 (main account)
+      // - subaddr_indices: empty set (use any subaddress)
+      std::vector<tools::wallet2::pending_tx> ptx_vector =
+          m_wallet->create_transactions_all(
+              0, // below = 0 means sweep ALL outputs
+              cryptonote::transaction_type::TRANSFER,
+              asset_type,
+              info.address,
+              info.is_subaddress,
+              1, // outputs per tx
+              mixin_count,
+              0, // unlock_time
+              priority,
+              extra,
+              0, // subaddr_account
+              {} // subaddr_indices (empty = use any)
+          );
+
+      std_cerr << "[WASM DEBUG] create_transactions_all returned "
+               << ptx_vector.size() << " transactions" << std::endl;
+
+      if (ptx_vector.empty()) {
+        return R"({"status":"error","error":"No transactions created"})";
+      }
+
+      // Build JSON response with transaction blobs
+      std::ostringstream json;
+      json << R"({"status":"success","transactions":[)";
+
+      uint64_t total_amount = 0;
+      uint64_t total_fee = 0;
+
+      bool first = true;
+      for (const auto &ptx : ptx_vector) {
+        if (!first)
+          json << ",";
+        first = false;
+
+        // Convert the signed TX to a hex blob
+        std::string tx_blob = epee::string_tools::buff_to_hex_nodelimer(
+            cryptonote::tx_to_blob(ptx.tx));
+
+        // Get the Tx Key
+        std::string tx_key = key_to_hex((const unsigned char *)&ptx.tx_key);
+
+        // Get tx hash
+        crypto::hash tx_hash;
+        cryptonote::get_transaction_hash(ptx.tx, tx_hash);
+        std::string tx_hash_str = epee::string_tools::pod_to_hex(tx_hash);
+
+        // Calculate amount from outputs (for sweep_all, amount varies per tx)
+        uint64_t tx_amount = 0;
+        for (const auto &dest : ptx.dests) {
+          tx_amount += dest.amount;
+        }
+
+        total_amount += tx_amount;
+        total_fee += ptx.fee;
+
+        json << "{"
+             << R"("tx_blob":")" << tx_blob << R"(",)"
+             << R"("tx_key":")" << tx_key << R"(",)"
+             << R"("tx_hash":")" << tx_hash_str << R"(",)"
+             << R"("fee":)" << ptx.fee << ","
+             << R"("dust":)" << ptx.dust << ","
+             << R"("amount":)" << tx_amount << "}";
+      }
+
+      json << "],"
+           << R"("total_amount":)" << total_amount << ","
+           << R"("total_fee":)" << total_fee << "}";
+      return json.str();
+
+    } catch (const tools::error::not_enough_money &e) {
+      m_last_error = "Not enough unlocked balance";
+      return R"({"status":"error","error":"Not enough unlocked balance. Wallet may need to sync first."})";
+    } catch (const tools::error::not_enough_unlocked_money &e) {
+      m_last_error = "Not enough unlocked balance";
+      return R"({"status":"error","error":"Not enough unlocked balance. Wait for funds to unlock."})";
+    } catch (const tools::error::tx_not_possible &e) {
+      m_last_error = "Transaction not possible";
+      return R"({"status":"error","error":"Transaction not possible with current inputs. Need decoy outputs?"})";
+    } catch (const tools::error::no_connection_to_daemon &e) {
+      std::string error_details = e.to_string();
+      m_last_error = "no connection to daemon";
+      size_t pos = 0;
+      while ((pos = error_details.find('"', pos)) != std::string::npos) {
+        error_details.replace(pos, 1, "'");
+        pos += 1;
+      }
+      std::ostringstream err;
+      err << R"({"status":"error","error":"no connection to daemon: )"
+          << error_details << R"("})";
+      return err.str();
+    } catch (const std::exception &e) {
+      m_last_error = e.what() ? e.what() : "Unknown error";
+      std::string error_msg = m_last_error;
+      size_t pos = 0;
+      while ((pos = error_msg.find('"', pos)) != std::string::npos) {
+        error_msg.replace(pos, 1, "\\\"");
+        pos += 2;
+      }
+      std::ostringstream err;
+      err << R"({"status":"error","error":")" << error_msg << R"("})";
+      return err.str();
+    } catch (...) {
+      m_last_error = "Unknown exception during sweep_all transaction creation";
+      return R"({"status":"error","error":"Unknown exception during sweep_all transaction creation"})";
     }
   }
 
@@ -18015,6 +18398,10 @@ EMSCRIPTEN_BINDINGS(salvium_wallet) {
       .function("create_transaction_json", &WasmWallet::create_transaction_json)
       .function("create_stake_transaction_json",
                 &WasmWallet::create_stake_transaction_json)
+      .function("create_return_transaction_json",
+                &WasmWallet::create_return_transaction_json)
+      .function("create_sweep_all_transaction_json",
+                &WasmWallet::create_sweep_all_transaction_json)
       .function("estimate_fee_json", &WasmWallet::estimate_fee_json)
       // Split Transaction Architecture (Prepare + Complete)
       // These separate input selection from signing, allowing deterministic
