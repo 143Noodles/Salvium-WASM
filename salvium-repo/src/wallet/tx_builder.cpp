@@ -93,7 +93,7 @@ static bool is_transfer_usable_for_input_selection(
     const wallet2::transfer_details &td, const std::uint32_t from_account,
     const std::set<std::uint32_t> from_subaddresses,
     const rct::xmr_amount ignore_above, const rct::xmr_amount ignore_below,
-    const uint64_t top_block_index) {
+    const uint64_t current_chain_height) {
   /**
    * This additional check appears to be for fcmp++.
   const uint64_t last_locked_block_index =
@@ -111,7 +111,7 @@ static bool is_transfer_usable_for_input_selection(
   bool ki_partial = td.m_key_image_partial;
   bool frozen = td.m_frozen;
   bool height_unlocked =
-      (top_block_index >= td.m_block_height + blocks_locked_for);
+      (current_chain_height >= td.m_block_height + blocks_locked_for);
   bool acct_match = (td.m_subaddr_index.major == from_account);
   bool subaddr_match = (from_subaddresses.empty() ||
                         from_subaddresses.count(td.m_subaddr_index.minor) == 1);
@@ -709,12 +709,11 @@ make_carrot_transaction_proposals_wallet2_transfer(
       current_chain_height > 0,
       "make_carrot_transaction_proposals_wallet2_transfer: chain height is 0, "
       "there is no top block");
-  const std::uint64_t top_block_index = current_chain_height - 1;
 
   return make_carrot_transaction_proposals_wallet2_transfer(
       w, dsts, fee_per_weight, fee_quantization_mask, extra, tx_type,
       subaddr_account, subaddr_indices, subtract_fee_from_outputs,
-      top_block_index);
+      current_chain_height);
 }
 //-------------------------------------------------------------------------------------------------------------------
 // NEW: Wrapper with priority that takes pre-fetched transfers (WASM memory
@@ -741,13 +740,12 @@ make_carrot_transaction_proposals_wallet2_transfer(
       current_chain_height > 0,
       "make_carrot_transaction_proposals_wallet2_transfer: chain height is 0, "
       "there is no top block");
-  const std::uint64_t top_block_index = current_chain_height - 1;
 
   // Use impl with the provided transfers (no copy!)
   return make_carrot_transaction_proposals_wallet2_transfer_impl(
       w, transfers, dsts, fee_per_weight, fee_quantization_mask, extra, tx_type,
       subaddr_account, subaddr_indices, subtract_fee_from_outputs,
-      top_block_index);
+      current_chain_height);
 }
 //-------------------------------------------------------------------------------------------------------------------
 std::vector<carrot::CarrotTransactionProposalV1>
@@ -879,11 +877,10 @@ make_carrot_transaction_proposals_wallet2_sweep(
   CHECK_AND_ASSERT_THROW_MES(current_chain_height > 0,
                              "make_carrot_transaction_proposals_wallet2_sweep: "
                              "chain height is 0, there is no top block");
-  const std::uint64_t top_block_index = current_chain_height - 1;
 
   return make_carrot_transaction_proposals_wallet2_sweep(
       w, input_key_images, address, is_subaddress, n_dests_per_tx,
-      fee_per_weight, fee_quantization_mask, extra, tx_type, top_block_index);
+      fee_per_weight, fee_quantization_mask, extra, tx_type, current_chain_height);
 }
 //-------------------------------------------------------------------------------------------------------------------
 std::vector<carrot::CarrotTransactionProposalV1>
@@ -950,12 +947,11 @@ make_carrot_transaction_proposals_wallet2_sweep_all(
   CHECK_AND_ASSERT_THROW_MES(current_chain_height > 0,
                              "make_carrot_transaction_proposals_wallet2_sweep: "
                              "chain height is 0, there is no top block");
-  const std::uint64_t top_block_index = current_chain_height - 1;
 
   return make_carrot_transaction_proposals_wallet2_sweep_all(
       w, only_below, address, is_subaddress, n_dests_per_tx, fee_per_weight,
       fee_quantization_mask, extra, tx_type, subaddr_account, subaddr_indices,
-      top_block_index);
+      current_chain_height);
 }
 //-------------------------------------------------------------------------------------------------------------------
 bool get_address_openings_x_y(const cryptonote::transaction &tx,
