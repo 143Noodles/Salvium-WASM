@@ -37,7 +37,7 @@
 
 // Debug flag for wallet2 - set to 1 for debug builds, 0 for production
 // WARNING: Do NOT remove the debug code structure, only toggle this flag!
-#define WALLET2_DEBUG 1
+#define WALLET2_DEBUG 0
 
 #if WALLET2_DEBUG
 #define W2_DEBUG_LOG(...) fprintf(stderr, __VA_ARGS__)
@@ -1955,6 +1955,15 @@ void wallet2::create_one_off_subaddress(
     const cryptonote::subaddress_index &index) {
   const crypto::public_key pkey = get_subaddress_spend_public_key(index);
   m_subaddresses[pkey] = index;
+
+  // Also register with the Carrot account for spending
+  // This is critical for WASM where subaddress lookahead is (1,1)
+  std::unordered_map<crypto::public_key, carrot::subaddress_index_extended> new_addresses;
+  new_addresses.insert({pkey,
+                        {{index.major, index.minor},
+                         carrot::AddressDeriveType::PreCarrot,
+                         false}});
+  m_account.insert_subaddresses(new_addresses);
 }
 //----------------------------------------------------------------------------------------------------
 std::string
@@ -3036,6 +3045,16 @@ void wallet2::process_new_scanned_transaction(
     td.m_rct = tx.version >= 2;
     td.m_frozen = false;
 
+    // FIX: Ensure subaddress is registered in m_subaddresses and carrot account
+    // This is critical for WASM where subaddress lookahead is (1,1) - we must
+    // register detected subaddresses on-demand so they can be spent later.
+    // Skip for main address (0,0) which is always available.
+    if (subaddr_index_cn.major != 0 || subaddr_index_cn.minor != 0) {
+      if (m_subaddresses.find(active_scan_info->address_spend_pubkey) == m_subaddresses.end()) {
+        create_one_off_subaddress(subaddr_index_cn);
+      }
+    }
+
     // FIX v5.35.5: For PROTOCOL/RETURN tx outputs, use onetime_address for
     // m_salvium_txs lookup. The STAKE tx stores return_address in
     // m_salvium_txs, and the PROTOCOL output's onetime_address IS that
@@ -3102,25 +3121,11 @@ void wallet2::process_new_scanned_transaction(
         (!active_scan_info->is_carrot || has_zero_key_image);
 
     if (needs_key_image_override) {
-
-      // DEBUG v5.50.0: Log PROTOCOL tx processing
-      std::cout << "[PROTOCOL h=" << height << "] Processing output (carrot="
-                << (active_scan_info->is_carrot ? "yes" : "no")
-                << ", zero_ki=" << (has_zero_key_image ? "yes" : "no")
-                << "), onetime_address="
-                << epee::string_tools::pod_to_hex(onetime_address).substr(0, 16)
-                << "..."
-                << " m_td_origin_idx=" << td.m_td_origin_idx
-                << " m_confirmed_txs.size=" << m_confirmed_txs.size()
-                << std::endl;
-
       origin_data origin_tx_data;
       bool have_origin_data = false;
 
       if (td.m_td_origin_idx != std::numeric_limits<uint64_t>::max()) {
         // Normal path: have origin via m_salvium_txs -> m_transfers
-        std::cout << "[PROTOCOL h=" << height
-                  << "] Found via m_salvium_txs lookup" << std::endl;
         THROW_WALLET_EXCEPTION_IF(
             td.m_td_origin_idx >= get_num_transfer_details(),
             error::wallet_internal_error,
@@ -3133,15 +3138,10 @@ void wallet2::process_new_scanned_transaction(
       } else {
         // FIX: STAKE/AUDIT without change - search m_confirmed_txs
         // The PROTOCOL output's onetime_address == STAKE tx's return_address
-        std::cout << "[PROTOCOL h=" << height
-                  << "] m_td_origin_idx=SIZE_MAX, searching m_confirmed_txs..."
-                  << std::endl;
-        size_t stake_count = 0;
         for (const auto &ctd_entry : m_confirmed_txs) {
           const cryptonote::transaction_prefix &ctd_tx = ctd_entry.second.m_tx;
           if (ctd_tx.type == cryptonote::transaction_type::STAKE ||
               ctd_tx.type == cryptonote::transaction_type::AUDIT) {
-            stake_count++;
             // Check if this STAKE's return_address matches our PROTOCOL output
             crypto::public_key stake_return_addr = crypto::null_pkey;
             if (ctd_tx.return_address != crypto::null_pkey) {
@@ -3150,18 +3150,6 @@ void wallet2::process_new_scanned_transaction(
                        crypto::null_pkey) {
               stake_return_addr = ctd_tx.protocol_tx_data.return_address;
             }
-            // Debug: log each STAKE's return_address
-            std::cout
-                << "[PROTOCOL h=" << height << "] Checking STAKE txid="
-                << epee::string_tools::pod_to_hex(ctd_entry.first).substr(0, 16)
-                << "..."
-                << " return_addr="
-                << epee::string_tools::pod_to_hex(stake_return_addr)
-                       .substr(0, 16)
-                << "..."
-                << " vs onetime="
-                << epee::string_tools::pod_to_hex(onetime_address).substr(0, 16)
-                << "..." << std::endl;
             if (stake_return_addr == onetime_address) {
               // Found the STAKE tx! Extract origin data
               origin_tx_data.tx_pub_key = get_tx_pub_key_from_extra(ctd_tx);
@@ -3169,9 +3157,6 @@ void wallet2::process_new_scanned_transaction(
                   0; // STAKE origin always uses index 0
               origin_tx_data.tx_type = ctd_tx.type;
               have_origin_data = true;
-              std::cout << "[PROTOCOL h=" << height
-                        << "] MATCH FOUND! Using STAKE for key_image derivation"
-                        << std::endl;
               LOG_PRINT_L2("[PROTOCOL NO-CHANGE FIX h="
                            << height
                            << "] Found STAKE origin in m_confirmed_txs for "
@@ -3181,13 +3166,9 @@ void wallet2::process_new_scanned_transaction(
             }
           }
         }
-        std::cout << "[PROTOCOL h=" << height << "] Searched " << stake_count
-                  << " STAKE/AUDIT txs in m_confirmed_txs" << std::endl;
       }
 
       if (have_origin_data) {
-        std::cout << "[PROTOCOL h=" << height
-                  << "] Deriving key_image with origin_data" << std::endl;
         hw::device &hwdev = m_account.get_device();
         hw::reset_mode rst(hwdev);
         hwdev.set_mode(hw::device::TRANSACTION_PARSE);
@@ -3207,13 +3188,41 @@ void wallet2::process_new_scanned_transaction(
             "failed to obtain key image for protocol_tx output");
         td.m_key_image_known = true;
         td.m_key_image = ki;
-        std::cout << "[PROTOCOL h=" << height << "] key_image derived: "
-                  << epee::string_tools::pod_to_hex(ki).substr(0, 16) << "..."
-                  << std::endl;
       } else {
-        std::cout << "[PROTOCOL h=" << height
-                  << "] NO ORIGIN DATA - key_image will NOT be derived!"
-                  << std::endl;
+        // FIX: Fallback for return outputs registered via register_stake_return_info
+        // When we have no origin_data (STAKE tx not in wallet), but have return_output_info,
+        // we can compute the key image directly from the return secret.
+        const auto &return_output_map = m_account.get_return_output_map_ref();
+        auto roi_it = return_output_map.find(onetime_address);
+        if (roi_it != return_output_map.end()) {
+          const auto &roi = roi_it->second;
+
+          // Compute k_return from input_context and K_o
+          crypto::secret_key k_return;
+          m_account.s_view_balance_dev.make_internal_return_privkey(
+              roi.input_context, roi.K_o, k_return);
+
+          // Use main address keys directly (returns from no-change STAKEs go to main address)
+          // The main address (0,0) uses the account's spend secret key as the G-component
+          crypto::secret_key address_privkey_g = m_account.get_keys().m_spend_secret_key;
+          // T-component is zero for main address
+          crypto::secret_key address_privkey_t;
+          memset(&address_privkey_t, 0, sizeof(address_privkey_t));
+
+          // Compute spend_key = address_privkey_g + k_return
+          crypto::secret_key spend_key;
+          sc_add(reinterpret_cast<unsigned char*>(&spend_key),
+                 reinterpret_cast<const unsigned char*>(&address_privkey_g),
+                 reinterpret_cast<const unsigned char*>(&k_return));
+
+          // Compute key_image = spend_key * Hp(onetime_address)
+          crypto::key_image ki;
+          crypto::generate_key_image(onetime_address, spend_key, ki);
+
+          td.m_key_image_known = true;
+          td.m_key_image = ki;
+          LOG_PRINT_L2("Computed key image for return output via fallback path");
+        }
       }
     }
     td.m_key_image_request = m_watch_only; // for view wallets, that flag means
@@ -7917,6 +7926,20 @@ void wallet2::load_wallet_cache(const bool use_fs,
               m_account_public_address.m_view_public_key !=
                   m_account.get_keys().m_account_address.m_view_public_key,
           error::wallet_files_doesnt_correspond, m_keys_file, m_wallet_file);
+    }
+
+    // FIX: Register subaddresses from cached transfers on-demand
+    // This is critical for WASM where subaddress lookahead is (1,1) - any
+    // subaddresses used in cached outputs need to be registered with the
+    // carrot account for spending to work after restoring from backup.
+    for (const auto &td : m_transfers) {
+      const auto &idx = td.m_subaddr_index;
+      // Skip main address (0,0) which is always available
+      if (idx.major == 0 && idx.minor == 0) continue;
+      // Only register if not already in the map
+      if (m_subaddresses.find(td.m_recovered_spend_pubkey) == m_subaddresses.end()) {
+        create_one_off_subaddress(idx);
+      }
     }
   }
 }

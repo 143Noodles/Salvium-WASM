@@ -479,7 +479,7 @@ public:
     std::vector<std::pair<uint64_t, crypto::hash>> m_uses;
     std::string asset_type;
     crypto::public_key
-        m_recovered_spend_pubkey; // spend pubkey recovered from the output
+        m_recovered_spend_pubkey = crypto::null_pkey; // spend pubkey recovered from the output
 
     bool is_rct() const { return m_rct; }
     uint64_t amount() const { return m_amount; }
@@ -546,6 +546,7 @@ public:
     FIELD(m_multisig_info)
     FIELD(m_uses)
     FIELD(asset_type)
+    FIELD(m_recovered_spend_pubkey)
     END_SERIALIZE()
   };
 

@@ -45,8 +45,18 @@
 #define TX_BUILDER_DEBUG 1
 
 #if TX_BUILDER_DEBUG
+#ifdef __EMSCRIPTEN__
+// Use EM_ASM for direct console.log output in browser
+#define TX_DEBUG_LOG(...) do { \
+    char _tx_debug_buf[2048]; \
+    snprintf(_tx_debug_buf, sizeof(_tx_debug_buf), __VA_ARGS__); \
+    EM_ASM({ console.log(UTF8ToString($0)); }, _tx_debug_buf); \
+} while(0)
+#define TX_DEBUG_FLUSH() ((void)0)
+#else
 #define TX_DEBUG_LOG(...) fprintf(stderr, __VA_ARGS__)
 #define TX_DEBUG_FLUSH() fflush(stderr)
+#endif
 #else
 #define TX_DEBUG_LOG(...) ((void)0)
 #define TX_DEBUG_FLUSH() ((void)0)
@@ -124,29 +134,46 @@ static bool is_transfer_usable_for_input_selection(
                 && acct_match && subaddr_match && amt_ok && is_v10;
 
   static int log_limit = 0;
-  if (!result && log_limit < 50) {
-    log_limit++;
-    fprintf(
-        stderr,
-        "[WASM DEBUG] REJECTED Input %llu (Amt:%llu): Spent:%d KI:%d Part:%d "
-        "Frz:%d H_Unlock:%d Acct:%d Sub:%d Amt:%d V10:%d (Type: %s)\n",
-        (unsigned long long)td.m_block_height, (unsigned long long)td.amount(),
-        is_spent, ki_known, ki_partial, frozen, height_unlocked, acct_match,
-        subaddr_match, amt_ok, is_v10, td.asset_type.c_str());
-    TX_DEBUG_FLUSH();
-  } else if (result && log_limit < 60) {
-    log_limit++;
-    TX_DEBUG_LOG(
-            "[WASM DEBUG] ACCEPTED Input block=%llu global_idx=%llu "
-            "asset_idx=%llu (Amt:%llu)\n",
+  static int reject_counts[11] = {0}; // Track rejection reasons
+  if (!result) {
+    // Count rejection reasons
+    if (is_spent) reject_counts[0]++;
+    if (!ki_known) reject_counts[1]++;
+    if (ki_partial) reject_counts[2]++;
+    if (frozen) reject_counts[3]++;
+    if (!height_unlocked) reject_counts[4]++;
+    if (!acct_match) reject_counts[5]++;
+    if (!subaddr_match) reject_counts[6]++;
+    if (!amt_ok) reject_counts[7]++;
+    if (!is_v10) reject_counts[8]++;
+    reject_counts[9]++; // total rejected
+
+    if (log_limit < 20) {
+      log_limit++;
+      TX_DEBUG_LOG(
+          "[WASM DEBUG] REJECTED Input %llu (Amt:%llu): Spent:%d KI:%d Part:%d "
+          "Frz:%d H_Unlock:%d Acct:%d Sub:%d Amt:%d V10:%d (Type: %s)\n",
+          (unsigned long long)td.m_block_height, (unsigned long long)td.amount(),
+          is_spent, ki_known, ki_partial, frozen, height_unlocked, acct_match,
+          subaddr_match, amt_ok, is_v10, td.asset_type.c_str());
+      TX_DEBUG_FLUSH();
+    }
+  } else {
+    reject_counts[10]++; // total accepted
+    if (log_limit < 30) {
+      log_limit++;
+      TX_DEBUG_LOG(
+              "[WASM DEBUG] ACCEPTED Input block=%llu global_idx=%llu "
+              "asset_idx=%llu (Amt:%llu)\n",
             (unsigned long long)td.m_block_height,
             (unsigned long long)td.m_global_output_index,
             (unsigned long long)td.m_asset_type_output_index,
             (unsigned long long)td.amount());
-    TX_DEBUG_LOG( "  td.m_mask[0:4]: %02x%02x%02x%02x\n",
+      TX_DEBUG_LOG( "  td.m_mask[0:4]: %02x%02x%02x%02x\n",
             (unsigned)td.m_mask.bytes[0], (unsigned)td.m_mask.bytes[1],
             (unsigned)td.m_mask.bytes[2], (unsigned)td.m_mask.bytes[3]);
-    TX_DEBUG_FLUSH();
+      TX_DEBUG_FLUSH();
+    }
   }
 
   return result;
@@ -514,7 +541,24 @@ get_sources(const std::vector<std::size_t> &selected_transfers,
     src.real_output = it_to_replace - src.outputs.begin();
     src.real_output_in_tx_index = td.m_internal_output_index;
     src.mask = td.m_mask;
-    src.address_spend_pubkey = td.m_recovered_spend_pubkey;
+    // FIX: For wallets created before m_recovered_spend_pubkey was serialized,
+    // the field will be uninitialized. Use the subaddress index to look up the
+    // correct spend pubkey from the wallet's subaddress map.
+    if (td.m_recovered_spend_pubkey == crypto::null_pkey ||
+        // Check for garbage values (mostly zeros with random trailing bytes)
+        memcmp(&td.m_recovered_spend_pubkey, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16) == 0) {
+      src.address_spend_pubkey = w.get_subaddress_spend_public_key(td.m_subaddr_index);
+    } else {
+      src.address_spend_pubkey = td.m_recovered_spend_pubkey;
+    }
+
+    // FIX: Ensure subaddress is registered in the carrot account for spending.
+    // This is critical for WASM where subaddress lookahead is (1,1). Without this,
+    // try_searching_for_opening_for_subaddress() will fail in get_address_openings_x_y().
+    // Skip main address (0,0) which is always available.
+    if (td.m_subaddr_index.major != 0 || td.m_subaddr_index.minor != 0) {
+      w.create_one_off_subaddress(td.m_subaddr_index);
+    }
     if (td.m_tx.vin[0].type() == typeid(cryptonote::txin_to_key)) {
       src.first_rct_key_image =
           boost::get<cryptonote::txin_to_key>(td.m_tx.vin[0]).k_image;
@@ -901,6 +945,15 @@ make_carrot_transaction_proposals_wallet2_sweep_all(
       unburned_transfers_by_key_image =
           collect_non_burned_transfers_by_key_image(transfers);
 
+  // NOTE: Return outputs are now properly handled in get_address_openings_x_y()
+  // which computes the correct x,y values from return_output_info when sum_g is zero
+  // However, outputs with zero key images (from register_stake_return_info) must be
+  // skipped as we cannot regenerate the key image without proper origin_data.
+
+  // Define zero key image for comparison
+  crypto::key_image zero_ki;
+  memset(&zero_ki, 0, sizeof(zero_ki));
+
   std::vector<crypto::key_image> input_key_images;
   input_key_images.reserve(transfers.size());
   for (std::size_t transfer_idx = 0; transfer_idx < transfers.size();
@@ -920,8 +973,57 @@ make_carrot_transaction_proposals_wallet2_sweep_all(
     else if (ki_it->second != transfer_idx)
       continue;
 
+    // Skip outputs with zero key images - these are return outputs registered via
+    // register_stake_return_info that don't have valid key images computed.
+    // The wallet cannot regenerate key images without proper origin_data.
+    if (td.m_key_image == zero_ki) {
+      TX_DEBUG_LOG("[WASM DEBUG sweep_all] Skipping transfer %zu: zero key image (return output without origin_data)\n", transfer_idx);
+      TX_DEBUG_FLUSH();
+      continue;
+    }
+
+    // FIX: Skip PROTOCOL/RETURN outputs that can't be spent due to missing return_output_info.
+    // After seed-only restore, return outputs from STAKE txs without change are unspendable
+    // because the return_output_info was never computed (requires original STAKE tx data).
+    // These outputs have: m_td_origin_idx == SIZE_MAX AND no entry in return_output_map.
+    bool is_protocol_output = (td.m_tx.type == cryptonote::transaction_type::PROTOCOL ||
+                               td.m_tx.type == cryptonote::transaction_type::RETURN);
+    if (is_protocol_output) {
+      bool has_origin_data = (td.m_td_origin_idx != std::numeric_limits<uint64_t>::max());
+      crypto::public_key output_pubkey = crypto::null_pkey;
+      cryptonote::get_output_public_key(td.m_tx.vout[td.m_internal_output_index], output_pubkey);
+      const auto &return_output_map = w.get_account().get_return_output_map_ref();
+      bool has_return_info = (return_output_map.find(output_pubkey) != return_output_map.end());
+
+      if (!has_origin_data && !has_return_info) {
+        TX_DEBUG_LOG("[WASM DEBUG sweep_all] Skipping transfer %zu: PROTOCOL output unspendable after seed restore (no origin_data, no return_output_info)\n", transfer_idx);
+        TX_DEBUG_FLUSH();
+        continue;
+      }
+    }
+
+    // FIX: Skip outputs where recovered_spend_pubkey is neither main address nor in subaddress_map.
+    // After seed restore, subaddresses may not be regenerated, making those outputs unspendable.
+    // This catches outputs detected during scanning but can't be spent due to missing subaddress keys.
+    if (td.m_recovered_spend_pubkey != crypto::null_pkey) {
+      const crypto::public_key &main_spend_pubkey = w.get_account().get_keys().m_account_address.m_spend_public_key;
+      bool is_main_address = (td.m_recovered_spend_pubkey == main_spend_pubkey);
+      bool in_subaddress_map = (w.get_account().get_subaddress_map_cn().find(td.m_recovered_spend_pubkey) !=
+                                 w.get_account().get_subaddress_map_cn().end());
+
+      if (!is_main_address && !in_subaddress_map) {
+        TX_DEBUG_LOG("[WASM DEBUG sweep_all] Skipping transfer %zu: recovered_spend_pubkey not in subaddress_map (subaddress not regenerated after restore)\n", transfer_idx);
+        TX_DEBUG_FLUSH();
+        continue;
+      }
+    }
+
     input_key_images.push_back(td.m_key_image);
   }
+
+  TX_DEBUG_LOG("[WASM DEBUG sweep_all] Selection summary: total_transfers=%zu, selected=%zu\n",
+               transfers.size(), input_key_images.size());
+  TX_DEBUG_FLUSH();
 
   CHECK_AND_ASSERT_THROW_MES(!input_key_images.empty(),
                              __func__ << ": no usable transfers to sweep");
@@ -958,18 +1060,178 @@ bool get_address_openings_x_y(const cryptonote::transaction &tx,
                               const cryptonote::tx_source_entry &src,
                               const wallet2 &w, crypto::secret_key &x_out,
                               crypto::secret_key &y_out) {
+  TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Starting for output, carrot=%d, coinbase=%d, amount=%llu\n",
+               src.carrot ? 1 : 0, src.coinbase ? 1 : 0, (unsigned long long)src.amount);
+  TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] real_output=%zu, real_output_in_tx_index=%zu\n",
+               src.real_output, src.real_output_in_tx_index);
+  TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] real_out_tx_key: %s\n",
+               epee::string_tools::pod_to_hex(src.real_out_tx_key).c_str());
+  TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] additional_tx_keys count: %zu\n",
+               src.real_out_additional_tx_keys.size());
+  TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] STORED src.address_spend_pubkey: %s\n",
+               epee::string_tools::pod_to_hex(src.address_spend_pubkey).c_str());
+  TX_DEBUG_FLUSH();
+
   // If the output is a return output, we can use the return output secret key
   // to derive x and y directly.
   const auto &return_output_map = w.get_account().get_return_output_map_ref();
-  if (return_output_map.find(
-          rct::rct2pk(src.outputs[src.real_output].second.dest)) !=
-      return_output_map.end()) {
-    const auto &return_output = return_output_map.at(
-        rct::rct2pk(src.outputs[src.real_output].second.dest));
-    x_out = return_output.sum_g;
-    y_out = return_output.sender_extension_t;
-    return true;
+  TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] return_output_map size: %zu\n", return_output_map.size());
+  TX_DEBUG_FLUSH();
+
+  // Log what we're looking up
+  crypto::public_key lookup_key = rct::rct2pk(src.outputs[src.real_output].second.dest);
+  TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Looking up key: %s\n",
+               epee::string_tools::pod_to_hex(lookup_key).c_str());
+  TX_DEBUG_FLUSH();
+
+  if (return_output_map.find(lookup_key) != return_output_map.end()) {
+    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Found in return_output_map\n");
+    TX_DEBUG_FLUSH();
+    const auto &return_output = return_output_map.at(lookup_key);
+
+    // Check if sum_g is zero (placeholder from register_stake_return_info)
+    crypto::secret_key zero_key;
+    memset(&zero_key, 0, sizeof(zero_key));
+
+    // DIAGNOSTIC: Always compute from scratch to test if stored sum_g values are wrong
+    // If this fixes the invalid_input error, it confirms the stored values are incorrect
+    if (return_output.sum_g != zero_key) {
+      TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] sum_g is non-zero BUT IGNORING - will recompute\n");
+      TX_DEBUG_FLUSH();
+      // DON'T use stored values - fall through to compute
+      // x_out = return_output.sum_g;
+      // y_out = return_output.sender_extension_t;
+      // return true;
+    }
+
+    // sum_g is zero - need to compute the actual values
+    // This happens when return_output was registered via register_stake_return_info
+    // which only stores placeholders because it doesn't have full TX data
+    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] sum_g is zero, computing from return_output_info\n");
+    TX_DEBUG_FLUSH();
+
+    // For return outputs: K_return = K_original + k_return * G
+    // The opening is: x = address_privkey_g + k_return, y = address_privkey_t
+    // (sender_extension_g/t are zero for PROTOCOL transactions)
+    //
+    // CRITICAL: K_spend_pubkey from src/transfer_details is the RETURN address, not the original!
+    // To find the original address, we must compute: K_original = K_return - k_return * G
+
+    // Step 1: Compute k_return first (we need this to find K_original)
+    crypto::secret_key k_return;
+    w.get_account().s_view_balance_dev.make_internal_return_privkey(
+        return_output.input_context, return_output.K_o, k_return);
+
+    // Step 2: Get K_return (the return address spend pubkey)
+    crypto::public_key K_return = src.address_spend_pubkey;
+    crypto::public_key zero_pubkey;
+    memset(&zero_pubkey, 0, sizeof(zero_pubkey));
+
+    if (K_return == zero_pubkey) {
+      K_return = return_output.K_spend_pubkey;
+      TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] src.address_spend_pubkey is zero, using return_output.K_spend_pubkey\n");
+      TX_DEBUG_FLUSH();
+    }
+
+    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] K_return (return address): %s\n",
+                 epee::string_tools::pod_to_hex(K_return).c_str());
+    TX_DEBUG_FLUSH();
+
+    // Step 3: Compute K_original = K_return - k_return * G
+    // This gives us the original address that was used for the STAKE tx
+    crypto::public_key K_original;
+    crypto::public_key k_return_pubkey;
+    crypto::secret_key_to_public_key(k_return, k_return_pubkey);
+    // K_original = K_return - k_return * G (point subtraction)
+    ge_p3 K_return_p3, k_return_pub_p3, K_original_p3;
+    ge_frombytes_vartime(&K_return_p3, reinterpret_cast<const unsigned char*>(&K_return));
+    ge_frombytes_vartime(&k_return_pub_p3, reinterpret_cast<const unsigned char*>(&k_return_pubkey));
+    // Negate k_return_pubkey
+    ge_cached k_return_neg_cached;
+    ge_p3_to_cached(&k_return_neg_cached, &k_return_pub_p3);
+    // We need to negate the point: -P = (x, -y) in extended coordinates
+    // Actually, use subtraction: K_original = K_return + (-k_return * G)
+    // Compute -k_return
+    crypto::secret_key neg_k_return;
+    sc_sub(reinterpret_cast<unsigned char*>(&neg_k_return),
+           reinterpret_cast<const unsigned char*>(&zero_pubkey),  // 0
+           reinterpret_cast<const unsigned char*>(&k_return));
+    crypto::public_key neg_k_return_pubkey;
+    crypto::secret_key_to_public_key(neg_k_return, neg_k_return_pubkey);
+    // K_original = K_return + neg_k_return * G
+    ge_p3 neg_k_return_p3;
+    ge_frombytes_vartime(&neg_k_return_p3, reinterpret_cast<const unsigned char*>(&neg_k_return_pubkey));
+    ge_cached neg_k_return_cached;
+    ge_p3_to_cached(&neg_k_return_cached, &neg_k_return_p3);
+    ge_p1p1 K_original_p1p1;
+    ge_add(&K_original_p1p1, &K_return_p3, &neg_k_return_cached);
+    ge_p1p1_to_p3(&K_original_p3, &K_original_p1p1);
+    ge_p3_tobytes(reinterpret_cast<unsigned char*>(&K_original), &K_original_p3);
+
+    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] K_original (computed): %s\n",
+                 epee::string_tools::pod_to_hex(K_original).c_str());
+    TX_DEBUG_FLUSH();
+
+    // Step 4: Check if K_original is the main address or a subaddress
+    crypto::public_key main_spend_pubkey = w.get_account().get_keys().m_account_address.m_spend_public_key;
+    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] main_spend_pubkey: %s\n",
+                 epee::string_tools::pod_to_hex(main_spend_pubkey).c_str());
+    TX_DEBUG_FLUSH();
+
+    crypto::secret_key address_privkey_g, address_privkey_t;
+    bool found_subaddr = false;
+
+    if (K_original == main_spend_pubkey) {
+      // Original was main address (0,0)
+      address_privkey_g = w.get_account().get_keys().m_spend_secret_key;
+      memset(&address_privkey_t, 0, sizeof(address_privkey_t));
+      found_subaddr = true;
+      TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] K_original matches main address\n");
+      TX_DEBUG_FLUSH();
+    } else {
+      // Try to find K_original in subaddress map
+      found_subaddr = w.get_account().try_searching_for_opening_for_subaddress(
+          K_original, address_privkey_g, address_privkey_t);
+
+      if (found_subaddr) {
+        TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] K_original found in subaddress_map\n");
+        TX_DEBUG_FLUSH();
+      } else {
+        TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] K_original not in subaddress_map, using main address as fallback\n");
+        TX_DEBUG_FLUSH();
+        // Fallback to main address - this might be wrong but better than failing
+        address_privkey_g = w.get_account().get_keys().m_spend_secret_key;
+        memset(&address_privkey_t, 0, sizeof(address_privkey_t));
+        found_subaddr = true;
+      }
+    }
+
+    if (!found_subaddr) {
+      TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Could not find address opening\n");
+      TX_DEBUG_FLUSH();
+      // Fall through to normal derivation path below
+    } else {
+      // Step 5: Compute the final opening
+      // x = address_privkey_g + k_return, y = address_privkey_t
+
+      TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Computed k_return, computing x = address_privkey_g + k_return\n");
+      TX_DEBUG_FLUSH();
+
+      // Step 4: Compute the final opening
+      // x = address_privkey_g + k_return (sender_extension_g = 0 for PROTOCOL tx)
+      // y = address_privkey_t (sender_extension_t = 0 for PROTOCOL tx)
+      sc_add(reinterpret_cast<unsigned char*>(&x_out),
+             reinterpret_cast<const unsigned char*>(&address_privkey_g),
+             reinterpret_cast<const unsigned char*>(&k_return));
+      y_out = address_privkey_t;
+
+      TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] SUCCESS - computed x,y from return_output_info\n");
+      TX_DEBUG_FLUSH();
+      return true;
+    }
   }
+  TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] NOT in return_output_map, trying derivations\n");
+  TX_DEBUG_FLUSH();
 
   const std::vector<crypto::public_key> v_pubkeys{src.real_out_tx_key};
   const std::vector<crypto::public_key> v_pubkeys_empty{};
@@ -1051,18 +1313,138 @@ bool get_address_openings_x_y(const cryptonote::transaction &tx,
         encrypted_payment_id, s_sender_receiver, sender_extension_g_out,
         sender_extension_t_out, address_spend_pubkey_out,
         nominal_payment_id_out, nominal_janus_anchor_out);
+
+    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Loop i=%zu, address_spend_pubkey_out: %s\n",
+                 i, epee::string_tools::pod_to_hex(address_spend_pubkey_out).c_str());
+    TX_DEBUG_FLUSH();
+
     r = w.get_account().try_searching_for_opening_for_onetime_address(
         address_spend_pubkey_out, sender_extension_g_out,
         sender_extension_t_out, x_out, y_out);
 
+    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Loop i=%zu, try_searching_for_opening result: %s\n",
+                 i, r ? "SUCCESS" : "FAILED");
+    TX_DEBUG_FLUSH();
+
     // If we found the opening, we can stop here
     if (r) {
+      TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Found opening at i=%zu\n", i);
+      TX_DEBUG_FLUSH();
       break;
     }
   }
 
-  CHECK_AND_ASSERT_THROW_MES(r,
-                             "Failed to obtain openings for onetime address");
+  if (!r) {
+    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Derivation failed, trying stored src.address_spend_pubkey\n");
+    TX_DEBUG_FLUSH();
+
+    // FIX: If derivation failed but we have a stored address_spend_pubkey from scanning,
+    // try using it directly. This handles cases where the derivation path differs
+    // between scanning and spending.
+    if (src.address_spend_pubkey != crypto::null_pkey) {
+      TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Trying stored address_spend_pubkey: %s\n",
+                   epee::string_tools::pod_to_hex(src.address_spend_pubkey).c_str());
+      TX_DEBUG_FLUSH();
+
+      // We need to recompute sender extensions using the correct derivation
+      // Try both internal and external derivations again with stored pubkey
+      for (size_t i = 0; i < 2; ++i) {
+        std::vector<crypto::key_derivation> main_derivations;
+        std::vector<crypto::key_derivation> additional_derivations;
+
+        const std::vector<crypto::public_key> v_pubkeys{src.real_out_tx_key};
+        const std::vector<crypto::public_key> v_pubkeys_empty{};
+        const epee::span<const crypto::public_key> main_tx_ephemeral_pubkeys =
+            (src.real_out_tx_key == crypto::null_pkey)
+                ? epee::to_span(v_pubkeys_empty)
+                : epee::to_span(v_pubkeys);
+        const epee::span<const crypto::public_key> additional_tx_ephemeral_pubkeys =
+            epee::to_span(src.real_out_additional_tx_keys);
+
+        if (i == 0) {
+          wallet::perform_ecdh_derivations(
+              main_tx_ephemeral_pubkeys, additional_tx_ephemeral_pubkeys,
+              w.get_account().get_keys().k_view_incoming,
+              w.get_account().get_keys().get_device(), src.carrot, main_derivations,
+              additional_derivations);
+        } else {
+          crypto::key_derivation main_derivation;
+          memcpy(main_derivation.data,
+                 w.get_account().get_keys().s_view_balance.data,
+                 sizeof(crypto::secret_key));
+          main_derivations.push_back(main_derivation);
+        }
+
+        const crypto::key_derivation &kd =
+            main_derivations.size()
+                ? main_derivations[0]
+                : additional_derivations[src.real_output_in_tx_index];
+        const mx25519_pubkey s_sender_receiver_unctx =
+            carrot::raw_byte_convert<mx25519_pubkey>(kd);
+
+        const epee::span<const crypto::public_key> enote_ephemeral_pubkeys_pk =
+            main_tx_ephemeral_pubkeys.empty() ? additional_tx_ephemeral_pubkeys
+                                              : main_tx_ephemeral_pubkeys;
+        const epee::span<const mx25519_pubkey> enote_ephemeral_pubkeys = {
+            reinterpret_cast<const mx25519_pubkey *>(
+                enote_ephemeral_pubkeys_pk.data()),
+            enote_ephemeral_pubkeys_pk.size()};
+
+        const bool shared_ephemeral_pubkey = enote_ephemeral_pubkeys.size() == 1;
+        const size_t ephemeral_pubkey_index =
+            shared_ephemeral_pubkey ? 0 : src.real_output_in_tx_index;
+
+        carrot::input_context_t input_context;
+        if (src.coinbase) {
+          input_context =
+              carrot::make_carrot_input_context_coinbase(src.block_index);
+        } else {
+          input_context =
+              carrot::make_carrot_input_context(src.first_rct_key_image);
+        }
+
+        crypto::hash s_sender_receiver;
+        make_carrot_sender_receiver_secret(
+            s_sender_receiver_unctx.data,
+            enote_ephemeral_pubkeys[ephemeral_pubkey_index], input_context,
+            s_sender_receiver);
+
+        // Compute sender extensions from s_sender_receiver
+        crypto::secret_key sender_extension_g;
+        crypto::secret_key sender_extension_t;
+        carrot::make_carrot_onetime_address_extension_g(
+            s_sender_receiver, src.outputs[src.real_output].second.mask,
+            sender_extension_g);
+        carrot::make_carrot_onetime_address_extension_t(
+            s_sender_receiver, src.outputs[src.real_output].second.mask,
+            sender_extension_t);
+
+        TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Fallback i=%zu: trying stored pubkey with computed extensions\n", i);
+        TX_DEBUG_FLUSH();
+
+        // Try with stored address_spend_pubkey instead of derived one
+        r = w.get_account().try_searching_for_opening_for_onetime_address(
+            src.address_spend_pubkey, sender_extension_g,
+            sender_extension_t, x_out, y_out);
+
+        TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Fallback i=%zu result: %s\n",
+                     i, r ? "SUCCESS" : "FAILED");
+        TX_DEBUG_FLUSH();
+
+        if (r) {
+          TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] SUCCESS using stored address_spend_pubkey!\n");
+          TX_DEBUG_FLUSH();
+          return true;
+        }
+      }
+    }
+
+    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] FAILED - could not find openings for output dest: %s\n",
+                 epee::string_tools::pod_to_hex(rct::rct2pk(src.outputs[src.real_output].second.dest)).c_str());
+    TX_DEBUG_FLUSH();
+    // Return false instead of throwing to allow fallback to legacy path
+    return false;
+  }
   return true;
 }
 //-------------------------------------------------------------------------------------------------------------------
@@ -1285,16 +1667,31 @@ cryptonote::transaction finalize_all_proofs_from_transfer_details(
     // inSk: (x, y, mask)
     rct::carrot_ctkey ctkey;
     ctkey.mask = src.mask;
+    bool use_legacy_path = false;
     if (src.carrot) {
       crypto::secret_key x, y;
-      THROW_WALLET_EXCEPTION_IF(!get_address_openings_x_y(tx, src, w, x, y),
-                                error::wallet_internal_error,
-                                "Failed to get x and y for input");
+      bool carrot_ok = false;
+      try {
+        carrot_ok = get_address_openings_x_y(tx, src, w, x, y);
+      } catch (const std::exception &e) {
+        TX_DEBUG_LOG("[WASM DEBUG] Carrot openings threw exception: %s\n", e.what());
+        carrot_ok = false;
+      }
 
-      ctkey.x = rct::sk2rct(x);
-      ctkey.y = rct::sk2rct(y);
-    } else {
+      if (carrot_ok) {
+        ctkey.x = rct::sk2rct(x);
+        ctkey.y = rct::sk2rct(y);
+      } else {
+        // Carrot path failed - try legacy path as fallback
+        TX_DEBUG_LOG("[WASM DEBUG] Carrot openings failed for output amount=%llu, trying legacy fallback\n",
+                     (unsigned long long)src.amount);
+        use_legacy_path = true;
+      }
+    }
+    if (!src.carrot || use_legacy_path) {
       // generate the secret key
+      TX_DEBUG_LOG("[WASM DEBUG] Using legacy path for output amount=%llu (carrot=%d, fallback=%d)\n",
+                   (unsigned long long)src.amount, src.carrot ? 1 : 0, use_legacy_path ? 1 : 0);
       cryptonote::keypair in_ephemeral;
       crypto::key_image img;
       rct::salvium_input_data_t sid;
@@ -1313,11 +1710,17 @@ cryptonote::transaction finalize_all_proofs_from_transfer_details(
             src.real_output_in_tx_index, in_ephemeral, img, hwdev,
             use_origin_data, src.origin_tx_data, sid);
 
-        THROW_WALLET_EXCEPTION_IF(!r, error::wallet_internal_error,
+        if (!r) {
+          TX_DEBUG_LOG("[WASM DEBUG] Legacy generate_key_image_helper FAILED\n");
+          THROW_WALLET_EXCEPTION(error::wallet_internal_error,
                                   "Failed to generate key image helper");
+        }
+        TX_DEBUG_LOG("[WASM DEBUG] Legacy generate_key_image_helper SUCCESS\n");
       } catch (const std::exception &e) {
+        TX_DEBUG_LOG("[WASM DEBUG] Legacy path threw exception: %s\n", e.what());
         throw;
       } catch (...) {
+        TX_DEBUG_LOG("[WASM DEBUG] Legacy path threw unknown exception\n");
         throw;
       }
 

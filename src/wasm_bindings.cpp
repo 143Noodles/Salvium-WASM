@@ -2608,6 +2608,55 @@ public:
     }
   }
 
+  // ========================================================================
+  // RETURN ADDRESS EXPORT - For detecting incoming RETURN transactions
+  // ========================================================================
+  /**
+   * Get all return addresses from the return_output_map as CSV.
+   *
+   * When we send a TRANSFER transaction, we embed our return address in it.
+   * If the recipient creates a RETURN transaction to send funds back, the
+   * output is sent to our return address. The CSP scanner needs to know
+   * these return addresses to detect incoming RETURN transactions.
+   *
+   * Format: "pubkey1,pubkey2,..." (64-char hex public keys)
+   * These are the K_r values from return_output_map.
+   *
+   * @return CSV of return address public keys
+   */
+  std::string get_return_addresses_csv() const {
+    if (!m_initialized || !m_wallet) {
+      return "";
+    }
+
+    try {
+      auto &account = m_wallet->get_account();
+      const auto &return_map = account.get_return_output_map_ref();
+
+      if (return_map.empty()) {
+        return "";
+      }
+
+      std::ostringstream oss;
+      bool first = true;
+
+      for (const auto &entry : return_map) {
+        // entry.first is the K_r (return pubkey)
+        if (!first) {
+          oss << ",";
+        }
+        first = false;
+        oss << epee::string_tools::pod_to_hex(entry.first);
+      }
+
+      return oss.str();
+    } catch (const std::exception &e) {
+      DEBUG_LOG("[WasmWallet] get_return_addresses_csv exception: %s\n", e.what());
+      return "";
+    } catch (...) {
+      return "";
+    }
+  }
 
   /**
    * Check if any of our key images appear in the given transaction inputs.
@@ -12863,7 +12912,8 @@ scan_csp_batch_impl(uintptr_t csp_ptr, size_t csp_size,
                     const std::string &s_view_balance_hex,
                     const std::string &key_images_hex = "",
                     const std::string &stake_return_heights_hex = "",
-                    const std::string &spend_public_key_hex = "") {
+                    const std::string &spend_public_key_hex = "",
+                    const std::string &return_addresses_csv = "") {
   auto total_start = std::chrono::high_resolution_clock::now();
 
   try {
@@ -12955,6 +13005,28 @@ scan_csp_batch_impl(uintptr_t csp_ptr, size_t csp_size,
     }
     bool do_stake_filtering = !stake_return_heights.empty();
     size_t coinbase_filtered_by_stake = 0; // Track how many we skipped
+
+    // Parse return addresses for RETURN transaction detection
+    // Format: comma-separated 64-char hex public keys (K_r values from
+    // return_output_map) When someone sends us a RETURN transaction, the output
+    // key will be one of these return addresses. We check output keys directly
+    // against this set, bypassing view tag matching (which won't work for return
+    // outputs since they use a different key derivation).
+    std::set<crypto::public_key> return_addresses;
+    if (!return_addresses_csv.empty()) {
+      std::istringstream iss(return_addresses_csv);
+      std::string pk_hex;
+      while (std::getline(iss, pk_hex, ',')) {
+        if (pk_hex.length() == 64) {
+          crypto::public_key pk;
+          if (epee::string_tools::hex_to_pod(pk_hex, pk)) {
+            return_addresses.insert(pk);
+          }
+        }
+      }
+    }
+    bool do_return_address_check = !return_addresses.empty();
+    size_t return_address_matches = 0;
 
     // Get pointer to CSP data
     const uint8_t *ptr = reinterpret_cast<const uint8_t *>(csp_ptr);
@@ -13348,6 +13420,16 @@ scan_csp_batch_impl(uintptr_t csp_ptr, size_t csp_size,
         // needed for Phase 1 Phase 2 fetches full TXs and
         // wallet2::process_new_transaction does ownership check
 
+        // Check if output key matches a known return address (for RETURN tx detection)
+        if (do_return_address_check) {
+          crypto::public_key output_pk;
+          memcpy(output_pk.data, output_key, 32);
+          if (return_addresses.count(output_pk) > 0) {
+            matched = true;
+            return_address_matches++;
+          }
+        }
+
         // ================================================================
         // VIEW-TAG-ONLY MATCHING (v6.0.0)
         // ================================================================
@@ -13358,19 +13440,21 @@ scan_csp_batch_impl(uintptr_t csp_ptr, size_t csp_size,
         // ensures 100% parity with CLI wallet transaction detection.
         // ================================================================
 
-        if (output_type == 0) {
-          // Type-0: No view tag stored
-          // Pass through coinbase outputs at stake return heights only
-          if (is_coinbase) {
-            if (!stake_return_heights.empty()) {
-              matched = (stake_return_heights.count(current_block_height) > 0);
-            } else {
-              matched = true; // No stake filter = pass all coinbase
+        // Skip view tag matching if we already matched via return address check
+        if (!matched) {
+          if (output_type == 0) {
+            // Type-0: No view tag stored
+            // Pass through coinbase outputs at stake return heights only
+            if (is_coinbase) {
+              if (!stake_return_heights.empty()) {
+                matched = (stake_return_heights.count(current_block_height) > 0);
+              } else {
+                matched = true; // No stake filter = pass all coinbase
+              }
             }
-          }
-          // User tx type-0: skip (Phase 2 will catch if truly ours)
+            // User tx type-0: skip (Phase 2 will catch if truly ours)
 
-        } else if (output_type == 1) {
+          } else if (output_type == 1) {
           // Type-1: Legacy output with 1-byte view tag
           // Compute view tag using available derivations and compare
 
@@ -13456,7 +13540,8 @@ scan_csp_batch_impl(uintptr_t csp_ptr, size_t csp_size,
               }
             }
           }
-        }
+          }
+        } // End of if (!matched) - view tag matching
 
         // Report match
         if (matched) {
@@ -13533,6 +13618,7 @@ scan_csp_batch_impl(uintptr_t csp_ptr, size_t csp_size,
         << "\"carrot_outputs\":" << carrot_outputs_found << ","
         << "\"derivations\":" << derivations_computed << ","
         << "\"view_tag_matches\":" << view_tag_matches << ","
+        << "\"return_address_matches\":" << return_address_matches << ","
         << "\"carrot_matches\":" << carrot_matches << ","
         << "\"time_us\":" << total_us << "}}";
 
@@ -13575,11 +13661,10 @@ std::string scan_csp_batch_with_stake_filter(
     const std::string &stake_return_heights,
     const std::string &spend_public_key_hex,
     const std::string &return_addresses_csv) {
-  (void)return_addresses_csv;
   return scan_csp_batch_impl(csp_ptr, csp_size, view_secret_key_hex,
                              k_view_incoming_hex, s_view_balance_hex,
                              key_images_hex, stake_return_heights,
-                             spend_public_key_hex);
+                             spend_public_key_hex, return_addresses_csv);
 }
 
 /**
@@ -14090,11 +14175,10 @@ std::string scan_csp_batch_with_stake_filter(
     const std::string &stake_return_heights,
     const std::string &spend_public_key_hex,
     const std::string &return_addresses_csv) {
-  (void)return_addresses_csv;
   return scan_csp_batch_impl(csp_ptr, csp_size, view_secret_key_hex,
                              k_view_incoming_hex, s_view_balance_hex,
                              key_images_hex, stake_return_heights,
-                             spend_public_key_hex);
+                             spend_public_key_hex, return_addresses_csv);
 }
 
 /**
@@ -14311,7 +14395,8 @@ static std::string scan_csp_with_ownership_impl(
     const std::string &k_view_incoming_hex,
     const std::string &s_view_balance_hex,
     const std::string &subaddress_map_csv, const std::string &key_images_hex,
-    const std::string &stake_return_heights_hex) {
+    const std::string &stake_return_heights_hex,
+    const std::string &return_addresses_csv = "") {
 
   auto total_start = std::chrono::high_resolution_clock::now();
 
@@ -14447,6 +14532,25 @@ static std::string scan_csp_with_ownership_impl(
         }
       }
     }
+
+    // Parse return addresses for RETURN transaction detection
+    // Format: comma-separated 64-char hex public keys (K_r values from
+    // return_output_map)
+    std::set<crypto::public_key> return_addresses;
+    if (!return_addresses_csv.empty()) {
+      std::istringstream iss(return_addresses_csv);
+      std::string pk_hex;
+      while (std::getline(iss, pk_hex, ',')) {
+        if (pk_hex.length() == 64) {
+          crypto::public_key pk;
+          if (epee::string_tools::hex_to_pod(pk_hex, pk)) {
+            return_addresses.insert(pk);
+          }
+        }
+      }
+    }
+    bool do_return_address_check = !return_addresses.empty();
+    size_t return_address_matches = 0;
 
     // Parse CSP buffer
     const uint8_t *ptr = reinterpret_cast<const uint8_t *>(csp_ptr);
@@ -14606,6 +14710,14 @@ static std::string scan_csp_with_ownership_impl(
 
         bool verified = false;
 
+        // Check if output key matches a known return address (for RETURN tx detection)
+        if (do_return_address_check && return_addresses.count(output_key) > 0) {
+          verified = true;
+          return_address_matches++;
+        }
+
+        // Skip view tag matching if already verified via return address check
+        if (!verified) {
         // Type-0 coinbase/protocol outputs have NO view tag.
         // These include miner/protocol payouts ("block unlocked" / yield),
         // which the CLI wallet tracks. We MUST do full derivation + subaddress
@@ -15142,6 +15254,7 @@ static std::string scan_csp_with_ownership_impl(
             }
           }
         }
+        } // End of if (!verified) - view tag matching
 
         if (verified) {
           verified_matches.push_back({chunk_tx_index, out_idx, block_height});
@@ -15180,6 +15293,7 @@ static std::string scan_csp_with_ownership_impl(
         << "\"tx_count\":" << tx_count << ","
         << "\"total_outputs\":" << total_outputs << ","
         << "\"view_tag_matches\":" << view_tag_matches << ","
+        << "\"return_address_matches\":" << return_address_matches << ","
         << "\"ownership_verified\":" << ownership_verified << ","
         << "\"coinbase_passthrough\":" << coinbase_passthrough << ","
         << "\"input_count\":" << total_inputs << ","
@@ -15205,10 +15319,12 @@ scan_csp_with_ownership(uintptr_t csp_ptr, size_t csp_size,
                         const std::string &k_view_incoming_hex,
                         const std::string &s_view_balance_hex,
                         const std::string &subaddress_map_csv,
-                        const std::string &stake_return_heights_hex = "") {
+                        const std::string &stake_return_heights_hex = "",
+                        const std::string &return_addresses_csv = "") {
   return scan_csp_with_ownership_impl(
       csp_ptr, csp_size, view_secret_key_hex, k_view_incoming_hex,
-      s_view_balance_hex, subaddress_map_csv, "", stake_return_heights_hex);
+      s_view_balance_hex, subaddress_map_csv, "", stake_return_heights_hex,
+      return_addresses_csv);
 }
 
 // CSP v6: Ownership verification + spent detection
@@ -15217,11 +15333,13 @@ std::string scan_csp_with_ownership_and_spent(
     const std::string &k_view_incoming_hex, const std::string &key_images_hex,
     const std::string &s_view_balance_hex,
     const std::string &subaddress_map_csv,
-    const std::string &stake_return_heights_hex) {
+    const std::string &stake_return_heights_hex,
+    const std::string &return_addresses_csv = "") {
   return scan_csp_with_ownership_impl(csp_ptr, csp_size, view_secret_key_hex,
                                       k_view_incoming_hex, s_view_balance_hex,
                                       subaddress_map_csv, key_images_hex,
-                                      stake_return_heights_hex);
+                                      stake_return_heights_hex,
+                                      return_addresses_csv);
 }
 // ============================================================================
 // SERVER-SIDE EPEE TO CSP CONVERSION
@@ -18188,6 +18306,113 @@ std::string extract_all_stakes(uintptr_t epee_ptr, size_t epee_size,
   return oss.str();
 }
 
+// ============================================================================
+// EXTRACT RETURN TRANSACTION HEIGHTS
+// v5.52.0: Fast index of all RETURN-type transaction heights
+// Used by Phase 2b to fetch sparse RETURN txs instead of rescanning entire chain
+// ============================================================================
+std::string extract_return_tx_heights(uintptr_t epee_ptr, size_t epee_size,
+                                      double start_height_d) {
+  std::ostringstream oss;
+  uint64_t start_height = static_cast<uint64_t>(start_height_d);
+
+  // Stats
+  uint32_t blocks_parsed = 0;
+  uint32_t returns_found = 0;
+  uint32_t txs_scanned = 0;
+
+  // Debug: count all tx types
+  std::map<int, uint32_t> tx_type_counts;
+
+  try {
+    if (epee_ptr == 0 || epee_size < 10) {
+      return "{\"error\":\"invalid epee buffer\",\"success\":false}";
+    }
+
+    const std::string epee_data(reinterpret_cast<const char *>(epee_ptr),
+                                epee_size);
+
+    // Parse Epee response
+    cryptonote::COMMAND_RPC_GET_BLOCKS_FAST::response res;
+    bool parsed = epee::serialization::load_t_from_binary(res, epee_data);
+
+    if (!parsed) {
+      return "{\"error\":\"epee parse failed\",\"success\":false}";
+    }
+
+    // Build heights array (deduplicated - one entry per height even if multiple
+    // RETURN txs)
+    std::set<uint32_t> return_heights;
+    uint32_t current_block_height = static_cast<uint32_t>(start_height);
+
+    for (const auto &block_entry : res.blocks) {
+      cryptonote::block blk;
+      if (!cryptonote::parse_and_validate_block_from_blob(block_entry.block,
+                                                          blk)) {
+        current_block_height++;
+        continue;
+      }
+      blocks_parsed++;
+
+      // Check user transactions for RETURN type
+      for (const auto &tx_blob_entry : block_entry.txs) {
+        txs_scanned++;
+        cryptonote::transaction tx;
+        crypto::hash tx_hash;
+
+        if (!cryptonote::parse_and_validate_tx_from_blob(tx_blob_entry.blob, tx,
+                                                         tx_hash)) {
+          continue;
+        }
+
+        // Count all tx types for debugging
+        int tx_type_int = static_cast<int>(tx.type);
+        tx_type_counts[tx_type_int]++;
+
+        // RETURN transactions are user-initiated returns of funds
+        if (tx.type == cryptonote::transaction_type::RETURN) {
+          return_heights.insert(current_block_height);
+          returns_found++;
+        }
+      }
+
+      current_block_height++;
+    }
+
+    // Build JSON response
+    oss << "{\"heights\":[";
+    bool first = true;
+    for (uint32_t h : return_heights) {
+      if (!first)
+        oss << ",";
+      first = false;
+      oss << h;
+    }
+    oss << "],";
+    oss << "\"stats\":{";
+    oss << "\"blocks_parsed\":" << blocks_parsed << ",";
+    oss << "\"returns_found\":" << returns_found << ",";
+    oss << "\"unique_heights\":" << return_heights.size() << ",";
+    oss << "\"txs_scanned\":" << txs_scanned << ",";
+    oss << "\"tx_types\":{";
+    bool first_type = true;
+    for (const auto &kv : tx_type_counts) {
+      if (!first_type)
+        oss << ",";
+      first_type = false;
+      oss << "\"" << kv.first << "\":" << kv.second;
+    }
+    oss << "}";
+    oss << "},";
+    oss << "\"success\":true}";
+
+  } catch (const std::exception &e) {
+    return "{\"error\":\"" + std::string(e.what()) + "\",\"success\":false}";
+  }
+
+  return oss.str();
+}
+
 std::string debug_inspect_tx_keys(std::string tx_hex) {
   std::string tx_blob;
   epee::string_tools::parse_hexstr_to_binbuff(tx_hex, tx_blob);
@@ -18462,6 +18687,12 @@ EMSCRIPTEN_BINDINGS(salvium_wallet) {
       .function("get_spent_key_images_csv_chunk",
                 &WasmWallet::get_spent_key_images_csv_chunk)
 
+      // Export return addresses for RETURN transaction detection
+      // These are K_r values from our outgoing transfers that recipients can
+      // use to send RETURN transactions back to us
+      .function("get_return_addresses_csv",
+                &WasmWallet::get_return_addresses_csv)
+
       // Check if TX spends any of our outputs
        .function("check_tx_spends_our_outputs",
                  &WasmWallet::check_tx_spends_our_outputs)
@@ -18714,6 +18945,7 @@ EMSCRIPTEN_BINDINGS(salvium_wallet) {
   // Usage: extract_all_stakes(ptr, size, startHeight) -> {stakes: [...], stats,
   // success}
   function("extract_all_stakes", &extract_all_stakes);
+  function("extract_return_tx_heights", &extract_return_tx_heights);
   function("extract_key_images", &extract_key_images);
 
   // ========================================================================

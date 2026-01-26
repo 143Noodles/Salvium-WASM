@@ -104,7 +104,7 @@ FilesystemStatus WasmFilesystem::get_status() const {
     status.is_mounted = m_mounted;
     status.has_pending_writes = m_sync_pending;
     status.last_sync_time = m_last_sync_time;
-    status.pending_bytes = 0;  // TODO: Track this
+    status.pending_bytes = 0;  // Not tracked - would require intercepting all writes
     status.error_message = m_last_error;
     return status;
 }

@@ -525,7 +525,7 @@ RUN echo "=== Linking final WASM binary ===" \
        -s MODULARIZE=1 \
        -s EXPORT_NAME="SalviumWallet" \
        -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","FS","getValue","setValue"]' \
-       -s EXPORTED_FUNCTIONS='["_fast_generate_key_derivation","_fast_batch_key_derivations","_donna64_get_version","_donna64_benchmark","_donna64_debug_test","_donna64_debug_get_byte","_donna64_debug_full_trace","_donna64_debug_get_scalar_e","_donna64_debug_get_point_P","_donna64_debug_get_precomp_1P","_donna64_debug_get_precomp_2P","_donna64_debug_get_precomp_8P","_donna64_debug_get_after_scalarmult","_donna64_debug_get_iter0","_donna64_debug_get_flags","_donna64_debug_test_decompress","_donna64_debug_test_field","_donna64_debug_run_doubling_trace","_donna64_debug_trace_get_input_X","_donna64_debug_trace_get_input_Y","_donna64_debug_trace_get_input_Z","_donna64_debug_trace_get_A","_donna64_debug_trace_get_B","_donna64_debug_trace_get_C","_donna64_debug_trace_get_D","_donna64_debug_trace_get_E","_donna64_debug_trace_get_F","_donna64_debug_trace_get_G","_donna64_debug_trace_get_H","_donna64_debug_trace_get_I","_donna64_debug_trace_get_p1p1_X","_donna64_debug_trace_get_p1p1_Y","_donna64_debug_trace_get_p1p1_Z","_donna64_debug_trace_get_p1p1_T","_donna64_debug_trace_get_result_X","_donna64_debug_trace_get_result_Y","_donna64_debug_trace_get_result_Z","_donna64_debug_trace_get_final","_malloc","_free"]' \
+       -s EXPORTED_FUNCTIONS='["_fast_generate_key_derivation","_fast_batch_key_derivations","_donna64_get_version","_malloc","_free"]' \
        -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
        -s DISABLE_EXCEPTION_CATCHING=0 \
        -s ENVIRONMENT='web,worker,node' \

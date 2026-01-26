@@ -79,12 +79,13 @@ struct WasmHttpResponseCache {
     return asset_type + ":" + std::to_string(index);
   }
 
-  // Store the last get_outs request body so JS can fetch exact outputs
-  // requested This enables two-phase transaction creation:
-  // 1. First attempt fails with cache miss, but we capture the request
-  // 2. JS reads the request, fetches exact outputs, injects them
+  // Store ALL get_outs request bodies so JS can fetch exact outputs
+  // requested. This enables two-phase transaction creation:
+  // 1. First attempt fails with cache misses, but we capture ALL requests
+  // 2. JS reads the requests, fetches exact outputs, injects them
   // 3. Second attempt succeeds
-  std::string last_get_outs_request_body;
+  // Changed from single string to vector to capture ALL requests (not just last)
+  std::vector<std::string> pending_get_outs_requests;
   bool has_pending_get_outs_request = false;
 
   // Singleton access
@@ -131,7 +132,7 @@ struct WasmHttpResponseCache {
     binary_responses.clear();
     json_responses.clear();
     output_cache.clear();
-    last_get_outs_request_body.clear();
+    pending_get_outs_requests.clear();
     has_pending_get_outs_request = false;
   }
 
@@ -453,7 +454,7 @@ public:
         fprintf(stderr,
                 "[WASM HTTP] get_outs.bin: No indices parsed from request, "
                 "capturing for async fetch...\n");
-        cache.last_get_outs_request_body = body_str;
+        cache.pending_get_outs_requests.push_back(body_str);
         cache.has_pending_get_outs_request = true;
         return false;
       }
@@ -549,7 +550,7 @@ public:
           fprintf(stderr, "[WASM ERROR] Failed to serialize dynamic response, "
                           "capturing request for async fetch...\n");
           // FIX: Don't fall through - capture request and return false
-          cache.last_get_outs_request_body = body_str;
+          cache.pending_get_outs_requests.push_back(body_str);
           cache.has_pending_get_outs_request = true;
           return false;
         }
@@ -641,7 +642,7 @@ public:
         // If fallback failed or not enough cached outputs, capture request
         fprintf(stderr, "[WASM HTTP] get_outs.bin: Capturing request for async "
                         "fetch...\n");
-        cache.last_get_outs_request_body = body_str;
+        cache.pending_get_outs_requests.push_back(body_str);
         cache.has_pending_get_outs_request = true;
         return false;
       }
@@ -656,7 +657,7 @@ public:
       fprintf(stderr,
               "[WASM HTTP] get_outs.bin: Skipping binary cache, capturing "
               "request for async fetch...\n");
-      cache.last_get_outs_request_body = body_str;
+      cache.pending_get_outs_requests.push_back(body_str);
       cache.has_pending_get_outs_request = true;
       return false;
     }
@@ -762,15 +763,15 @@ public:
 
       // Capture request for async retry - JavaScript will:
       // 1. Check has_pending_get_outs_request()
-      // 2. Get the request via get_pending_get_outs_request_base64()
-      // 3. Fetch outputs from daemon
+      // 2. Get ALL requests via get_pending_get_outs_request_base64()
+      // 3. Fetch outputs from daemon for each request
       // 4. Inject outputs via inject_decoy_outputs_from_json()
       // 5. Retry the transaction creation
-      cache.last_get_outs_request_body = body_str;
+      cache.pending_get_outs_requests.push_back(body_str);
       cache.has_pending_get_outs_request = true;
       fprintf(stderr,
-              "[WASM HTTP] Captured request body for async retry (%zu bytes)\n",
-              cache.last_get_outs_request_body.size());
+              "[WASM HTTP] Captured request body for async retry (%zu bytes, %zu total requests)\n",
+              body_str.size(), cache.pending_get_outs_requests.size());
     }
 
     fprintf(
@@ -860,26 +861,34 @@ bool wasm_http_has_pending_get_outs_request() {
 
 // Get the pending get_outs request body as base64 encoded string
 // (binary data can't be returned directly through C strings)
-// Returns empty string if no pending request
-// After calling this, the request is cleared to allow for retry
+// Returns empty string if no pending requests
+// CHANGED: Now returns FIRST request and REMOVES it from queue (pop behavior)
+// Call this in a loop until it returns empty to get all pending requests
 const char *wasm_http_get_pending_get_outs_request_base64() {
   static std::string base64_result;
   auto &cache = epee::net_utils::http::WasmHttpResponseCache::instance();
   std::lock_guard<std::mutex> lock(cache.mutex);
 
-  if (!cache.has_pending_get_outs_request ||
-      cache.last_get_outs_request_body.empty()) {
+  if (cache.pending_get_outs_requests.empty()) {
     base64_result = "";
+    cache.has_pending_get_outs_request = false;
     return base64_result.c_str();
   }
+
+  // Get the FIRST request (pop from front)
+  std::string request_body = cache.pending_get_outs_requests.front();
+  cache.pending_get_outs_requests.erase(cache.pending_get_outs_requests.begin());
+
+  // Update flag based on remaining requests
+  cache.has_pending_get_outs_request = !cache.pending_get_outs_requests.empty();
 
   // Convert to base64
   static const char *base64_chars =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
   const unsigned char *bytes = reinterpret_cast<const unsigned char *>(
-      cache.last_get_outs_request_body.data());
-  size_t len = cache.last_get_outs_request_body.size();
+      request_body.data());
+  size_t len = request_body.size();
 
   base64_result.clear();
   base64_result.reserve(((len + 2) / 3) * 4);
@@ -899,41 +908,40 @@ const char *wasm_http_get_pending_get_outs_request_base64() {
 
   fprintf(stderr,
           "[WASM HTTP] Returning pending get_outs request (%zu binary bytes -> "
-          "%zu base64)\n",
-          cache.last_get_outs_request_body.size(), base64_result.size());
-
-  // Clear the pending request flag (but keep the data in case of retry)
-  cache.has_pending_get_outs_request = false;
+          "%zu base64, %zu requests remaining)\n",
+          request_body.size(), base64_result.size(),
+          cache.pending_get_outs_requests.size());
 
   return base64_result.c_str();
 }
 
-// Clear just the pending get_outs request
+// Clear ALL pending get_outs requests
 void wasm_http_clear_pending_get_outs_request() {
   auto &cache = epee::net_utils::http::WasmHttpResponseCache::instance();
   std::lock_guard<std::mutex> lock(cache.mutex);
-  cache.last_get_outs_request_body.clear();
+  cache.pending_get_outs_requests.clear();
   cache.has_pending_get_outs_request = false;
 }
 
-// Get the hashed cache key for the pending get_outs request
+// Get the hashed cache key for the first pending get_outs request
 // Returns the key that should be used when injecting outputs
 // This ensures the cached outputs match what wallet2 will request on lookup
+// NOTE: With multiple pending requests, this returns key for the FIRST one only
 const char *wasm_http_get_pending_cache_key() {
   static std::string cache_key;
   auto &cache = epee::net_utils::http::WasmHttpResponseCache::instance();
   std::lock_guard<std::mutex> lock(cache.mutex);
 
-  if (cache.last_get_outs_request_body.empty()) {
+  if (cache.pending_get_outs_requests.empty()) {
     cache_key = "/get_outs.bin";
     return cache_key.c_str();
   }
 
-  // Compute DJB2 hash of the request body (same algorithm as get_cache_key)
+  // Compute DJB2 hash of the FIRST request body (same algorithm as get_cache_key)
+  const std::string& first_request = cache.pending_get_outs_requests.front();
   unsigned long hash = 5381;
-  for (size_t i = 0; i < cache.last_get_outs_request_body.size(); ++i) {
-    hash = ((hash << 5) + hash) +
-           (unsigned char)cache.last_get_outs_request_body[i];
+  for (size_t i = 0; i < first_request.size(); ++i) {
+    hash = ((hash << 5) + hash) + (unsigned char)first_request[i];
   }
   cache_key = "/get_outs.bin:" + std::to_string(hash);
   return cache_key.c_str();
