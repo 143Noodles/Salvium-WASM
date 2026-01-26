@@ -34,7 +34,7 @@ Write-Host ""
 # Temporarily disable error action preference for docker commands
 # Docker writes progress to stderr which PowerShell treats as errors
 $ErrorActionPreference = "Continue"
-docker build -t $ImageName . 2>&1 | ForEach-Object { Write-Host $_ }
+docker build --no-cache -t $ImageName . 2>&1 | ForEach-Object { Write-Host $_ }
 $buildExitCode = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
 

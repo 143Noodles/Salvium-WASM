@@ -22,7 +22,17 @@
 #endif
 
 /* ============================================================================
- * COMPREHENSIVE DEBUG STORAGE
+ * PRODUCTION BUILD FLAG
+ * Set to 0 to enable debug functions for development/testing
+ * Set to 1 to compile out all debug code for production (saves ~3KB)
+ * ============================================================================ */
+#ifndef DONNA64_PRODUCTION
+#define DONNA64_PRODUCTION 1
+#endif
+
+#if !DONNA64_PRODUCTION
+/* ============================================================================
+ * DEBUG STORAGE (only compiled when DONNA64_PRODUCTION=0)
  * These store intermediate values for inspection from JavaScript
  * ============================================================================ */
 
@@ -59,6 +69,7 @@ static unsigned char debug_all_iters[64 * 32];
 /* Error flags */
 static int debug_decompress_ok = 0;
 static int debug_scalarmult_ok = 0;
+#endif /* !DONNA64_PRODUCTION */
 
 /**
  * Fast key derivation for wallet scanning.
@@ -151,22 +162,20 @@ int donna64_get_version(void)
     return 0x02080e;
 }
 
+#if !DONNA64_PRODUCTION
 /**
  * Debug test - returns a simple computation result that can be verified
  * Call this and compare the result to ref10 to check if donna64 is working.
- * 
+ *
  * Computes: 8 * view_sec * tx_pub where both inputs are provided
- * 
+ *
  * Return value encoding:
  * - 100: SUCCESS (all 32 bytes match expected)
- * - 0-31: First mismatch position 
+ * - 0-31: First mismatch position
  * - Negative: error (e.g., -1 = computation failed)
- * 
+ *
  * Call donna64_debug_get_byte(i) after this to get actual result[i]
  */
-
-/* Store result for inspection */
-static unsigned char debug_result[32];
 
 DONNA64_EXPORT
 int donna64_debug_test(void)
@@ -632,3 +641,4 @@ DEFINE_TRACE_GETTER(final, debug_trace_final, 32)
 
 #undef DEFINE_TRACE_GETTER
 
+#endif /* !DONNA64_PRODUCTION */

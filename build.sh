@@ -34,7 +34,7 @@ echo ""
 echo "Building Docker image (this may take 10-15 minutes on first run)..."
 echo ""
 
-docker build -t $IMAGE_NAME .
+docker build --no-cache -t $IMAGE_NAME .
 
 if [ $? -ne 0 ]; then
     echo ""
