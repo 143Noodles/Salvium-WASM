@@ -1953,13 +1953,31 @@ void wallet2::expand_subaddresses(const cryptonote::subaddress_index &index) {
 //----------------------------------------------------------------------------------------------------
 void wallet2::create_one_off_subaddress(
     const cryptonote::subaddress_index &index) {
-  const crypto::public_key pkey = get_subaddress_spend_public_key(index);
-  m_subaddresses[pkey] = index;
+  // Register PreCarrot-derived key
+  const crypto::public_key pkey_precarrot = get_subaddress_spend_public_key(index);
+  m_subaddresses[pkey_precarrot] = index;
+
+  // FIX: Also compute and register Carrot-derived key
+  // Carrot uses multiplicative derivation (K^j_s = k^j_subscal * K_s)
+  // PreCarrot uses additive derivation (D = B + M)
+  // Both keys must be in m_subaddresses for proper output detection and spending
+  try {
+    carrot::subaddress_index_extended carrot_idx{
+        {index.major, index.minor},
+        carrot::AddressDeriveType::Carrot,
+        false};
+    carrot::CarrotDestinationV1 carrot_addr = m_account.subaddress(carrot_idx);
+    if (carrot_addr.address_spend_pubkey != pkey_precarrot) {
+      m_subaddresses[carrot_addr.address_spend_pubkey] = index;
+    }
+  } catch (...) {
+    // Carrot derivation may fail if account not fully initialized - that's OK
+  }
 
   // Also register with the Carrot account for spending
   // This is critical for WASM where subaddress lookahead is (1,1)
   std::unordered_map<crypto::public_key, carrot::subaddress_index_extended> new_addresses;
-  new_addresses.insert({pkey,
+  new_addresses.insert({pkey_precarrot,
                         {{index.major, index.minor},
                          carrot::AddressDeriveType::PreCarrot,
                          false}});
@@ -2827,6 +2845,16 @@ void wallet2::process_new_scanned_transaction(
     const bool ignore_callbacks) {
   PERF_TIMER(process_new_scanned_transaction);
 
+  // FIX: Check if this transaction was already processed to prevent double-counting
+  // This can happen during incremental scans when the same height range is re-scanned
+  if (std::find_if(m_transfers.begin(), m_transfers.end(),
+                   [&txid](const transfer_details &td) {
+                       return td.m_txid == txid;
+                   }) != m_transfers.end()) {
+    MDEBUG("Transaction " << txid << " already processed, skipping to prevent double-count");
+    return;
+  }
+
   const size_t n_outputs = tx.vout.size();
 
   THROW_WALLET_EXCEPTION_IF(
@@ -3038,6 +3066,12 @@ void wallet2::process_new_scanned_transaction(
     td.m_txid = txid;
     td.m_amount = active_scan_info->amount;
     td.asset_type = active_scan_info->asset_type;
+    // FIX: Normalize asset type to SAL1 post-fork for consistent indexing
+    // Outputs from older transactions may have "SAL", empty string, or other
+    // unexpected values. Post-fork, ALL native coin outputs should be "SAL1".
+    if (use_fork_rules(get_salvium_one_proofs_fork(), 0) && td.asset_type != "SAL1") {
+      td.asset_type = "SAL1";
+    }
     td.m_pk_index = active_scan_info->main_tx_pubkey_index;
     td.m_subaddr_index = subaddr_index_cn;
     td.m_mask = active_scan_info->amount_blinding_factor;
@@ -3103,6 +3137,36 @@ void wallet2::process_new_scanned_transaction(
       }
     }
 
+    // FIX: For Carrot TRANSFER outputs without key images, try to derive now.
+    // This can happen when a subaddress wasn't in the map during initial scan,
+    // but was registered via create_one_off_subaddress above. Now that it's
+    // registered, we can compute the key image.
+    if (!td.m_key_image_known && active_scan_info->is_carrot &&
+        tx.type != cryptonote::transaction_type::PROTOCOL &&
+        tx.type != cryptonote::transaction_type::RETURN) {
+      try {
+        // Verify the address_spend_pubkey is now in the subaddress map
+        const auto& subaddr_map = m_account.get_subaddress_map_ref();
+        bool in_map = (subaddr_map.find(active_scan_info->address_spend_pubkey) != subaddr_map.end());
+        bool is_main = (active_scan_info->address_spend_pubkey ==
+                        m_account.get_keys().m_account_address.m_spend_public_key);
+
+        if (in_map || is_main) {
+          // Derive key image using Carrot account's method
+          crypto::key_image ki = m_account.derive_key_image(
+              active_scan_info->address_spend_pubkey,
+              active_scan_info->sender_extension_g,
+              active_scan_info->sender_extension_t,
+              onetime_address);
+          td.m_key_image = ki;
+          td.m_key_image_known = true;
+          LOG_PRINT_L2("FIX: Derived key image for Carrot TRANSFER output after subaddress registration");
+        }
+      } catch (const std::exception& e) {
+        LOG_PRINT_L1("FIX: Failed to derive key image for Carrot output: " << e.what());
+      }
+    }
+
     // override the key image for PROTOCOL/RETURN tx outputs.
     // FIX v5.49.0: Handle STAKE/AUDIT txs without change outputs
     // When a STAKE tx uses ALL funds (no change), there's no entry in
@@ -3131,7 +3195,8 @@ void wallet2::process_new_scanned_transaction(
             error::wallet_internal_error,
             "cannot locate return_payment TX origin in m_transfers");
         const transfer_details &td_origin = m_transfers[td.m_td_origin_idx];
-        origin_tx_data.tx_pub_key = get_tx_pub_key_from_extra(td_origin.m_tx);
+        // FIX: Use td_origin.m_pk_index to get correct pubkey for multi-pubkey txs
+        origin_tx_data.tx_pub_key = get_tx_pub_key_from_extra(td_origin.m_tx, td_origin.m_pk_index);
         origin_tx_data.output_index = td_origin.m_internal_output_index;
         origin_tx_data.tx_type = td_origin.m_tx.type;
         have_origin_data = true;
@@ -3239,8 +3304,8 @@ void wallet2::process_new_scanned_transaction(
         tx.vout.at(td.m_internal_output_index).amount,
         td.m_global_output_index)] = m_transfers.size() - 1;
 
-    // update m_transfer_indices
-    m_transfers_indices[active_scan_info->asset_type].insert(
+    // update m_transfer_indices (use td.asset_type which is normalized post-fork)
+    m_transfers_indices[td.asset_type].insert(
         m_transfers.size() - 1);
 
     // Check for STAKE / AUDIT TX payouts
@@ -11982,7 +12047,8 @@ void wallet2::transfer_selected_rct(
       const transfer_details &td_origin =
           get_transfer_details(td.m_td_origin_idx);
       src.origin_tx_data.tx_type = td_origin.m_tx.type;
-      src.origin_tx_data.tx_pub_key = get_tx_pub_key_from_extra(td_origin.m_tx);
+      // FIX: Use td_origin.m_pk_index to get correct pubkey for multi-pubkey txs
+      src.origin_tx_data.tx_pub_key = get_tx_pub_key_from_extra(td_origin.m_tx, td_origin.m_pk_index);
       src.origin_tx_data.output_index = td_origin.m_internal_output_index;
     }
 
@@ -14051,7 +14117,8 @@ wallet2::create_transactions_return(std::vector<size_t> transfers_indices) {
              "TX pubkeys in origin TX for return_payment"));
       txkey_pub = in_additional_tx_pub_keys[td_origin.m_internal_output_index];
     } else {
-      txkey_pub = get_tx_pub_key_from_extra(td_origin.m_tx);
+      // FIX: Use td_origin.m_pk_index to get correct pubkey for multi-pubkey txs
+      txkey_pub = get_tx_pub_key_from_extra(td_origin.m_tx, td_origin.m_pk_index);
     }
     crypto::key_derivation derivation = AUTO_VAL_INIT(derivation);
     THROW_WALLET_EXCEPTION_IF(
@@ -18474,7 +18541,8 @@ crypto::key_image wallet2::get_multisig_composite_key_image(size_t n) const {
     // Flag to indicate this is a TX that uses a return_address
     const transfer_details &td_origin =
         get_transfer_details(td.m_td_origin_idx);
-    origin_tx_data.tx_pub_key = get_tx_pub_key_from_extra(td_origin.m_tx);
+    // FIX: Use td_origin.m_pk_index to get correct pubkey for multi-pubkey txs
+    origin_tx_data.tx_pub_key = get_tx_pub_key_from_extra(td_origin.m_tx, td_origin.m_pk_index);
     origin_tx_data.output_index = td_origin.m_internal_output_index;
     origin_tx_data.tx_type = td_origin.m_tx.type;
     use_origin_data = true;

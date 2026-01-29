@@ -5305,11 +5305,24 @@ public:
       }
 
       // Determine asset type based on hardfork (SAL1 for Carrot, SAL otherwise)
+      // NOTE: wallet2.cpp now normalizes all post-fork outputs to SAL1 during scanning
       const bool is_carrot_hf = m_wallet->get_current_hard_fork() >= 10;
       std::string asset_type = is_carrot_hf ? "SAL1" : "SAL";
 
       // Check balance
       uint64_t unlocked = m_wallet->unlocked_balance(0, asset_type, false);
+
+      // Also check SAL if SAL1 is empty (wallet needs rescan for normalization fix)
+      uint64_t unlocked_other = 0;
+      if (is_carrot_hf && unlocked == 0) {
+        unlocked_other = m_wallet->unlocked_balance(0, "SAL", false);
+        if (unlocked_other > 0) {
+          std::ostringstream err;
+          err << R"({"status":"error","error":"Wallet needs rescan. Funds ()"
+              << unlocked_other << R"() are indexed under old asset type. Please restore wallet from seed."})";
+          return err.str();
+        }
+      }
 
       if (unlocked == 0) {
         return R"({"status":"error","error":"No unlocked balance. Funds may still be locked."})";

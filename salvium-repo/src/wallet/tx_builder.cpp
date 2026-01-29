@@ -42,7 +42,7 @@
 // Debug flag for transaction builder - set to 1 for debug builds, 0 for production
 // WARNING: Do NOT remove the debug code structure, only toggle this flag!
 // Removing the debug code entirely has been shown to break transaction sending.
-#define TX_BUILDER_DEBUG 1
+#define TX_BUILDER_DEBUG 0
 
 #if TX_BUILDER_DEBUG
 #ifdef __EMSCRIPTEN__
@@ -63,6 +63,9 @@
 #endif
 
 // local headers
+extern "C" {
+#include "crypto/crypto-ops.h"
+}
 #include "carrot_core/address_utils.h"
 #include "carrot_core/config.h"
 #include "carrot_core/core_types.h"
@@ -99,11 +102,154 @@ template <typename T> static constexpr T div_ceil(T dividend, T divisor) {
 }
 //-------------------------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------------------------
+static bool verify_transfer_openable(const wallet2::transfer_details& td, const wallet2& w) {
+    // FIX: For Carrot enotes, we cannot use PreCarrot (CryptoNote) derivation to verify.
+    // Carrot uses multiplicative derivation: Ko = k^g_o*G + k^t_o*T + K^j_s
+    // PreCarrot uses additive derivation: P = H(R*v)*G + spend_pubkey
+    // These are fundamentally incompatible. For Carrot outputs, trust the scan result
+    // which already verified ownership via view tag matching and amount decryption.
+    if (td.is_carrot()) {
+        // Carrot outputs are verified during scanning. We need to ensure:
+        // 1. Scan succeeded (recovered_spend_pubkey is valid)
+        // 2. Key is properly registered (in subaddress map)
+        // 3. Key image is known (we can actually spend it)
+
+        if (td.m_recovered_spend_pubkey == crypto::null_pkey) {
+            TX_DEBUG_LOG("[WASM DEBUG verify] Carrot output REJECTED: null recovered_spend_pubkey\n");
+            return false;
+        }
+
+        // Check if key is in the Carrot account's subaddress map
+        const auto& subaddr_map = w.get_account().get_subaddress_map_ref();
+        bool in_subaddr_map = (subaddr_map.find(td.m_recovered_spend_pubkey) != subaddr_map.end());
+
+        // Also check main address
+        bool is_main = (td.m_recovered_spend_pubkey == w.get_account().get_keys().m_account_address.m_spend_public_key);
+
+        if (!in_subaddr_map && !is_main) {
+            TX_DEBUG_LOG("[WASM DEBUG verify] Carrot output REJECTED: recovered_spend_pubkey not in subaddress map\n");
+            return false;
+        }
+
+        // Must have known key image to be spendable
+        if (!td.m_key_image_known) {
+            TX_DEBUG_LOG("[WASM DEBUG verify] Carrot output REJECTED: key image not known\n");
+            return false;
+        }
+
+        TX_DEBUG_LOG("[WASM DEBUG verify] Carrot output ACCEPTED: valid scan result with known key image\n");
+        return true;
+    }
+
+    // --- PreCarrot (CryptoNote) verification below ---
+
+    // 1. Get P_chain (Manual Carrot + Standard)
+    crypto::public_key P_chain = crypto::null_pkey;
+    bool key_found = false;
+
+    if (td.m_tx.vout.size() > td.m_internal_output_index) {
+        const auto& out = td.m_tx.vout[td.m_internal_output_index];
+        if (out.target.type() == typeid(cryptonote::txout_to_carrot_v1)) {
+             P_chain = boost::get<cryptonote::txout_to_carrot_v1>(out.target).key;
+             key_found = true;
+        } else if (cryptonote::get_output_public_key(out, P_chain)) {
+             key_found = true;
+        }
+    }
+
+    if (!key_found) {
+        TX_DEBUG_LOG("[WASM DEBUG verify] Failed to get P_chain for input %llu\n", (unsigned long long)td.m_block_height);
+        return false;
+    }
+
+    // 2. Special Case: Return Output - Check return_output_map
+    // The map is keyed by K_r. For return outputs, P_chain SHOULD equal K_r.
+    // Direct lookup is the correct approach (same as CLI wallet tx_builder.cpp:817).
+    const auto &return_output_map = w.get_account().get_return_output_map_ref();
+    TX_DEBUG_LOG("[WASM DEBUG verify] return_output_map size: %zu\n", return_output_map.size());
+    TX_DEBUG_LOG("[WASM DEBUG verify] Looking for P_chain (should be map key K_r): %s\n",
+                 epee::string_tools::pod_to_hex(P_chain).c_str());
+    TX_DEBUG_FLUSH();
+
+    // Print all map keys for diagnostic
+    for (const auto& [map_key, info] : return_output_map) {
+        TX_DEBUG_LOG("[WASM DEBUG verify] Map KEY (K_r): %s\n",
+                     epee::string_tools::pod_to_hex(map_key).c_str());
+    }
+    TX_DEBUG_FLUSH();
+
+    // Direct lookup - P_chain should BE the map key for return outputs
+    auto it = return_output_map.find(P_chain);
+    if (it != return_output_map.end()) {
+        TX_DEBUG_LOG("[WASM DEBUG verify] FOUND P_chain as map key - this is a spendable return output!\n");
+        TX_DEBUG_FLUSH();
+        return true;
+    }
+    TX_DEBUG_LOG("[WASM DEBUG verify] P_chain NOT found as map key - registration issue?\n");
+    TX_DEBUG_FLUSH();
+
+    // 3. Prepare Candidate Keys (Tx Keys)
+    // FIX: Use m_pk_index to get the correct pubkey for multi-key transactions (stake returns)
+    std::vector<crypto::public_key> candidate_keys;
+    crypto::public_key def_key = get_tx_pub_key_from_extra(td.m_tx, td.m_pk_index);
+    if (def_key != crypto::null_pkey) candidate_keys.push_back(def_key);
+    std::vector<crypto::public_key> add_keys = get_additional_tx_pub_keys_from_extra(td.m_tx);
+    candidate_keys.insert(candidate_keys.end(), add_keys.begin(), add_keys.end());
+
+    // 4. Try Derivation using Recovered Spend Key (Handles Subaddresses & Main)
+    // We trust that 'scan' correctly identified the spend key (D or B) belonging to this wallet.
+    if (td.m_recovered_spend_pubkey != crypto::null_pkey) {
+        for (const auto& R : candidate_keys) {
+             crypto::key_derivation derivation;
+             if (!crypto::generate_key_derivation(R, w.get_account().get_keys().m_view_secret_key, derivation)) continue;
+             
+             crypto::public_key derived_key;
+             if (crypto::derive_public_key(derivation, td.m_internal_output_index, td.m_recovered_spend_pubkey, derived_key)) {
+                 if (derived_key == P_chain) {
+                     return true;
+                 }
+             }
+        }
+    }
+    
+    // 5. Last Resort: Try Main Address Key (if recovered was wrong/missing)
+    if (td.m_recovered_spend_pubkey != w.get_account().get_keys().m_account_address.m_spend_public_key) {
+         for (const auto& R : candidate_keys) {
+             crypto::key_derivation derivation;
+             if (!crypto::generate_key_derivation(R, w.get_account().get_keys().m_view_secret_key, derivation)) continue;
+             crypto::public_key derived_key;
+             if (crypto::derive_public_key(derivation, td.m_internal_output_index, w.get_account().get_keys().m_account_address.m_spend_public_key, derived_key)) {
+                 if (derived_key == P_chain) return true;
+             }
+         }
+    }
+
+    // 6. Robust Fallback: Re-derive Subaddress Spend Key from Index
+    // If m_recovered was wrong (e.g. corrupted/null) but m_subaddr_index is correct (likely), 
+    // we can deterministically regenerate the correct spend key D.
+    crypto::public_key subaddr_spend_key = w.get_account().get_device().get_subaddress_spend_public_key(
+        w.get_account().get_keys(), td.m_subaddr_index);
+        
+    if (subaddr_spend_key != td.m_recovered_spend_pubkey && 
+        subaddr_spend_key != w.get_account().get_keys().m_account_address.m_spend_public_key) {
+         for (const auto& R : candidate_keys) {
+             crypto::key_derivation derivation;
+             if (!crypto::generate_key_derivation(R, w.get_account().get_keys().m_view_secret_key, derivation)) continue;
+             crypto::public_key derived_key;
+             if (crypto::derive_public_key(derivation, td.m_internal_output_index, subaddr_spend_key, derived_key)) {
+                 if (derived_key == P_chain) return true;
+             }
+         }
+    }
+
+    return false;
+}
+
 static bool is_transfer_usable_for_input_selection(
     const wallet2::transfer_details &td, const std::uint32_t from_account,
     const std::set<std::uint32_t> from_subaddresses,
     const rct::xmr_amount ignore_above, const rct::xmr_amount ignore_below,
-    const uint64_t current_chain_height) {
+    const uint64_t current_chain_height, const wallet2& w) {
   /**
    * This additional check appears to be for fcmp++.
   const uint64_t last_locked_block_index =
@@ -132,6 +278,15 @@ static bool is_transfer_usable_for_input_selection(
                 height_unlocked
                 // && last_locked_block_index <= top_block_index
                 && acct_match && subaddr_match && amt_ok && is_v10;
+
+  // Extra check: Verify openable (filters out Ghost inputs 0 and 1)
+  if (result) {
+      if (!verify_transfer_openable(td, w)) {
+          TX_DEBUG_LOG("[WASM DEBUG] Input %llu (Amt:%llu) REJECTED by verify_transfer_openable (Ghost/Unrecoverable)\n", 
+              (unsigned long long)td.m_block_height, (unsigned long long)td.amount());
+          result = false;
+      }
+  }
 
   static int log_limit = 0;
   static int reject_counts[11] = {0}; // Track rejection reasons
@@ -374,7 +529,8 @@ carrot::select_inputs_func_t make_wallet2_single_transfer_input_selector(
     const std::uint64_t top_block_index,
     const bool allow_carrot_external_inputs_in_normal_transfers,
     const bool allow_pre_carrot_inputs_in_normal_transfers,
-    std::set<size_t> &selected_transfer_indices_out) {
+    std::set<size_t> &selected_transfer_indices_out,
+    const wallet2& w) {
   // Collect transfer_container into a `std::vector<carrot::InputCandidate>` for
   // usable inputs
   std::vector<carrot::InputCandidate> input_candidates;
@@ -385,7 +541,7 @@ carrot::select_inputs_func_t make_wallet2_single_transfer_input_selector(
     const wallet2::transfer_details &td = transfers.at(i);
     if (is_transfer_usable_for_input_selection(td, from_account,
                                                from_subaddresses, ignore_above,
-                                               ignore_below, top_block_index)) {
+                                               ignore_below, top_block_index, w)) {
       input_candidates.push_back(carrot::InputCandidate{
           .core = carrot::CarrotSelectedInput{.amount = td.amount(),
                                               .key_image = td.m_key_image},
@@ -491,8 +647,9 @@ get_sources(const std::vector<std::size_t> &selected_transfers,
       const wallet2::transfer_details &td_origin =
           w.get_transfer_details(td.m_td_origin_idx);
       src.origin_tx_data.tx_type = td_origin.m_tx.type;
+      // FIX: Use td_origin.m_pk_index to get the correct pubkey when tx has multiple pubkeys
       src.origin_tx_data.tx_pub_key =
-          cryptonote::get_tx_pub_key_from_extra(td_origin.m_tx);
+          cryptonote::get_tx_pub_key_from_extra(td_origin.m_tx, td_origin.m_pk_index);
       src.origin_tx_data.output_index = td_origin.m_internal_output_index;
     }
 
@@ -635,7 +792,7 @@ make_carrot_transaction_proposals_wallet2_transfer_impl(
             w.ignore_outputs_above(), w.ignore_outputs_below(), top_block_index,
             /*allow_carrot_external_inputs_in_normal_transfers=*/true,
             /*allow_pre_carrot_inputs_in_normal_transfers=*/true,
-            selected_transfer_indices);
+            selected_transfer_indices, w);
 
     TX_DEBUG_LOG( "[WASM DEBUG carrot_tx] Calling "
                     "make_carrot_transaction_proposal_v1_transfer()...\n");
@@ -829,7 +986,7 @@ make_carrot_transaction_proposals_wallet2_sweep(
                                    td, td.m_subaddr_index.major,
                                    /*from_subaddresses=*/{},
                                    /*ignore_above=*/MONEY_SUPPLY,
-                                   /*ignore_below=*/0, top_block_index),
+                                   /*ignore_below=*/0, top_block_index, w),
                                __func__ << ": transfer not usable as an input");
     input_amounts.push_back(td.amount());
     subaddr_account = std::min(subaddr_account, td.m_subaddr_index.major);
@@ -964,7 +1121,7 @@ make_carrot_transaction_proposals_wallet2_sweep_all(
             td, subaddr_account, subaddr_indices,
             only_below ? only_below : MONEY_SUPPLY,
             1, // ignore_below
-            top_block_index))
+            top_block_index, w))
       continue;
 
     const auto ki_it = unburned_transfers_by_key_image.find(td.m_key_image);
@@ -993,6 +1150,8 @@ make_carrot_transaction_proposals_wallet2_sweep_all(
       crypto::public_key output_pubkey = crypto::null_pkey;
       cryptonote::get_output_public_key(td.m_tx.vout[td.m_internal_output_index], output_pubkey);
       const auto &return_output_map = w.get_account().get_return_output_map_ref();
+      // The map is keyed by K_r. For return outputs, output_pubkey SHOULD equal K_r.
+      // Direct lookup is the correct approach.
       bool has_return_info = (return_output_map.find(output_pubkey) != return_output_map.end());
 
       if (!has_origin_data && !has_return_info) {
@@ -1005,7 +1164,10 @@ make_carrot_transaction_proposals_wallet2_sweep_all(
     // FIX: Skip outputs where recovered_spend_pubkey is neither main address nor in subaddress_map.
     // After seed restore, subaddresses may not be regenerated, making those outputs unspendable.
     // This catches outputs detected during scanning but can't be spent due to missing subaddress keys.
-    if (td.m_recovered_spend_pubkey != crypto::null_pkey) {
+    // EXCEPTION: PROTOCOL/RETURN tx outputs use special return_address derivation, not normal subaddresses.
+    bool is_protocol_or_return = (td.m_tx.type == cryptonote::transaction_type::PROTOCOL ||
+                                   td.m_tx.type == cryptonote::transaction_type::RETURN);
+    if (td.m_recovered_spend_pubkey != crypto::null_pkey && !is_protocol_or_return) {
       const crypto::public_key &main_spend_pubkey = w.get_account().get_keys().m_account_address.m_spend_public_key;
       bool is_main_address = (td.m_recovered_spend_pubkey == main_spend_pubkey);
       bool in_subaddress_map = (w.get_account().get_subaddress_map_cn().find(td.m_recovered_spend_pubkey) !=
@@ -1072,166 +1234,193 @@ bool get_address_openings_x_y(const cryptonote::transaction &tx,
                epee::string_tools::pod_to_hex(src.address_spend_pubkey).c_str());
   TX_DEBUG_FLUSH();
 
+    // FIX: Just-In-Time Subaddress Generation (Robust)
+    // If not Main Address and missing from map, we MUST regenerate it.
+    const crypto::public_key &main_spend_pubkey = w.get_account().get_keys().m_account_address.m_spend_public_key;
+    if (src.address_spend_pubkey != main_spend_pubkey) {
+        const auto& sub_map = w.get_account().get_subaddress_map_cn();
+        
+        if (sub_map.find(src.address_spend_pubkey) == sub_map.end()) {
+             TX_DEBUG_LOG("[WASM DEBUG] JIT: Key missing. Searching history...\n");
+             TX_DEBUG_FLUSH();
+             bool found_index = false;
+             cryptonote::subaddress_index found_idx = {0, 0};
+             // Strategy 1: Look up by Key Image (Fast)
+             try {
+                size_t transfer_idx = w.get_transfer_details(src.first_rct_key_image);
+                const auto& td = w.get_transfer_details(transfer_idx);
+                found_idx = td.m_subaddr_index;
+                found_index = true;
+                TX_DEBUG_LOG("[WASM DEBUG] JIT: Found via Key Image.\n");
+             } catch (...) {
+                // Strategy 2: Search by Spend Pubkey (Fallback)
+                // We match src.address_spend_pubkey (P) against td.m_recovered_spend_pubkey (P)
+                TX_DEBUG_LOG("[WASM DEBUG] JIT: Key Image lookup failed. Searching by Pubkey...\n");
+                wallet2::transfer_container transfers;
+                w.get_transfers(transfers);
+                for (const auto& td : transfers) {
+                    if (td.m_recovered_spend_pubkey == src.address_spend_pubkey) {
+                        found_idx = td.m_subaddr_index;
+                        found_index = true;
+                        TX_DEBUG_LOG("[WASM DEBUG] JIT: Found via Pubkey search.\n");
+                        break;
+                    }
+                }
+             }
+             if (found_index) {
+                 TX_DEBUG_LOG("[WASM DEBUG] JIT generating subaddress for index %u:%u\n", 
+                              found_idx.major, found_idx.minor);
+                 wallet2 &w_mutable = const_cast<wallet2&>(w);
+                 w_mutable.create_one_off_subaddress(found_idx);
+
+                 // FIX: Correct the stored spend pubkey to match the ON-CHAIN output key (P).
+                 // The previous JIT fix incorrectly set it to the Account Spend Key (B), which caused xG != P.
+                 // We want to target the actual one-time key on the blockchain.
+                 crypto::public_key P_chain = rct::rct2pk(src.outputs[src.real_output].second.dest);
+                 if (P_chain != src.address_spend_pubkey) {
+                     TX_DEBUG_LOG("[WASM DEBUG] JIT: Correcting garbage spend pubkey %s -> %s (On-Chain P)\n",
+                         epee::string_tools::pod_to_hex(src.address_spend_pubkey).c_str(),
+                         epee::string_tools::pod_to_hex(P_chain).c_str());
+                     const_cast<cryptonote::tx_source_entry&>(src).address_spend_pubkey = P_chain;
+                 }
+             } else {
+                 TX_DEBUG_LOG("[WASM DEBUG] JIT: CRITICAL FAILURE - Transfer not found in history.\n");
+             }
+             TX_DEBUG_FLUSH();
+        }
+    }
+
   // If the output is a return output, we can use the return output secret key
   // to derive x and y directly.
   const auto &return_output_map = w.get_account().get_return_output_map_ref();
-  TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] return_output_map size: %zu\n", return_output_map.size());
-  TX_DEBUG_FLUSH();
-
-  // Log what we're looking up
   crypto::public_key lookup_key = rct::rct2pk(src.outputs[src.real_output].second.dest);
-  TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Looking up key: %s\n",
-               epee::string_tools::pod_to_hex(lookup_key).c_str());
-  TX_DEBUG_FLUSH();
+  auto return_it = return_output_map.find(lookup_key);
+  const carrot::return_output_info_t* found_return_output = (return_it != return_output_map.end()) ? &return_it->second : nullptr;
 
-  if (return_output_map.find(lookup_key) != return_output_map.end()) {
-    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Found in return_output_map\n");
-    TX_DEBUG_FLUSH();
-    const auto &return_output = return_output_map.at(lookup_key);
+  if (found_return_output != nullptr) {
+    const auto &return_output = *found_return_output;
 
     // Check if sum_g is zero (placeholder from register_stake_return_info)
     crypto::secret_key zero_key;
     memset(&zero_key, 0, sizeof(zero_key));
+    crypto::public_key zero_pubkey;
+    memset(&zero_pubkey, 0, sizeof(zero_pubkey));
 
-    // DIAGNOSTIC: Always compute from scratch to test if stored sum_g values are wrong
-    // If this fixes the invalid_input error, it confirms the stored values are incorrect
-    if (return_output.sum_g != zero_key) {
-      TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] sum_g is non-zero BUT IGNORING - will recompute\n");
-      TX_DEBUG_FLUSH();
-      // DON'T use stored values - fall through to compute
-      // x_out = return_output.sum_g;
-      // y_out = return_output.sender_extension_t;
-      // return true;
+    // PATH 1: If sum_g is non-zero, use stored values directly (like CLI wallet)
+    if (return_output.sum_g != zero_key && return_output.K_spend_pubkey != zero_pubkey) {
+      bool r = w.get_account().try_searching_for_opening_for_onetime_address(
+          return_output.K_spend_pubkey,
+          return_output.sum_g,
+          return_output.sender_extension_t,
+          x_out,
+          y_out);
+      if (r) {
+        return true;
+      }
     }
 
-    // sum_g is zero - need to compute the actual values
-    // This happens when return_output was registered via register_stake_return_info
-    // which only stores placeholders because it doesn't have full TX data
-    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] sum_g is zero, computing from return_output_info\n");
-    TX_DEBUG_FLUSH();
-
-    // For return outputs: K_return = K_original + k_return * G
-    // The opening is: x = address_privkey_g + k_return, y = address_privkey_t
-    // (sender_extension_g/t are zero for PROTOCOL transactions)
-    //
-    // CRITICAL: K_spend_pubkey from src/transfer_details is the RETURN address, not the original!
-    // To find the original address, we must compute: K_original = K_return - k_return * G
-
-    // Step 1: Compute k_return first (we need this to find K_original)
+    // PATH 2: sum_g is zero or K_spend_pubkey is zero (no-change stake or incomplete registration)
+    // For Carrot return outputs: P = K_o + k_return * G
+    // Compute k_return from stored input_context and K_o
     crypto::secret_key k_return;
     w.get_account().s_view_balance_dev.make_internal_return_privkey(
         return_output.input_context, return_output.K_o, k_return);
 
-    // Step 2: Get K_return (the return address spend pubkey)
-    crypto::public_key K_return = src.address_spend_pubkey;
-    crypto::public_key zero_pubkey;
-    memset(&zero_pubkey, 0, sizeof(zero_pubkey));
+    // Try to find original stake output K_o in transfers to get its openings
+    wallet2::transfer_container transfers;
+    w.get_transfers(transfers);
+    bool found_stake_output = false;
+    crypto::secret_key x_stake, y_stake;
 
-    if (K_return == zero_pubkey) {
-      K_return = return_output.K_spend_pubkey;
-      TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] src.address_spend_pubkey is zero, using return_output.K_spend_pubkey\n");
-      TX_DEBUG_FLUSH();
-    }
+    for (const auto &td : transfers) {
+      crypto::public_key output_pk = crypto::null_pkey;
+      if (td.m_tx.vout.size() > td.m_internal_output_index) {
+        cryptonote::get_output_public_key(td.m_tx.vout[td.m_internal_output_index], output_pk);
+      }
 
-    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] K_return (return address): %s\n",
-                 epee::string_tools::pod_to_hex(K_return).c_str());
-    TX_DEBUG_FLUSH();
+      if (output_pk == return_output.K_o) {
+        crypto::public_key tx_pub_key = get_tx_pub_key_from_extra(td.m_tx, td.m_pk_index);
+        std::vector<crypto::public_key> additional_tx_keys = get_additional_tx_pub_keys_from_extra(td.m_tx);
 
-    // Step 3: Compute K_original = K_return - k_return * G
-    // This gives us the original address that was used for the STAKE tx
-    crypto::public_key K_original;
-    crypto::public_key k_return_pubkey;
-    crypto::secret_key_to_public_key(k_return, k_return_pubkey);
-    // K_original = K_return - k_return * G (point subtraction)
-    ge_p3 K_return_p3, k_return_pub_p3, K_original_p3;
-    ge_frombytes_vartime(&K_return_p3, reinterpret_cast<const unsigned char*>(&K_return));
-    ge_frombytes_vartime(&k_return_pub_p3, reinterpret_cast<const unsigned char*>(&k_return_pubkey));
-    // Negate k_return_pubkey
-    ge_cached k_return_neg_cached;
-    ge_p3_to_cached(&k_return_neg_cached, &k_return_pub_p3);
-    // We need to negate the point: -P = (x, -y) in extended coordinates
-    // Actually, use subtraction: K_original = K_return + (-k_return * G)
-    // Compute -k_return
-    crypto::secret_key neg_k_return;
-    sc_sub(reinterpret_cast<unsigned char*>(&neg_k_return),
-           reinterpret_cast<const unsigned char*>(&zero_pubkey),  // 0
-           reinterpret_cast<const unsigned char*>(&k_return));
-    crypto::public_key neg_k_return_pubkey;
-    crypto::secret_key_to_public_key(neg_k_return, neg_k_return_pubkey);
-    // K_original = K_return + neg_k_return * G
-    ge_p3 neg_k_return_p3;
-    ge_frombytes_vartime(&neg_k_return_p3, reinterpret_cast<const unsigned char*>(&neg_k_return_pubkey));
-    ge_cached neg_k_return_cached;
-    ge_p3_to_cached(&neg_k_return_cached, &neg_k_return_p3);
-    ge_p1p1 K_original_p1p1;
-    ge_add(&K_original_p1p1, &K_return_p3, &neg_k_return_cached);
-    ge_p1p1_to_p3(&K_original_p3, &K_original_p1p1);
-    ge_p3_tobytes(reinterpret_cast<unsigned char*>(&K_original), &K_original_p3);
+        std::vector<crypto::key_derivation> main_derivations;
+        std::vector<crypto::key_derivation> additional_derivations;
+        std::vector<crypto::public_key> v_pubkeys{tx_pub_key};
+        epee::span<const crypto::public_key> main_tx_keys = (tx_pub_key == crypto::null_pkey)
+            ? epee::span<const crypto::public_key>()
+            : epee::to_span(v_pubkeys);
+        epee::span<const crypto::public_key> add_tx_keys = epee::to_span(additional_tx_keys);
 
-    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] K_original (computed): %s\n",
-                 epee::string_tools::pod_to_hex(K_original).c_str());
-    TX_DEBUG_FLUSH();
+        wallet::perform_ecdh_derivations(
+            main_tx_keys, add_tx_keys,
+            w.get_account().get_keys().k_view_incoming,
+            w.get_account().get_keys().get_device(), true,
+            main_derivations, additional_derivations);
 
-    // Step 4: Check if K_original is the main address or a subaddress
-    crypto::public_key main_spend_pubkey = w.get_account().get_keys().m_account_address.m_spend_public_key;
-    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] main_spend_pubkey: %s\n",
-                 epee::string_tools::pod_to_hex(main_spend_pubkey).c_str());
-    TX_DEBUG_FLUSH();
+        bool got_stake_openings = false;
 
-    crypto::secret_key address_privkey_g, address_privkey_t;
-    bool found_subaddr = false;
+        if (!main_derivations.empty() || !additional_derivations.empty()) {
+          crypto::key_derivation kd = main_derivations.size() ? main_derivations[0]
+              : (additional_derivations.size() > td.m_internal_output_index
+                  ? additional_derivations[td.m_internal_output_index]
+                  : crypto::key_derivation{});
 
-    if (K_original == main_spend_pubkey) {
-      // Original was main address (0,0)
-      address_privkey_g = w.get_account().get_keys().m_spend_secret_key;
-      memset(&address_privkey_t, 0, sizeof(address_privkey_t));
-      found_subaddr = true;
-      TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] K_original matches main address\n");
-      TX_DEBUG_FLUSH();
-    } else {
-      // Try to find K_original in subaddress map
-      found_subaddr = w.get_account().try_searching_for_opening_for_subaddress(
-          K_original, address_privkey_g, address_privkey_t);
+          crypto::public_key derived_pubkey;
+          if (crypto::derive_public_key(kd, td.m_internal_output_index,
+                  w.get_account().get_keys().m_account_address.m_spend_public_key, derived_pubkey)) {
+            if (derived_pubkey == return_output.K_o) {
+              crypto::derive_secret_key(kd, td.m_internal_output_index,
+                  w.get_account().get_keys().m_spend_secret_key, x_stake);
+              memset(&y_stake, 0, sizeof(y_stake));
+              got_stake_openings = true;
+            }
+          }
 
-      if (found_subaddr) {
-        TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] K_original found in subaddress_map\n");
-        TX_DEBUG_FLUSH();
-      } else {
-        TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] K_original not in subaddress_map, using main address as fallback\n");
-        TX_DEBUG_FLUSH();
-        // Fallback to main address - this might be wrong but better than failing
-        address_privkey_g = w.get_account().get_keys().m_spend_secret_key;
-        memset(&address_privkey_t, 0, sizeof(address_privkey_t));
-        found_subaddr = true;
+          if (!got_stake_openings) {
+            const auto &subaddr_map = w.get_account().get_subaddress_map_cn();
+            for (const auto &[spend_pk, idx] : subaddr_map) {
+              if (crypto::derive_public_key(kd, td.m_internal_output_index, spend_pk, derived_pubkey)) {
+                if (derived_pubkey == return_output.K_o) {
+                  crypto::secret_key subaddr_secret;
+                  crypto::secret_key m = w.get_account().get_device().get_subaddress_secret_key(
+                      w.get_account().get_keys().m_view_secret_key, idx);
+                  sc_add(reinterpret_cast<unsigned char*>(&subaddr_secret),
+                         reinterpret_cast<const unsigned char*>(&w.get_account().get_keys().m_spend_secret_key),
+                         reinterpret_cast<const unsigned char*>(&m));
+                  crypto::derive_secret_key(kd, td.m_internal_output_index, subaddr_secret, x_stake);
+                  memset(&y_stake, 0, sizeof(y_stake));
+                  got_stake_openings = true;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        if (got_stake_openings) {
+          found_stake_output = true;
+          break;
+        }
       }
     }
 
-    if (!found_subaddr) {
-      TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Could not find address opening\n");
-      TX_DEBUG_FLUSH();
-      // Fall through to normal derivation path below
-    } else {
-      // Step 5: Compute the final opening
-      // x = address_privkey_g + k_return, y = address_privkey_t
-
-      TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Computed k_return, computing x = address_privkey_g + k_return\n");
-      TX_DEBUG_FLUSH();
-
-      // Step 4: Compute the final opening
-      // x = address_privkey_g + k_return (sender_extension_g = 0 for PROTOCOL tx)
-      // y = address_privkey_t (sender_extension_t = 0 for PROTOCOL tx)
+    if (found_stake_output) {
+      // Return output opening: x = x_stake + k_return, y = y_stake
       sc_add(reinterpret_cast<unsigned char*>(&x_out),
-             reinterpret_cast<const unsigned char*>(&address_privkey_g),
+             reinterpret_cast<const unsigned char*>(&x_stake),
              reinterpret_cast<const unsigned char*>(&k_return));
-      y_out = address_privkey_t;
-
-      TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] SUCCESS - computed x,y from return_output_info\n");
-      TX_DEBUG_FLUSH();
+      y_out = y_stake;
       return true;
     }
+
+    // FALLBACK: For no-change stakes, use main address formula directly
+    // x = m_spend_secret_key + k_return, y = 0
+    const crypto::secret_key& address_privkey_g = w.get_account().get_keys().m_spend_secret_key;
+    sc_add(reinterpret_cast<unsigned char*>(&x_out),
+           reinterpret_cast<const unsigned char*>(&address_privkey_g),
+           reinterpret_cast<const unsigned char*>(&k_return));
+    memset(&y_out, 0, sizeof(y_out));
+    return true;
   }
-  TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] NOT in return_output_map, trying derivations\n");
-  TX_DEBUG_FLUSH();
 
   const std::vector<crypto::public_key> v_pubkeys{src.real_out_tx_key};
   const std::vector<crypto::public_key> v_pubkeys_empty{};
@@ -1318,6 +1507,23 @@ bool get_address_openings_x_y(const cryptonote::transaction &tx,
                  i, epee::string_tools::pod_to_hex(address_spend_pubkey_out).c_str());
     TX_DEBUG_FLUSH();
 
+    // For Carrot outputs, verify using can_open_fcmp_onetime_address (proper Carrot verification)
+    // For PreCarrot, the equality check address_spend_pubkey == P_chain was used, but that's
+    // WRONG for Carrot where Ko = k^g_o*G + k^t_o*T + K^j_s (they're never equal by design)
+    crypto::public_key P_chain = rct::rct2pk(src.outputs[src.real_output].second.dest);
+
+    // For Carrot: verify we can open this output with the derived extensions
+    bool can_open = w.get_account().can_open_fcmp_onetime_address(
+        address_spend_pubkey_out, sender_extension_g_out, sender_extension_t_out, P_chain);
+
+    if (!can_open) {
+        TX_DEBUG_LOG("[WASM DEBUG] Cannot open Carrot output with derived keys. address_spend_pubkey=%s, P_chain=%s. Skipping.\n",
+            epee::string_tools::pod_to_hex(address_spend_pubkey_out).c_str(),
+            epee::string_tools::pod_to_hex(P_chain).c_str());
+        continue;
+    }
+    TX_DEBUG_LOG("[WASM DEBUG] Carrot output CAN be opened with derived keys.\n");
+
     r = w.get_account().try_searching_for_opening_for_onetime_address(
         address_spend_pubkey_out, sender_extension_g_out,
         sender_extension_t_out, x_out, y_out);
@@ -1338,6 +1544,9 @@ bool get_address_openings_x_y(const cryptonote::transaction &tx,
     TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Derivation failed, trying stored src.address_spend_pubkey\n");
     TX_DEBUG_FLUSH();
 
+    // Define P_chain for recovery logic
+    crypto::public_key P_chain = rct::rct2pk(src.outputs[src.real_output].second.dest);
+
     // FIX: If derivation failed but we have a stored address_spend_pubkey from scanning,
     // try using it directly. This handles cases where the derivation path differs
     // between scanning and spending.
@@ -1346,104 +1555,211 @@ bool get_address_openings_x_y(const cryptonote::transaction &tx,
                    epee::string_tools::pod_to_hex(src.address_spend_pubkey).c_str());
       TX_DEBUG_FLUSH();
 
-      // We need to recompute sender extensions using the correct derivation
-      // Try both internal and external derivations again with stored pubkey
-      for (size_t i = 0; i < 2; ++i) {
-        std::vector<crypto::key_derivation> main_derivations;
-        std::vector<crypto::key_derivation> additional_derivations;
+      // Collect ALL candidate Tx Pubkeys to try (Brute Force Recovery)
+      // This handles cases where m_pk_index is wrong in the DB.
+      std::vector<crypto::public_key> candidate_keys;
+      
+      // 1. The key we thought was correct
+      if (src.real_out_tx_key != crypto::null_pkey)
+          candidate_keys.push_back(src.real_out_tx_key);
 
-        const std::vector<crypto::public_key> v_pubkeys{src.real_out_tx_key};
-        const std::vector<crypto::public_key> v_pubkeys_empty{};
-        const epee::span<const crypto::public_key> main_tx_ephemeral_pubkeys =
-            (src.real_out_tx_key == crypto::null_pkey)
-                ? epee::to_span(v_pubkeys_empty)
-                : epee::to_span(v_pubkeys);
-        const epee::span<const crypto::public_key> additional_tx_ephemeral_pubkeys =
-            epee::to_span(src.real_out_additional_tx_keys);
+      // Retrieve original transaction to extract candidate keys from the SOURCE
+      try {
+          size_t transfer_idx = w.get_transfer_details(src.first_rct_key_image);
+          const auto& td = w.get_transfer_details(transfer_idx);
+          
+          // 0. Special Case: Return Output (Re-Discovery)
+          // If the output key matches the return address, we derive x using k_return.
+          // This handles Protocol/Staking returns that were not properly mapped.
+          if (td.m_tx.return_address == P_chain) {
+               TX_DEBUG_LOG("[WASM DEBUG] Detected unmapped Return Output. Attempting recovery...\n");
+               
+               // Calculate input context for the ORIGINAL tx
+               carrot::input_context_t ctx;
+               if (td.m_tx.vin.size() > 0 && td.m_tx.vin[0].type() == typeid(cryptonote::txin_to_key)) {
+                    // Protocol tx usually spends inputs
+                    crypto::key_image ki = boost::get<cryptonote::txin_to_key>(td.m_tx.vin[0]).k_image;
+                    ctx = carrot::make_carrot_input_context(ki);
+               } else {
+                    // Fallback (e.g. genesis?)
+                    ctx = carrot::make_carrot_input_context_coinbase(td.m_block_height);
+               }
+               
+               // Derive k_return
+               crypto::secret_key k_return;
+               // Cast away constness if needed or assume method is const (it should be)
+               const_cast<wallet2&>(w).get_account().s_view_balance_dev.make_internal_return_privkey(
+                   ctx, P_chain, k_return);
+                   
+               // Derive x = k_return + B
+               const auto& keys = w.get_account().get_keys();
+               sc_add((unsigned char*)&x_out, (unsigned char*)&keys.m_spend_secret_key, (unsigned char*)&k_return);
+               
+               // y is 0 for protocol
+               memset(&y_out, 0, sizeof(y_out));
+               
+               TX_DEBUG_LOG("[WASM DEBUG] Return Output Recovery Successful!\n");
+               r = true;
+               goto brute_force_found;
+          }
 
-        if (i == 0) {
-          wallet::perform_ecdh_derivations(
-              main_tx_ephemeral_pubkeys, additional_tx_ephemeral_pubkeys,
-              w.get_account().get_keys().k_view_incoming,
-              w.get_account().get_keys().get_device(), src.carrot, main_derivations,
-              additional_derivations);
-        } else {
-          crypto::key_derivation main_derivation;
-          memcpy(main_derivation.data,
-                 w.get_account().get_keys().s_view_balance.data,
-                 sizeof(crypto::secret_key));
-          main_derivations.push_back(main_derivation);
-        }
+          // 2. The default (index 0) key from ORIGINAL tx
+          crypto::public_key default_key = get_tx_pub_key_from_extra(td.m_tx);
+          if (default_key != crypto::null_pkey)
+              candidate_keys.push_back(default_key);
+              
+          // 3. All additional keys from ORIGINAL tx
+          std::vector<crypto::public_key> additional_keys = get_additional_tx_pub_keys_from_extra(td.m_tx);
+          candidate_keys.insert(candidate_keys.end(), additional_keys.begin(), additional_keys.end());
 
-        const crypto::key_derivation &kd =
-            main_derivations.size()
-                ? main_derivations[0]
-                : additional_derivations[src.real_output_in_tx_index];
-        const mx25519_pubkey s_sender_receiver_unctx =
-            carrot::raw_byte_convert<mx25519_pubkey>(kd);
-
-        const epee::span<const crypto::public_key> enote_ephemeral_pubkeys_pk =
-            main_tx_ephemeral_pubkeys.empty() ? additional_tx_ephemeral_pubkeys
-                                              : main_tx_ephemeral_pubkeys;
-        const epee::span<const mx25519_pubkey> enote_ephemeral_pubkeys = {
-            reinterpret_cast<const mx25519_pubkey *>(
-                enote_ephemeral_pubkeys_pk.data()),
-            enote_ephemeral_pubkeys_pk.size()};
-
-        const bool shared_ephemeral_pubkey = enote_ephemeral_pubkeys.size() == 1;
-        const size_t ephemeral_pubkey_index =
-            shared_ephemeral_pubkey ? 0 : src.real_output_in_tx_index;
-
-        carrot::input_context_t input_context;
-        if (src.coinbase) {
-          input_context =
-              carrot::make_carrot_input_context_coinbase(src.block_index);
-        } else {
-          input_context =
-              carrot::make_carrot_input_context(src.first_rct_key_image);
-        }
-
-        crypto::hash s_sender_receiver;
-        make_carrot_sender_receiver_secret(
-            s_sender_receiver_unctx.data,
-            enote_ephemeral_pubkeys[ephemeral_pubkey_index], input_context,
-            s_sender_receiver);
-
-        // Compute sender extensions from s_sender_receiver
-        crypto::secret_key sender_extension_g;
-        crypto::secret_key sender_extension_t;
-        carrot::make_carrot_onetime_address_extension_g(
-            s_sender_receiver, src.outputs[src.real_output].second.mask,
-            sender_extension_g);
-        carrot::make_carrot_onetime_address_extension_t(
-            s_sender_receiver, src.outputs[src.real_output].second.mask,
-            sender_extension_t);
-
-        TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Fallback i=%zu: trying stored pubkey with computed extensions\n", i);
-        TX_DEBUG_FLUSH();
-
-        // Try with stored address_spend_pubkey instead of derived one
-        r = w.get_account().try_searching_for_opening_for_onetime_address(
-            src.address_spend_pubkey, sender_extension_g,
-            sender_extension_t, x_out, y_out);
-
-        TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] Fallback i=%zu result: %s\n",
-                     i, r ? "SUCCESS" : "FAILED");
-        TX_DEBUG_FLUSH();
-
-        if (r) {
-          TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] SUCCESS using stored address_spend_pubkey!\n");
-          TX_DEBUG_FLUSH();
-          return true;
-        }
+          // 4. Return Address (for Protocol/Staking txs)
+          // Note: protocol_tx_data is not in transaction_prefix, so we check direct return_address field
+          // which is often patched into prefix for Salvium.
+          if (td.m_tx.return_address != crypto::null_pkey)
+              candidate_keys.push_back(td.m_tx.return_address);
+          
+      } catch (...) {
+          TX_DEBUG_LOG("[WASM DEBUG] Failed to retrieve transfer details for Brute Force key extraction.\n");
       }
+
+      // Remove duplicates to avoid redundant work
+      std::sort(candidate_keys.begin(), candidate_keys.end(), [](const crypto::public_key &a, const crypto::public_key &b) {
+          return memcmp(&a, &b, 32) < 0;
+      });
+      candidate_keys.erase(std::unique(candidate_keys.begin(), candidate_keys.end()), candidate_keys.end());
+
+      TX_DEBUG_LOG("[WASM DEBUG] Brute-forcing %zu candidate keys for recovery...\n", candidate_keys.size());
+
+      for (const auto& try_key : candidate_keys) {
+          // Try both contexts: Key Image (Standard) and Height (Coinbase-like)
+          std::vector<carrot::input_context_t> candidate_contexts;
+          
+          // Context 1: Key Image (Standard for non-coinbase)
+          if (src.coinbase) {
+              candidate_contexts.push_back(carrot::make_carrot_input_context_coinbase(src.block_index));
+          } else {
+              candidate_contexts.push_back(carrot::make_carrot_input_context(src.first_rct_key_image));
+              // Context 2: Height (Fallback for Protocol/Reward outputs that might use height)
+              candidate_contexts.push_back(carrot::make_carrot_input_context_coinbase(src.block_index));
+          }
+
+          for (const auto& try_context : candidate_contexts) {
+              // We need to recompute sender extensions using the candidate key
+              // Try both internal and external derivations
+              for (size_t i = 0; i < 2; ++i) {
+                std::vector<crypto::key_derivation> main_derivations;
+                std::vector<crypto::key_derivation> additional_derivations;
+
+                const std::vector<crypto::public_key> v_pubkeys{try_key};
+                const std::vector<crypto::public_key> v_pubkeys_empty{};
+                const epee::span<const crypto::public_key> main_tx_ephemeral_pubkeys =
+                    (try_key == crypto::null_pkey)
+                        ? epee::to_span(v_pubkeys_empty)
+                        : epee::to_span(v_pubkeys);
+                const epee::span<const crypto::public_key> additional_tx_ephemeral_pubkeys =
+                    epee::to_span(src.real_out_additional_tx_keys); 
+
+                if (i == 0) {
+                  wallet::perform_ecdh_derivations(
+                      main_tx_ephemeral_pubkeys, additional_tx_ephemeral_pubkeys,
+                      w.get_account().get_keys().k_view_incoming,
+                      w.get_account().get_keys().get_device(), src.carrot, main_derivations,
+                      additional_derivations);
+                } else {
+                  crypto::key_derivation main_derivation;
+                  memcpy(main_derivation.data,
+                         w.get_account().get_keys().s_view_balance.data,
+                         sizeof(crypto::secret_key));
+                  main_derivations.push_back(main_derivation);
+                }
+
+                const crypto::key_derivation &kd =
+                    main_derivations.size()
+                        ? main_derivations[0]
+                        : additional_derivations[src.real_output_in_tx_index];
+                const mx25519_pubkey s_sender_receiver_unctx =
+                    carrot::raw_byte_convert<mx25519_pubkey>(kd);
+
+                const epee::span<const crypto::public_key> enote_ephemeral_pubkeys_pk =
+                    main_tx_ephemeral_pubkeys.empty() ? additional_tx_ephemeral_pubkeys
+                                                      : main_tx_ephemeral_pubkeys;
+                const epee::span<const mx25519_pubkey> enote_ephemeral_pubkeys = {
+                    reinterpret_cast<const mx25519_pubkey *>(
+                        enote_ephemeral_pubkeys_pk.data()),
+                    enote_ephemeral_pubkeys_pk.size()};
+
+                const bool shared_ephemeral_pubkey = enote_ephemeral_pubkeys.size() == 1;
+                const size_t ephemeral_pubkey_index =
+                    shared_ephemeral_pubkey ? 0 : src.real_output_in_tx_index;
+
+                crypto::hash s_sender_receiver;
+                make_carrot_sender_receiver_secret(
+                    s_sender_receiver_unctx.data,
+                    enote_ephemeral_pubkeys[ephemeral_pubkey_index], try_context,
+                    s_sender_receiver);
+
+                // Compute sender extensions from s_sender_receiver
+                crypto::secret_key sender_extension_g;
+                crypto::secret_key sender_extension_t;
+                carrot::make_carrot_onetime_address_extension_g(
+                    s_sender_receiver, src.outputs[src.real_output].second.mask,
+                    sender_extension_g);
+                carrot::make_carrot_onetime_address_extension_t(
+                    s_sender_receiver, src.outputs[src.real_output].second.mask,
+                    sender_extension_t);
+
+                // Compute Candidate B (Spend Key)
+                rct::key P_rct = src.outputs[src.real_output].second.dest;
+                rct::key ext_rct = rct::scalarmultBase(rct::sk2rct(sender_extension_g));
+                rct::key B_rct;
+                rct::subKeys(B_rct, P_rct, ext_rct);
+                crypto::public_key Candidate_B = rct::rct2pk(B_rct);
+
+                // Check Main Address
+                const auto& keys = w.get_account().get_keys();
+                if (Candidate_B == keys.m_account_address.m_spend_public_key) {
+                     // Found Main!
+                     sc_add((unsigned char*)&x_out, (unsigned char*)&keys.m_spend_secret_key, (unsigned char*)&sender_extension_g);
+                     y_out = sender_extension_t;
+                     r = true;
+                } 
+                // Check Subaddress Map
+                else {
+                     const auto& sub_map = w.get_account().get_subaddress_map_cn();
+                     auto it = sub_map.find(Candidate_B);
+                     if (it != sub_map.end()) {
+                          // Found Subaddress!
+                          cryptonote::subaddress_index found_idx = it->second;
+                          crypto::secret_key m = w.get_account().get_device().get_subaddress_secret_key(
+                              keys.m_view_secret_key, found_idx);
+                          crypto::secret_key b_i;
+                          sc_add((unsigned char*)&b_i, (unsigned char*)&keys.m_spend_secret_key, (unsigned char*)&m);
+                          sc_add((unsigned char*)&x_out, (unsigned char*)&b_i, (unsigned char*)&sender_extension_g);
+                          y_out = sender_extension_t; 
+                          r = true;
+                     }
+                }
+
+                if (r) {
+                  TX_DEBUG_LOG("[WASM DEBUG] Brute-force SUCCESS with key: %s\n", epee::string_tools::pod_to_hex(try_key).c_str());
+                  // Update the src to use this correct key for consistency
+                  const_cast<cryptonote::tx_source_entry&>(src).real_out_tx_key = try_key;
+                  goto brute_force_found; // Break out of all loops
+                }
+              }
+          }
+      }
+      brute_force_found:;
     }
 
-    TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] FAILED - could not find openings for output dest: %s\n",
-                 epee::string_tools::pod_to_hex(rct::rct2pk(src.outputs[src.real_output].second.dest)).c_str());
-    TX_DEBUG_FLUSH();
-    // Return false instead of throwing to allow fallback to legacy path
-    return false;
+    if (!r) {
+        TX_DEBUG_LOG("[WASM DEBUG get_address_openings_x_y] FAILED - could not find openings for output dest: %s\n",
+                     epee::string_tools::pod_to_hex(rct::rct2pk(src.outputs[src.real_output].second.dest)).c_str());
+        TX_DEBUG_FLUSH();
+        // Return false instead of throwing to allow fallback to legacy path
+        return false;
+    }
+    return true;
   }
   return true;
 }
@@ -1681,6 +1997,59 @@ cryptonote::transaction finalize_all_proofs_from_transfer_details(
       if (carrot_ok) {
         ctkey.x = rct::sk2rct(x);
         ctkey.y = rct::sk2rct(y);
+
+        // FIX: Regenerate Key Image to ensure it matches the recovered x.
+        // This is necessary if the stored Key Image was generated with the wrong R (bad index)
+        // and subsequently Brute-Forced or JIT-corrected.
+        if (src_idx < tx.vin.size()) {
+             // Get P (output public key)
+             crypto::public_key P = rct::rct2pk(src.outputs[src.real_output].second.dest);
+             crypto::key_image I_correct;
+             crypto::generate_key_image(P, x, I_correct);
+             
+             // Check if stored key image mismatches
+             if (tx.vin[src_idx].type() == typeid(cryptonote::txin_to_key)) {
+                  auto& txin = boost::get<cryptonote::txin_to_key>(tx.vin[src_idx]);
+                  if (txin.k_image != I_correct) {
+                      TX_DEBUG_LOG("[WASM DEBUG] Correcting Key Image for input %zu: %s -> %s\n", 
+                          src_idx, epee::string_tools::pod_to_hex(txin.k_image).c_str(), epee::string_tools::pod_to_hex(I_correct).c_str());
+                      TX_DEBUG_FLUSH();
+                      txin.k_image = I_correct;
+                  }
+             }
+
+             // DEBUG: Check Mask Consistency
+             rct::key C_chain = src.outputs[src.real_output].second.mask;
+             rct::key C_calc = rct::commit(src.amount, src.mask);
+             if (memcmp(&C_chain, &C_calc, 32) != 0) {
+                 TX_DEBUG_LOG("[WASM DEBUG] CRITICAL: Mask Mismatch for input %zu! Stored mask implies C=%s, but chain has C=%s\n",
+                     src_idx, epee::string_tools::pod_to_hex(C_calc).c_str(), epee::string_tools::pod_to_hex(C_chain).c_str());
+                 TX_DEBUG_FLUSH();
+             } else {
+                 TX_DEBUG_LOG("[WASM DEBUG] Mask Consistent for input %zu.\n", src_idx);
+                 TX_DEBUG_FLUSH();
+             }
+
+             // DEBUG: Verify x corresponds to P
+             crypto::public_key P_calc;
+             crypto::secret_key x_sec = rct::rct2sk(ctkey.x);
+             crypto::secret_key_to_public_key(x_sec, P_calc);
+             crypto::public_key P_chain = rct::rct2pk(src.outputs[src.real_output].second.dest);
+             
+             if (P_calc != P_chain) {
+                 TX_DEBUG_LOG("[WASM DEBUG] CRITICAL: Spend Key Mismatch! xG=%s, P=%s\n",
+                     epee::string_tools::pod_to_hex(P_calc).c_str(), epee::string_tools::pod_to_hex(P_chain).c_str());
+                 TX_DEBUG_FLUSH();
+             } else {
+                 TX_DEBUG_LOG("[WASM DEBUG] Spend Key Valid (xG == P) for input %zu\n", src_idx);
+                 // Cannot access txin easily in one line, logging from tx.vin below
+                 if (tx.vin[src_idx].type() == typeid(cryptonote::txin_to_key)) {
+                      auto& txin = boost::get<cryptonote::txin_to_key>(tx.vin[src_idx]);
+                      TX_DEBUG_LOG("[WASM DEBUG] Final TX Key Image: %s\n", epee::string_tools::pod_to_hex(txin.k_image).c_str());
+                 }
+                 TX_DEBUG_FLUSH();
+             }
+        }
       } else {
         // Carrot path failed - try legacy path as fallback
         TX_DEBUG_LOG("[WASM DEBUG] Carrot openings failed for output amount=%llu, trying legacy fallback\n",
