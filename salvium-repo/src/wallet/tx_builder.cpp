@@ -111,8 +111,37 @@ static bool verify_transfer_openable(const wallet2::transfer_details& td, const 
     if (td.is_carrot()) {
         // Carrot outputs are verified during scanning. We need to ensure:
         // 1. Scan succeeded (recovered_spend_pubkey is valid)
-        // 2. Key is properly registered (in subaddress map)
+        // 2. Key is properly registered (in subaddress map) OR is a return output
         // 3. Key image is known (we can actually spend it)
+
+        // Must have known key image to be spendable
+        if (!td.m_key_image_known) {
+            TX_DEBUG_LOG("[WASM DEBUG verify] Carrot output REJECTED: key image not known\n");
+            return false;
+        }
+
+        // v5.53.2 FIX: Check return_output_map for Carrot return outputs
+        // Return outputs use special derivation - their recovered_spend_pubkey won't be in subaddress map.
+        // The map is keyed by K_r (return address), but we have Ko (onetime address).
+        // We need to iterate through entries and check if any entry's K_o matches our output.
+        crypto::public_key Ko = crypto::null_pkey;
+        if (td.m_tx.vout.size() > td.m_internal_output_index) {
+            const auto& out = td.m_tx.vout[td.m_internal_output_index];
+            if (out.target.type() == typeid(cryptonote::txout_to_carrot_v1)) {
+                Ko = boost::get<cryptonote::txout_to_carrot_v1>(out.target).key;
+            }
+        }
+
+        if (Ko != crypto::null_pkey) {
+            const auto &return_output_map = w.get_account().get_return_output_map_ref();
+            // Iterate through entries - map is keyed by K_r but we need to match K_o
+            for (const auto& [K_r, info] : return_output_map) {
+                if (info.K_o == Ko) {
+                    TX_DEBUG_LOG("[WASM DEBUG verify] Carrot RETURN output ACCEPTED via return_output_map K_o match\n");
+                    return true;
+                }
+            }
+        }
 
         if (td.m_recovered_spend_pubkey == crypto::null_pkey) {
             TX_DEBUG_LOG("[WASM DEBUG verify] Carrot output REJECTED: null recovered_spend_pubkey\n");
@@ -128,12 +157,6 @@ static bool verify_transfer_openable(const wallet2::transfer_details& td, const 
 
         if (!in_subaddr_map && !is_main) {
             TX_DEBUG_LOG("[WASM DEBUG verify] Carrot output REJECTED: recovered_spend_pubkey not in subaddress map\n");
-            return false;
-        }
-
-        // Must have known key image to be spendable
-        if (!td.m_key_image_known) {
-            TX_DEBUG_LOG("[WASM DEBUG verify] Carrot output REJECTED: key image not known\n");
             return false;
         }
 
@@ -279,14 +302,9 @@ static bool is_transfer_usable_for_input_selection(
                 // && last_locked_block_index <= top_block_index
                 && acct_match && subaddr_match && amt_ok && is_v10;
 
-  // Extra check: Verify openable (filters out Ghost inputs 0 and 1)
-  if (result) {
-      if (!verify_transfer_openable(td, w)) {
-          TX_DEBUG_LOG("[WASM DEBUG] Input %llu (Amt:%llu) REJECTED by verify_transfer_openable (Ghost/Unrecoverable)\n", 
-              (unsigned long long)td.m_block_height, (unsigned long long)td.amount());
-          result = false;
-      }
-  }
+  // v5.53.4: REMOVED verify_transfer_openable check - CLI doesn't have it
+  // This check was blocking legitimate return outputs from being selected.
+  // The CLI wallet works fine without this extra verification.
 
   static int log_limit = 0;
   static int reject_counts[11] = {0}; // Track rejection reasons

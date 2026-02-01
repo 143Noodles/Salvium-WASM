@@ -357,8 +357,15 @@ using namespace emscripten;
 // v5.52.0:   Added create_sweep_all_transaction_json() for sweep_all functionality
 //            Sweeps ALL unlocked outputs to a destination address.
 //            Uses wallet2::create_transactions_all() internally.
+// v5.53.0:   CRITICAL FIX for RETURN tx outputs being unspendable!
+//            Spent detection was adding ALL key images from ALL tx inputs to
+//            spending_tx_map, including sender's key images from incoming txs.
+//            This caused false positives where our outputs were marked spent
+//            because a sender's key image happened to appear in some vin.
+//            Now only tracks key images that are in m_key_images (ours).
+// v5.53.5:   FIX return outputs from TRANSFER tx types (Salvium's return function)
 static const char *WASM_VERSION =
-  "5.52.0"; // Add create_sweep_all_transaction_json(dest_address, mixin, priority)
+  "5.53.5";
 
 #define WASM_DEBUG_LOGGING 0
 #if WASM_DEBUG_LOGGING
@@ -8351,81 +8358,79 @@ public:
       // in our m_transfers get marked as spent. This is critical for
       // correct balance calculation.
       //
-      // v5.36.1 OPTIMIZATION: Changed from O(n??) to O(n) using hashmap.
-      // Build a map of all key images spent by our transactions ONCE,
-      // then do a single pass to mark spent outputs.
-      // For ~3000 transfers, this reduces ~9M iterations to ~6K.
-      //
+      // v5.36.1 OPTIMIZATION: Changed from O(n²) to O(n) using hashmap.
       // v5.48.0: RE-ENABLED - was disabled in v5.36.3 for debug
+      // v5.53.1: FIX - Only track key images that are OURS (in m_key_images).
+      //          The old code added ALL key images from ALL tx inputs, including
+      //          sender's key images from incoming txs. This caused false positives
+      //          where return outputs were incorrectly marked as spent.
       // ================================================================
       trace_step = 900; // Entering post-processing spent detection
       {
         size_t post_marked_spent = 0;
         const size_t transfer_count = m_wallet->m_transfers.size();
         trace_step = 901; // Got transfer count
-        
+
         // v5.36.2 SAFETY: Sanity check transfer_count before using it
-        // If m_transfers is corrupted, size() could return garbage
         if (transfer_count > 1000000) {
-          // Corrupted - skip post-processing entirely
           DEBUG_LOG("[SPENT_DETECT] SKIP post-processing: transfer_count=%zu exceeds sanity limit\n", transfer_count);
         } else {
           trace_step = 902; // transfer_count validated
 
           // Step 1: Build map of key_image -> (spending_tx_index, block_height)
-          // This is O(n * avg_inputs_per_tx) ??? O(n)
+          // v5.53.1 FIX: Only include key images that are OURS (in m_key_images)
           std::unordered_map<crypto::key_image, std::pair<size_t, uint64_t>>
               spending_tx_map;
-          
-          // v5.36.2: Only reserve if transfer_count is reasonable
+
           if (transfer_count < 100000) {
-            spending_tx_map.reserve(transfer_count * 2); // Assume ~2 inputs avg
+            spending_tx_map.reserve(transfer_count * 2);
           }
           trace_step = 903; // Reserved map
 
-        // v5.36.1 FIX: Wrap in try-catch and use safe boost::get
-        for (size_t j = 0; j < transfer_count; ++j) {
-          trace_step = 910 + static_cast<int>(j % 100); // Post-process iteration j
-          try {
-            const auto &other_td = m_wallet->m_transfers[j];
-            const uint64_t spend_height = other_td.m_block_height;
-            
-            // Safety check for vin size
-            if (other_td.m_tx.vin.size() > 10000) continue;
+          for (size_t j = 0; j < transfer_count; ++j) {
+            trace_step = 910 + static_cast<int>(j % 100);
+            try {
+              const auto &other_td = m_wallet->m_transfers[j];
+              const uint64_t spend_height = other_td.m_block_height;
 
-            for (const auto &in : other_td.m_tx.vin) {
-              if (in.empty()) continue;
-              if (in.type() != typeid(cryptonote::txin_to_key))
-                continue;
-              // Use safe pointer form of boost::get
-              const auto *p_txin = boost::get<cryptonote::txin_to_key>(&in);
-              if (!p_txin) continue;
-              const auto &txin = *p_txin;
-              // Store the earliest spending tx for each key image
-              auto it = spending_tx_map.find(txin.k_image);
-              if (it == spending_tx_map.end() ||
-                  spend_height < it->second.second) {
-                spending_tx_map[txin.k_image] = {j, spend_height};
+              if (other_td.m_tx.vin.size() > 10000) continue;
+
+              for (const auto &in : other_td.m_tx.vin) {
+                if (in.empty()) continue;
+                if (in.type() != typeid(cryptonote::txin_to_key))
+                  continue;
+                const auto *p_txin = boost::get<cryptonote::txin_to_key>(&in);
+                if (!p_txin) continue;
+                const auto &txin = *p_txin;
+
+                // v5.53.1 FIX: Only track key images that belong to us!
+                // This prevents false positives from sender's key images in incoming txs.
+                if (m_wallet->m_key_images.count(txin.k_image) == 0) {
+                  continue; // Not our key image, skip
+                }
+
+                auto it = spending_tx_map.find(txin.k_image);
+                if (it == spending_tx_map.end() ||
+                    spend_height < it->second.second) {
+                  spending_tx_map[txin.k_image] = {j, spend_height};
+                }
               }
+            } catch (...) {
+              continue;
             }
-          } catch (...) {
-            // Skip problematic transfers
-            continue;
           }
-        }
-        trace_step = 920; // After Step 1 loop
+          trace_step = 920; // After Step 1 loop
 
           // Step 2: Single O(n) pass to mark spent outputs
           for (size_t i = 0; i < transfer_count; ++i) {
             auto &td = m_wallet->m_transfers[i];
             if (td.m_spent)
-              continue; // Already marked
+              continue;
             if (!td.m_key_image_known)
-              continue; // Can't detect without key image
+              continue;
 
             auto it = spending_tx_map.find(td.m_key_image);
             if (it != spending_tx_map.end()) {
-              // Verify the spending tx is at a higher height than our output
               if (it->second.second > td.m_block_height) {
                 td.m_spent = true;
                 td.m_spent_height = it->second.second;
@@ -8436,7 +8441,7 @@ public:
           trace_step = 930; // After Step 2 loop
 
           outputs_marked_spent_total += post_marked_spent;
-        } // end else (transfer_count sanity check)
+        }
       }
       trace_step = 940; // After post-processing block
 
@@ -9575,6 +9580,647 @@ public:
         }
       }
 
+      oss << "\"success\":true}";
+      return oss.str();
+
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  // ========================================================================
+  // MULTISIG FUNCTIONS - For 2-of-3 escrow bounty system
+  // ========================================================================
+
+  /**
+   * Get the initial multisig key exchange message
+   * This is called before make_multisig() to get the first round message
+   * @return JSON: {multisig_info: "MultisigV2...", success: true}
+   */
+  std::string prepare_multisig() {
+    try {
+      if (!m_wallet) {
+        return "{\"success\":false,\"error\":\"Wallet not initialized\"}";
+      }
+
+      std::string kex_msg = m_wallet->get_multisig_first_kex_msg();
+
+      std::ostringstream oss;
+      oss << "{\"multisig_info\":\"" << kex_msg << "\",\"success\":true}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  /**
+   * Create a multisig wallet from key exchange messages
+   * @param password Wallet password
+   * @param threshold M value (minimum signers required)
+   * @param multisig_infos_json JSON array of multisig info strings from other participants
+   * @return JSON: {address: "...", multisig_info: "..." (if more rounds needed), success: true}
+   */
+  std::string make_multisig(const std::string &password, int threshold,
+                            const std::string &multisig_infos_json) {
+    try {
+      if (!m_wallet) {
+        return "{\"success\":false,\"error\":\"Wallet not initialized\"}";
+      }
+
+      // Parse JSON array of multisig info strings
+      std::vector<std::string> kex_messages;
+
+      // Simple JSON array parsing (expects ["msg1", "msg2", ...])
+      std::string json = multisig_infos_json;
+      // Remove whitespace and brackets
+      size_t start = json.find('[');
+      size_t end = json.rfind(']');
+      if (start == std::string::npos || end == std::string::npos) {
+        return "{\"success\":false,\"error\":\"Invalid JSON array format\"}";
+      }
+      json = json.substr(start + 1, end - start - 1);
+
+      // Parse comma-separated quoted strings
+      size_t pos = 0;
+      while (pos < json.length()) {
+        // Find opening quote
+        size_t quote_start = json.find('"', pos);
+        if (quote_start == std::string::npos) break;
+
+        // Find closing quote
+        size_t quote_end = json.find('"', quote_start + 1);
+        if (quote_end == std::string::npos) break;
+
+        std::string msg = json.substr(quote_start + 1, quote_end - quote_start - 1);
+        kex_messages.push_back(msg);
+
+        pos = quote_end + 1;
+      }
+
+      if (kex_messages.empty()) {
+        return "{\"success\":false,\"error\":\"No multisig info messages provided\"}";
+      }
+
+      // Call wallet2::make_multisig
+      epee::wipeable_string pwd(password);
+      std::string next_kex_msg = m_wallet->make_multisig(pwd, kex_messages,
+                                                         static_cast<uint32_t>(threshold));
+
+      std::ostringstream oss;
+      oss << "{";
+
+      // Get the multisig address
+      auto status = m_wallet->get_multisig_status();
+      if (status.multisig_is_active) {
+        oss << "\"address\":\"" << m_wallet->get_account().get_public_address_str(
+            m_wallet->nettype()) << "\",";
+      }
+
+      // If more rounds needed, include the next message
+      if (!next_kex_msg.empty()) {
+        oss << "\"multisig_info\":\"" << next_kex_msg << "\",";
+        oss << "\"kex_complete\":false,";
+      } else {
+        oss << "\"kex_complete\":true,";
+      }
+
+      oss << "\"threshold\":" << status.threshold << ",";
+      oss << "\"total\":" << status.total << ",";
+      oss << "\"success\":true}";
+
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  /**
+   * Continue multisig key exchange (for rounds after make_multisig)
+   * @param password Wallet password
+   * @param multisig_infos_json JSON array of multisig info strings from current round
+   * @return JSON: {address: "...", multisig_info: "..." (if more rounds), success: true}
+   */
+  std::string exchange_multisig_keys(const std::string &password,
+                                     const std::string &multisig_infos_json) {
+    try {
+      if (!m_wallet) {
+        return "{\"success\":false,\"error\":\"Wallet not initialized\"}";
+      }
+
+      // Parse JSON array (same as make_multisig)
+      std::vector<std::string> kex_messages;
+      std::string json = multisig_infos_json;
+      size_t start = json.find('[');
+      size_t end = json.rfind(']');
+      if (start == std::string::npos || end == std::string::npos) {
+        return "{\"success\":false,\"error\":\"Invalid JSON array format\"}";
+      }
+      json = json.substr(start + 1, end - start - 1);
+
+      size_t pos = 0;
+      while (pos < json.length()) {
+        size_t quote_start = json.find('"', pos);
+        if (quote_start == std::string::npos) break;
+        size_t quote_end = json.find('"', quote_start + 1);
+        if (quote_end == std::string::npos) break;
+        kex_messages.push_back(json.substr(quote_start + 1, quote_end - quote_start - 1));
+        pos = quote_end + 1;
+      }
+
+      if (kex_messages.empty()) {
+        return "{\"success\":false,\"error\":\"No multisig info messages provided\"}";
+      }
+
+      // Call wallet2::exchange_multisig_keys
+      epee::wipeable_string pwd(password);
+      std::string next_kex_msg = m_wallet->exchange_multisig_keys(pwd, kex_messages, false);
+
+      std::ostringstream oss;
+      oss << "{";
+
+      auto status = m_wallet->get_multisig_status();
+      if (status.multisig_is_active) {
+        oss << "\"address\":\"" << m_wallet->get_account().get_public_address_str(
+            m_wallet->nettype()) << "\",";
+      }
+
+      if (!next_kex_msg.empty()) {
+        oss << "\"multisig_info\":\"" << next_kex_msg << "\",";
+        oss << "\"kex_complete\":false,";
+      } else {
+        oss << "\"kex_complete\":true,";
+      }
+
+      oss << "\"is_ready\":" << (status.is_ready ? "true" : "false") << ",";
+      oss << "\"threshold\":" << status.threshold << ",";
+      oss << "\"total\":" << status.total << ",";
+      oss << "\"success\":true}";
+
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  /**
+   * Get current multisig status
+   * @return JSON: {is_multisig, is_ready, threshold, total, ...}
+   */
+  std::string get_multisig_status() {
+    try {
+      if (!m_wallet) {
+        return "{\"success\":false,\"error\":\"Wallet not initialized\"}";
+      }
+
+      auto status = m_wallet->get_multisig_status();
+
+      std::ostringstream oss;
+      oss << "{";
+      oss << "\"multisig_is_active\":" << (status.multisig_is_active ? "true" : "false") << ",";
+      oss << "\"kex_is_done\":" << (status.kex_is_done ? "true" : "false") << ",";
+      oss << "\"is_ready\":" << (status.is_ready ? "true" : "false") << ",";
+      oss << "\"threshold\":" << status.threshold << ",";
+      oss << "\"total\":" << status.total << ",";
+      oss << "\"success\":true}";
+
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  /**
+   * Export multisig info for signing (partial key images)
+   * Call this before creating a multisig transaction
+   * @return JSON: {multisig_info: "base64...", success: true}
+   */
+  std::string export_multisig_info() {
+    try {
+      if (!m_wallet) {
+        return "{\"success\":false,\"error\":\"Wallet not initialized\"}";
+      }
+
+      cryptonote::blobdata data = m_wallet->export_multisig();
+      std::string encoded = epee::string_encoding::base64_encode(data);
+
+      std::ostringstream oss;
+      oss << "{\"multisig_info\":\"" << encoded << "\",\"success\":true}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  /**
+   * Import multisig info from other signers
+   * @param infos_json JSON array of base64-encoded multisig info blobs
+   * @return JSON: {num_imported: N, success: true}
+   */
+  std::string import_multisig_info(const std::string &infos_json) {
+    try {
+      if (!m_wallet) {
+        return "{\"success\":false,\"error\":\"Wallet not initialized\"}";
+      }
+
+      // Parse JSON array of base64 strings
+      std::vector<cryptonote::blobdata> blobs;
+      std::string json = infos_json;
+      size_t start = json.find('[');
+      size_t end = json.rfind(']');
+      if (start == std::string::npos || end == std::string::npos) {
+        return "{\"success\":false,\"error\":\"Invalid JSON array format\"}";
+      }
+      json = json.substr(start + 1, end - start - 1);
+
+      size_t pos = 0;
+      while (pos < json.length()) {
+        size_t quote_start = json.find('"', pos);
+        if (quote_start == std::string::npos) break;
+        size_t quote_end = json.find('"', quote_start + 1);
+        if (quote_end == std::string::npos) break;
+        std::string b64 = json.substr(quote_start + 1, quote_end - quote_start - 1);
+        blobs.push_back(epee::string_encoding::base64_decode(b64));
+        pos = quote_end + 1;
+      }
+
+      size_t num_imported = m_wallet->import_multisig(blobs);
+
+      std::ostringstream oss;
+      oss << "{\"num_imported\":" << num_imported << ",\"success\":true}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  /**
+   * Enable multisig experimental mode (required before exchange_multisig_keys)
+   * This sets the wallet attribute to allow multisig operations
+   */
+  bool enable_multisig_experimental() {
+    try {
+      if (!m_wallet) {
+        m_last_error = "Wallet not initialized";
+        return false;
+      }
+      m_wallet->set_attribute("enable-multisig-experimental", "1");
+      return true;
+    } catch (const std::exception &e) {
+      m_last_error = e.what();
+      return false;
+    }
+  }
+
+  /**
+   * Check if multisig experimental mode is enabled
+   */
+  bool is_multisig_enabled() {
+    try {
+      if (!m_wallet) return false;
+      std::string val;
+      if (m_wallet->get_attribute("enable-multisig-experimental", val)) {
+        return val == "1";
+      }
+      return false;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  // ========================================================================
+  // MULTISIG TRANSACTION FUNCTIONS - For signing/submitting multisig txs
+  // ========================================================================
+
+  /**
+   * Create a multisig transaction and return it as hex for sharing with other signers.
+   * This creates a pending transaction on a multisig wallet and exports it.
+   * @param dest_address Destination address
+   * @param amount_str Amount in atomic units as string
+   * @param mixin Ring size - 1
+   * @param priority Transaction priority (0-3)
+   * @return JSON: {tx_data_hex: "...", num_txs: N, success: true} or error
+   */
+  std::string create_multisig_tx_hex(const std::string &dest_address,
+                                      const std::string &amount_str,
+                                      int mixin, int priority) {
+    try {
+      if (!m_wallet) {
+        return "{\"success\":false,\"error\":\"Wallet not initialized\"}";
+      }
+
+      auto status = m_wallet->get_multisig_status();
+      if (!status.multisig_is_active) {
+        return "{\"success\":false,\"error\":\"Wallet is not a multisig wallet\"}";
+      }
+      if (!status.is_ready) {
+        return "{\"success\":false,\"error\":\"Multisig wallet not ready - key exchange incomplete\"}";
+      }
+
+      // Parse destination address
+      cryptonote::address_parse_info info;
+      if (!cryptonote::get_account_address_from_str(info, m_wallet->nettype(), dest_address)) {
+        return "{\"success\":false,\"error\":\"Invalid destination address\"}";
+      }
+
+      // Parse amount
+      uint64_t amount = 0;
+      try {
+        amount = std::stoull(amount_str);
+      } catch (...) {
+        return "{\"success\":false,\"error\":\"Invalid amount\"}";
+      }
+
+      // Create destination
+      std::vector<cryptonote::tx_destination_entry> dsts;
+      cryptonote::tx_destination_entry dst;
+      dst.addr = info.address;
+      dst.is_subaddress = info.is_subaddress;
+      dst.amount = amount;
+      dst.asset_type = "SAL";
+      dsts.push_back(dst);
+
+      // Create the transaction
+      std::vector<tools::wallet2::pending_tx> ptx_vector = m_wallet->create_transactions_2(
+          dsts,
+          "SAL",  // source_asset
+          "SAL",  // dest_asset
+          cryptonote::transaction_type::TRANSFER,
+          mixin,
+          0,      // unlock_time
+          priority,
+          std::vector<uint8_t>(),  // extra
+          0,      // subaddr_account
+          {}      // subaddr_indices
+      );
+
+      if (ptx_vector.empty()) {
+        return "{\"success\":false,\"error\":\"No transaction created\"}";
+      }
+
+      // Convert to multisig tx set and export
+      std::string tx_data = m_wallet->save_multisig_tx(ptx_vector);
+      if (tx_data.empty()) {
+        return "{\"success\":false,\"error\":\"Failed to export multisig transaction\"}";
+      }
+
+      // Convert to hex for transport
+      std::string tx_data_hex = epee::string_tools::buff_to_hex_nodelimer(tx_data);
+
+      std::ostringstream oss;
+      oss << "{\"tx_data_hex\":\"" << tx_data_hex << "\",";
+      oss << "\"num_txs\":" << ptx_vector.size() << ",";
+      oss << "\"success\":true}";
+      return oss.str();
+
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  /**
+   * Sign a multisig transaction received from another signer.
+   * @param tx_data_hex The multisig tx data as hex string
+   * @return JSON: {tx_data_hex: "...", tx_hash_list: [...], ready: bool, success: true}
+   */
+  std::string sign_multisig_tx_hex(const std::string &tx_data_hex) {
+    try {
+      if (!m_wallet) {
+        return "{\"success\":false,\"error\":\"Wallet not initialized\"}";
+      }
+
+      auto status = m_wallet->get_multisig_status();
+      if (!status.multisig_is_active) {
+        return "{\"success\":false,\"error\":\"Wallet is not a multisig wallet\"}";
+      }
+
+      // Decode hex to binary
+      std::string tx_data;
+      if (!epee::string_tools::parse_hexstr_to_binbuff(tx_data_hex, tx_data)) {
+        return "{\"success\":false,\"error\":\"Invalid hex data\"}";
+      }
+
+      // Parse the multisig tx set
+      tools::wallet2::multisig_tx_set exported_txs;
+      if (!m_wallet->load_multisig_tx(tx_data, exported_txs)) {
+        return "{\"success\":false,\"error\":\"Failed to parse multisig transaction data\"}";
+      }
+
+      // Sign it
+      std::vector<crypto::hash> txids;
+      bool signed_ok = m_wallet->sign_multisig_tx(exported_txs, txids);
+      if (!signed_ok) {
+        return "{\"success\":false,\"error\":\"Failed to sign multisig transaction\"}";
+      }
+
+      // Export the signed tx
+      std::string signed_data = m_wallet->save_multisig_tx(exported_txs);
+      if (signed_data.empty()) {
+        return "{\"success\":false,\"error\":\"Failed to export signed transaction\"}";
+      }
+
+      std::string signed_hex = epee::string_tools::buff_to_hex_nodelimer(signed_data);
+
+      // Check if fully signed (ready to submit)
+      bool is_ready = exported_txs.m_signers.size() >= status.threshold;
+
+      // Build tx hash list
+      std::ostringstream oss;
+      oss << "{\"tx_data_hex\":\"" << signed_hex << "\",";
+      oss << "\"tx_hash_list\":[";
+      for (size_t i = 0; i < txids.size(); ++i) {
+        if (i > 0) oss << ",";
+        oss << "\"" << epee::string_tools::pod_to_hex(txids[i]) << "\"";
+      }
+      oss << "],";
+      oss << "\"signers\":" << exported_txs.m_signers.size() << ",";
+      oss << "\"threshold\":" << status.threshold << ",";
+      oss << "\"ready\":" << (is_ready ? "true" : "false") << ",";
+      oss << "\"success\":true}";
+      return oss.str();
+
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  /**
+   * Describe a multisig transaction (get info without signing).
+   * @param tx_data_hex The multisig tx data as hex string
+   * @return JSON with transaction details
+   */
+  std::string describe_multisig_tx_hex(const std::string &tx_data_hex) {
+    try {
+      if (!m_wallet) {
+        return "{\"success\":false,\"error\":\"Wallet not initialized\"}";
+      }
+
+      // Decode hex to binary
+      std::string tx_data;
+      if (!epee::string_tools::parse_hexstr_to_binbuff(tx_data_hex, tx_data)) {
+        return "{\"success\":false,\"error\":\"Invalid hex data\"}";
+      }
+
+      // Parse the multisig tx set
+      tools::wallet2::multisig_tx_set exported_txs;
+      if (!m_wallet->load_multisig_tx(tx_data, exported_txs)) {
+        return "{\"success\":false,\"error\":\"Failed to parse multisig transaction data\"}";
+      }
+
+      auto status = m_wallet->get_multisig_status();
+
+      std::ostringstream oss;
+      oss << "{\"num_txs\":" << exported_txs.m_ptx.size() << ",";
+      oss << "\"signers\":" << exported_txs.m_signers.size() << ",";
+      oss << "\"threshold\":" << status.threshold << ",";
+      oss << "\"ready\":" << (exported_txs.m_signers.size() >= status.threshold ? "true" : "false") << ",";
+
+      // Transaction details
+      oss << "\"transactions\":[";
+      for (size_t i = 0; i < exported_txs.m_ptx.size(); ++i) {
+        if (i > 0) oss << ",";
+        const auto &ptx = exported_txs.m_ptx[i];
+        uint64_t total_amount = 0;
+        for (const auto &dst : ptx.dests) {
+          total_amount += dst.amount;
+        }
+        oss << "{\"fee\":" << ptx.fee << ",";
+        oss << "\"amount\":" << total_amount << ",";
+        oss << "\"num_inputs\":" << ptx.tx.vin.size() << ",";
+        oss << "\"num_outputs\":" << ptx.tx.vout.size() << "}";
+      }
+      oss << "],";
+      oss << "\"success\":true}";
+      return oss.str();
+
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  /**
+   * Submit a fully-signed multisig transaction to the network.
+   * Note: This requires the wallet to have daemon connection for submission.
+   * In browser context, returns the raw tx blob for external submission.
+   * @param tx_data_hex The fully-signed multisig tx data as hex string
+   * @return JSON: {tx_hash_list: [...], tx_blob_list: [...], success: true}
+   */
+  std::string submit_multisig_tx_hex(const std::string &tx_data_hex) {
+    try {
+      if (!m_wallet) {
+        return "{\"success\":false,\"error\":\"Wallet not initialized\"}";
+      }
+
+      // Decode hex to binary
+      std::string tx_data;
+      if (!epee::string_tools::parse_hexstr_to_binbuff(tx_data_hex, tx_data)) {
+        return "{\"success\":false,\"error\":\"Invalid hex data\"}";
+      }
+
+      // Parse the multisig tx set
+      tools::wallet2::multisig_tx_set exported_txs;
+      if (!m_wallet->load_multisig_tx(tx_data, exported_txs)) {
+        return "{\"success\":false,\"error\":\"Failed to parse multisig transaction data\"}";
+      }
+
+      auto status = m_wallet->get_multisig_status();
+      if (exported_txs.m_signers.size() < status.threshold) {
+        std::ostringstream err;
+        err << "Transaction not fully signed. Has " << exported_txs.m_signers.size();
+        err << " signatures, needs " << status.threshold;
+        return "{\"success\":false,\"error\":\"" + err.str() + "\"}";
+      }
+
+      // Extract tx hashes and blobs for each transaction
+      std::ostringstream oss;
+      oss << "{\"tx_hash_list\":[";
+      for (size_t i = 0; i < exported_txs.m_ptx.size(); ++i) {
+        if (i > 0) oss << ",";
+        crypto::hash txid = cryptonote::get_transaction_hash(exported_txs.m_ptx[i].tx);
+        oss << "\"" << epee::string_tools::pod_to_hex(txid) << "\"";
+      }
+      oss << "],";
+
+      // Include raw tx blobs for submission via external RPC
+      oss << "\"tx_blob_list\":[";
+      for (size_t i = 0; i < exported_txs.m_ptx.size(); ++i) {
+        if (i > 0) oss << ",";
+        std::string tx_blob;
+        if (!cryptonote::t_serializable_object_to_blob(exported_txs.m_ptx[i].tx, tx_blob)) {
+          return "{\"success\":false,\"error\":\"Failed to serialize transaction\"}";
+        }
+        oss << "\"" << epee::string_tools::buff_to_hex_nodelimer(tx_blob) << "\"";
+      }
+      oss << "],";
+
+      oss << "\"num_txs\":" << exported_txs.m_ptx.size() << ",";
+      oss << "\"success\":true}";
+      return oss.str();
+
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  /**
+   * Create a RETURN transaction on a multisig wallet (for refunds).
+   * Uses Salvium's return transaction feature to send funds back to original sender.
+   * @param txid The original incoming transaction ID to return
+   * @return JSON: {tx_data_hex: "...", success: true} or error
+   */
+  std::string create_multisig_return_tx_hex(const std::string &txid) {
+    try {
+      if (!m_wallet) {
+        return "{\"success\":false,\"error\":\"Wallet not initialized\"}";
+      }
+
+      auto status = m_wallet->get_multisig_status();
+      if (!status.multisig_is_active) {
+        return "{\"success\":false,\"error\":\"Wallet is not a multisig wallet\"}";
+      }
+      if (!status.is_ready) {
+        return "{\"success\":false,\"error\":\"Multisig wallet not ready - key exchange incomplete\"}";
+      }
+
+      // Parse txid
+      crypto::hash tx_hash;
+      if (!epee::string_tools::hex_to_pod(txid, tx_hash)) {
+        return "{\"success\":false,\"error\":\"Invalid transaction ID\"}";
+      }
+
+      // Find the transfer indices for this txid
+      std::vector<size_t> transfer_indices;
+      size_t num_transfers = m_wallet->get_num_transfer_details();
+      for (size_t i = 0; i < num_transfers; ++i) {
+        const tools::wallet2::transfer_details &td = m_wallet->get_transfer_details(i);
+        if (td.m_txid == tx_hash && !td.m_spent) {
+          transfer_indices.push_back(i);
+        }
+      }
+
+      if (transfer_indices.empty()) {
+        return "{\"success\":false,\"error\":\"No unspent outputs found for this transaction\"}";
+      }
+
+      // Create the return transaction
+      std::vector<tools::wallet2::pending_tx> ptx_vector =
+          m_wallet->create_transactions_return(transfer_indices);
+
+      if (ptx_vector.empty()) {
+        return "{\"success\":false,\"error\":\"Failed to create return transaction\"}";
+      }
+
+      // Convert to multisig tx set and export
+      std::string tx_data = m_wallet->save_multisig_tx(ptx_vector);
+      if (tx_data.empty()) {
+        return "{\"success\":false,\"error\":\"Failed to export multisig return transaction\"}";
+      }
+
+      std::string tx_data_hex = epee::string_tools::buff_to_hex_nodelimer(tx_data);
+
+      std::ostringstream oss;
+      oss << "{\"tx_data_hex\":\"" << tx_data_hex << "\",";
+      oss << "\"num_txs\":" << ptx_vector.size() << ",";
+      oss << "\"original_txid\":\"" << txid << "\",";
       oss << "\"success\":true}";
       return oss.str();
 
@@ -18742,7 +19388,24 @@ EMSCRIPTEN_BINDINGS(salvium_wallet) {
                 &WasmWallet::register_stake_return_info)
       .function("get_wallet_diagnostic", &WasmWallet::get_wallet_diagnostic)
       .function("debug_transfer_vin", &WasmWallet::debug_transfer_vin)
-      .function("debug_input_candidates", &WasmWallet::debug_input_candidates);
+      .function("debug_input_candidates", &WasmWallet::debug_input_candidates)
+      // ========================================================================
+      // MULTISIG FUNCTIONS - For 2-of-3 escrow bounty system
+      // ========================================================================
+      .function("prepare_multisig", &WasmWallet::prepare_multisig)
+      .function("make_multisig", &WasmWallet::make_multisig)
+      .function("exchange_multisig_keys", &WasmWallet::exchange_multisig_keys)
+      .function("get_multisig_status", &WasmWallet::get_multisig_status)
+      .function("export_multisig_info", &WasmWallet::export_multisig_info)
+      .function("import_multisig_info", &WasmWallet::import_multisig_info)
+      .function("enable_multisig_experimental", &WasmWallet::enable_multisig_experimental)
+      .function("is_multisig_enabled", &WasmWallet::is_multisig_enabled)
+      // Multisig transaction functions
+      .function("create_multisig_tx_hex", &WasmWallet::create_multisig_tx_hex)
+      .function("sign_multisig_tx_hex", &WasmWallet::sign_multisig_tx_hex)
+      .function("describe_multisig_tx_hex", &WasmWallet::describe_multisig_tx_hex)
+      .function("submit_multisig_tx_hex", &WasmWallet::submit_multisig_tx_hex)
+      .function("create_multisig_return_tx_hex", &WasmWallet::create_multisig_return_tx_hex);
 
   function("validate_address", &validate_address);
   function("get_version", &get_version);

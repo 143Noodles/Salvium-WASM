@@ -3167,6 +3167,61 @@ void wallet2::process_new_scanned_transaction(
       }
     }
 
+    // v5.53.5 FIX: Handle return outputs from TRANSFER transactions
+    // Salvium's return function creates TRANSFER tx types (not RETURN tx types).
+    // When someone returns funds to us, the output is in return_output_map.
+    // The regular Carrot derivation above won't work for these - we need to
+    // use the return-specific derivation path.
+    if (!td.m_key_image_known && active_scan_info->is_carrot &&
+        tx.type == cryptonote::transaction_type::TRANSFER) {
+      const auto &return_output_map = m_account.get_return_output_map_ref();
+
+      // Check if onetime_address is a return address (K_r) in the map
+      // K_r = K_return + K_o, where K_return = k_return * G
+      auto roi_it = return_output_map.find(onetime_address);
+
+      // If not found by K_r, also check if any entry's K_o matches
+      // (the map is keyed by K_r but we may need to match K_o for some cases)
+      if (roi_it == return_output_map.end()) {
+        for (const auto& [K_r, info] : return_output_map) {
+          if (info.K_o == onetime_address) {
+            roi_it = return_output_map.find(K_r);
+            break;
+          }
+        }
+      }
+
+      if (roi_it != return_output_map.end()) {
+        try {
+          const auto &roi = roi_it->second;
+
+          // Compute k_return from input_context and K_o
+          crypto::secret_key k_return;
+          m_account.s_view_balance_dev.make_internal_return_privkey(
+              roi.input_context, roi.K_o, k_return);
+
+          // Use main address keys (return outputs go to main address)
+          crypto::secret_key address_privkey_g = m_account.get_keys().m_spend_secret_key;
+
+          // Compute spend_key = address_privkey_g + k_return
+          crypto::secret_key spend_key;
+          sc_add(reinterpret_cast<unsigned char*>(&spend_key),
+                 reinterpret_cast<const unsigned char*>(&address_privkey_g),
+                 reinterpret_cast<const unsigned char*>(&k_return));
+
+          // Compute key_image = spend_key * Hp(onetime_address)
+          crypto::key_image ki;
+          crypto::generate_key_image(onetime_address, spend_key, ki);
+
+          td.m_key_image = ki;
+          td.m_key_image_known = true;
+          LOG_PRINT_L2("v5.53.5 FIX: Derived key image for TRANSFER return output via return_output_map");
+        } catch (const std::exception& e) {
+          LOG_PRINT_L1("v5.53.5 FIX: Failed to derive key image for TRANSFER return output: " << e.what());
+        }
+      }
+    }
+
     // override the key image for PROTOCOL/RETURN tx outputs.
     // FIX v5.49.0: Handle STAKE/AUDIT txs without change outputs
     // When a STAKE tx uses ALL funds (no change), there's no entry in
