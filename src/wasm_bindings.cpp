@@ -617,6 +617,40 @@ private:
     return false;
   }
 
+  static std::string json_escape(const std::string &input) {
+    std::string out;
+    out.reserve(input.size());
+    for (char c : input) {
+      switch (c) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\b':
+        out += "\\b";
+        break;
+      case '\f':
+        out += "\\f";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out += c;
+        break;
+      }
+    }
+    return out;
+  }
+
   // ========================================================================
   // SCAN RESULT CACHING (for scan_blocks_fast optimization)
   // ========================================================================
@@ -716,12 +750,12 @@ private:
 
 public:
   WasmWallet()
-      : m_initialized(false), m_daemon_address("seed01.salvium.io:19081") {
+      : m_initialized(false), m_daemon_address("/api/wallet-rpc") {
     // Create HTTP client factory (returns stub clients that do nothing)
     auto http_factory = std::make_unique<net::http::client_factory>();
 
     m_wallet = std::make_unique<tools::wallet2>(
-        cryptonote::MAINNET,    // Network type
+        cryptonote::TESTNET,    // Network type (test build)
         1,                      // KDF rounds
         true,                   // Unattended mode
         std::move(http_factory) // HTTP client factory (stub)
@@ -1965,6 +1999,32 @@ public:
     }
   }
 
+  std::string get_balance_for_asset(const std::string &asset_type) const {
+    if (!m_initialized)
+      return "0";
+    try {
+      if (asset_type.empty()) {
+        return "0";
+      }
+      return std::to_string(get_balance_without_locked_coins(asset_type));
+    } catch (...) {
+      return "0";
+    }
+  }
+
+  std::string get_unlocked_balance_for_asset(const std::string &asset_type) const {
+    if (!m_initialized)
+      return "0";
+    try {
+      if (asset_type.empty()) {
+        return "0";
+      }
+      return std::to_string(m_wallet->unlocked_balance(0, asset_type, false));
+    } catch (...) {
+      return "0";
+    }
+  }
+
   // ========================================================================
   // Diagnostic - Comprehensive wallet state for debugging balance issues
   // ========================================================================
@@ -2947,25 +3007,44 @@ public:
         return R"({"error":"Failed to parse tx"})";
       }
 
-      uint64_t amount = 0;
-      uint64_t fee = 0;
-      bool is_incoming = false;
-      std::string asset_type = "SAL";
-      uint64_t timestamp = 0;
+      std::list<std::pair<crypto::hash, tools::wallet2::unconfirmed_transfer_details>>
+          pending_payments;
+      m_wallet->get_unconfirmed_payments_out(pending_payments);
 
-      if (m_wallet->get_unconfirmed_tx_info(tx_hash, amount, fee, is_incoming,
-                                            asset_type, timestamp)) {
+      for (const auto &entry : pending_payments) {
+        if (entry.first != tx_hash)
+          continue;
+
+        const auto &pd = entry.second;
+        std::string asset_type = pd.m_tx.source_asset_type.empty()
+                                     ? std::string("SAL1")
+                                     : pd.m_tx.source_asset_type;
+        uint64_t amount = pd.m_amount_out;
+        if (pd.m_tx.type == cryptonote::transaction_type::STAKE ||
+            pd.m_tx.type == cryptonote::transaction_type::AUDIT) {
+          amount = pd.m_tx.amount_burnt;
+        }
+
+        uint64_t timestamp = 0;
+        auto ts_it = m_tx_timestamps.find(tx_hash);
+        if (ts_it != m_tx_timestamps.end())
+          timestamp = ts_it->second;
+
+        const uint64_t fee = pd.m_amount_in > pd.m_amount_out
+                                 ? (pd.m_amount_in - pd.m_amount_out)
+                                 : 0;
+
         std::ostringstream oss;
         oss << "{"
             << "\"amount\":" << amount << ","
             << "\"fee\":" << fee << ","
-            << "\"is_incoming\":" << (is_incoming ? "true" : "false") << ","
+            << "\"is_incoming\":false,"
             << "\"asset_type\":\"" << asset_type << "\","
             << "\"timestamp\":" << timestamp << "}";
         return oss.str();
-      } else {
-        return R"({"error":"Transaction not found in wallet"})";
       }
+
+      return R"({"error":"Transaction not found in wallet"})";
     } catch (const std::exception &e) {
       std::ostringstream oss;
       oss << R"({"error":")" << e.what() << R"("})";
@@ -2994,7 +3073,7 @@ public:
 
   bool init_daemon(const std::string &address) {
     try {
-      m_daemon_address = address.empty() ? "seed01.salvium.io:19081" : address;
+      m_daemon_address = address.empty() ? "/api/wallet-rpc" : address;
 
       // Initialize wallet with daemon
       // In WASM, the actual HTTP calls will be proxied through JavaScript
@@ -5267,6 +5346,143 @@ public:
     }
   }
 
+  std::string create_transaction_with_asset_json(
+      const std::string &dest_address_str, const std::string &amount_str,
+      const std::string &asset_type_str, double mixin_count_d,
+      double priority_d) {
+    if (!m_initialized) {
+      return R"({"status":"error","error":"Wallet not initialized"})";
+    }
+
+    try {
+      const uint64_t amount = std::stoull(amount_str);
+      uint32_t mixin_count = static_cast<uint32_t>(mixin_count_d);
+      uint32_t priority = static_cast<uint32_t>(priority_d);
+
+      if (asset_type_str.empty()) {
+        return R"({"status":"error","error":"Asset type is required"})";
+      }
+
+      std::string asset_type = asset_type_str;
+      if (asset_type == "sal") {
+        asset_type = "SAL";
+      } else if (asset_type == "sal1") {
+        asset_type = "SAL1";
+      }
+
+      if (!cryptonote::is_valid_asset_type(asset_type)) {
+        return R"({"status":"error","error":"Invalid asset type"})";
+      }
+
+      if (m_wallet->get_base_fee(priority) == 0) {
+        for (uint32_t p = priority + 1; p <= 4; ++p) {
+          if (m_wallet->get_base_fee(p) > 0) {
+            priority = p;
+            break;
+          }
+        }
+        if (m_wallet->get_base_fee(priority) == 0) {
+          priority = 2;
+        }
+      }
+
+      const uint64_t unlocked =
+          m_wallet->unlocked_balance(0, asset_type, false);
+      if (unlocked == 0) {
+        std::ostringstream err;
+        err << R"({"status":"error","error":"No unlocked balance for asset )"
+            << json_escape(asset_type) << R"("})";
+        return err.str();
+      }
+      if (amount > unlocked) {
+        std::ostringstream err;
+        err << R"({"status":"error","error":"Insufficient unlocked balance for asset )"
+            << json_escape(asset_type) << R"(. Requested: )" << amount
+            << ", available: " << unlocked << R"("})";
+        return err.str();
+      }
+
+      cryptonote::address_parse_info info;
+      if (!cryptonote::get_account_address_from_str(info, m_wallet->nettype(),
+                                                    dest_address_str)) {
+        return R"({"status":"error","error":"Invalid destination address"})";
+      }
+
+      std::vector<cryptonote::tx_destination_entry> dsts;
+      cryptonote::tx_destination_entry dst;
+      dst.amount = amount;
+      dst.addr = info.address;
+      dst.is_subaddress = info.is_subaddress;
+      dst.is_integrated = info.has_payment_id;
+      dst.asset_type = asset_type;
+      dsts.push_back(dst);
+
+      std::vector<uint8_t> extra;
+      if (info.has_payment_id) {
+        std::string extra_nonce;
+        cryptonote::set_encrypted_payment_id_to_tx_extra_nonce(extra_nonce,
+                                                               info.payment_id);
+        if (!cryptonote::add_extra_nonce_to_tx_extra(extra, extra_nonce)) {
+          return R"({"status":"error","error":"Failed to add payment ID to extra"})";
+        }
+      }
+
+      std::vector<tools::wallet2::pending_tx> ptx_vector =
+          m_wallet->create_transactions_2(
+              dsts, asset_type, asset_type,
+              cryptonote::transaction_type::TRANSFER, mixin_count,
+              0, // unlock_time
+              priority, extra,
+              0, // subaddr_account
+              {} // subaddr_indices
+          );
+
+      if (ptx_vector.empty()) {
+        return R"({"status":"error","error":"No transactions created"})";
+      }
+
+      std::ostringstream json;
+      json << R"({"status":"success","asset_type":")" << json_escape(asset_type)
+           << R"(","transactions":[)";
+
+      bool first = true;
+      for (const auto &ptx : ptx_vector) {
+        if (!first)
+          json << ",";
+        first = false;
+
+        std::string tx_blob = epee::string_tools::buff_to_hex_nodelimer(
+            cryptonote::tx_to_blob(ptx.tx));
+        std::string tx_key = key_to_hex((const unsigned char *)&ptx.tx_key);
+        crypto::hash tx_hash;
+        cryptonote::get_transaction_hash(ptx.tx, tx_hash);
+        std::string tx_hash_str = epee::string_tools::pod_to_hex(tx_hash);
+
+        json << "{"
+             << R"("tx_blob":")" << tx_blob << R"(",)"
+             << R"("tx_key":")" << tx_key << R"(",)"
+             << R"("tx_hash":")" << tx_hash_str << R"(",)"
+             << R"("fee":)" << ptx.fee << ","
+             << R"("dust":)" << ptx.dust << ","
+             << R"("amount":)" << amount << "}";
+      }
+
+      json << "]}";
+      return json.str();
+    } catch (const std::invalid_argument &) {
+      return R"({"status":"error","error":"Invalid numeric argument"})";
+    } catch (const std::out_of_range &) {
+      return R"({"status":"error","error":"Numeric argument out of range"})";
+    } catch (const tools::error::no_connection_to_daemon &) {
+      m_last_error = "no connection to daemon";
+      return R"({"status":"error","error":"No connection to daemon"})";
+    } catch (const std::exception &e) {
+      m_last_error = e.what() ? e.what() : "Unknown error";
+      return std::string(R"({"status":"error","error":")") +
+             json_escape(m_last_error) + "\"}";
+    }
+  }
+
   // ========================================================================
   // STAKE Transaction Creation
   // ========================================================================
@@ -5846,6 +6062,173 @@ public:
     } catch (...) {
       m_last_error = "Unknown exception during sweep_all transaction creation";
       return R"({"status":"error","error":"Unknown exception during sweep_all transaction creation"})";
+    }
+  }
+
+  std::string create_create_token_transaction_json(const std::string &asset_type,
+                                                   const std::string &supply_str,
+                                                   double decimals_d,
+                                                   const std::string &metadata) {
+    if (!m_initialized) {
+      return R"({"status":"error","error":"Wallet not initialized"})";
+    }
+
+    try {
+      if (asset_type.empty()) {
+        return R"({"status":"error","error":"Asset type is required"})";
+      }
+
+      const uint64_t supply = std::stoull(supply_str);
+      const uint32_t decimals = static_cast<uint32_t>(decimals_d);
+
+      cryptonote::sal_token_t sal_token;
+      sal_token.version = 1;
+      sal_token.supply = supply;
+      sal_token.decimals = decimals;
+      sal_token.metadata = metadata;
+      sal_token.url = "";
+      sal_token.signature = crypto::null_hash;
+
+      cryptonote::token_metadata_t token_meta;
+      token_meta.version = 1;
+      token_meta.asset_type = asset_type;
+      token_meta.token = sal_token;
+
+      std::vector<tools::wallet2::pending_tx> ptx_vector =
+          m_wallet->create_token(token_meta, 0, {});
+
+      if (ptx_vector.empty()) {
+        return R"({"status":"error","error":"No token creation transactions created"})";
+      }
+
+      std::ostringstream json;
+      json << R"({"status":"success","asset_type":")" << json_escape(asset_type)
+           << R"(","transactions":[)";
+
+      bool first = true;
+      for (const auto &ptx : ptx_vector) {
+        if (!first)
+          json << ",";
+        first = false;
+
+        std::string tx_blob =
+            epee::string_tools::buff_to_hex_nodelimer(cryptonote::tx_to_blob(ptx.tx));
+        std::string tx_key = key_to_hex((const unsigned char *)&ptx.tx_key);
+        crypto::hash tx_hash;
+        cryptonote::get_transaction_hash(ptx.tx, tx_hash);
+        std::string tx_hash_str = epee::string_tools::pod_to_hex(tx_hash);
+
+        json << "{"
+             << R"("tx_blob":")" << tx_blob << R"(",)"
+             << R"("tx_key":")" << tx_key << R"(",)"
+             << R"("tx_hash":")" << tx_hash_str << R"(",)"
+             << R"("fee":)" << ptx.fee << ","
+             << R"("dust":)" << ptx.dust << "}";
+      }
+
+      json << "]}";
+      return json.str();
+    } catch (const std::invalid_argument &) {
+      return R"({"status":"error","error":"Invalid numeric argument"})";
+    } catch (const std::out_of_range &) {
+      return R"({"status":"error","error":"Numeric argument out of range"})";
+    } catch (const tools::error::no_connection_to_daemon &) {
+      m_last_error = "no connection to daemon";
+      return R"({"status":"error","error":"No connection to daemon"})";
+    } catch (const std::exception &e) {
+      m_last_error = e.what() ? e.what() : "Unknown error";
+      return std::string(R"({"status":"error","error":")") +
+             json_escape(m_last_error) + "\"}";
+    }
+  }
+
+  std::string get_tokens_json(const std::string &filter) {
+    if (!m_initialized) {
+      return R"({"status":"error","error":"Wallet not initialized"})";
+    }
+
+    try {
+      cryptonote::COMMAND_RPC_GET_TOKENS::request req = AUTO_VAL_INIT(req);
+      cryptonote::COMMAND_RPC_GET_TOKENS::response res = AUTO_VAL_INIT(res);
+      req.filter = filter;
+
+      const bool ok =
+          m_wallet->invoke_http_json_rpc("/json_rpc", "get_tokens", req, res);
+      if (!ok) {
+        return R"({"status":"error","error":"Failed to query daemon for tokens"})";
+      }
+      if (res.status != CORE_RPC_STATUS_OK) {
+        return std::string(R"({"status":"error","error":")") +
+               json_escape(res.status) + "\"}";
+      }
+
+      std::ostringstream json;
+      json << R"({"status":"success","tokens":[)";
+      for (size_t i = 0; i < res.tokens.size(); ++i) {
+        if (i > 0)
+          json << ",";
+        json << "\"" << json_escape(res.tokens[i]) << "\"";
+      }
+      json << "]}";
+      return json.str();
+    } catch (const std::exception &e) {
+      m_last_error = e.what() ? e.what() : "Unknown error";
+      return std::string(R"({"status":"error","error":")") +
+             json_escape(m_last_error) + "\"}";
+    }
+  }
+
+  std::string get_token_info_json(const std::string &asset_type) {
+    if (!m_initialized) {
+      return R"({"status":"error","error":"Wallet not initialized"})";
+    }
+
+    try {
+      if (asset_type.empty()) {
+        return R"({"status":"error","error":"Asset type is required"})";
+      }
+
+      cryptonote::COMMAND_RPC_GET_TOKEN_INFO::request req = AUTO_VAL_INIT(req);
+      cryptonote::COMMAND_RPC_GET_TOKEN_INFO::response res = AUTO_VAL_INIT(res);
+      req.asset_type = asset_type;
+
+      const bool ok = m_wallet->invoke_http_json_rpc("/json_rpc", "get_token_info",
+                                                     req, res);
+      if (!ok) {
+        return R"({"status":"error","error":"Failed to query daemon for token info"})";
+      }
+      if (res.status != CORE_RPC_STATUS_OK) {
+        return std::string(R"({"status":"error","error":")") +
+               json_escape(res.status) + "\"}";
+      }
+
+      std::ostringstream json;
+      json << R"({"status":"success",)"
+           << R"("asset_type":")" << json_escape(res.token.asset_type) << R"(",)"
+           << R"("version":)" << static_cast<uint32_t>(res.token.version) << ",";
+
+      if (res.token.token.type() == typeid(cryptonote::erc_token_t)) {
+        const auto &erc = boost::get<cryptonote::erc_token_t>(res.token.token);
+        json << R"("token_type":"erc20",)"
+             << R"("contract_address":")" << json_escape(erc.contract_address) << R"(",)"
+             << R"("lockbox_address":")" << json_escape(erc.lockbox_address) << R"(",)"
+             << R"("ticker":")" << json_escape(erc.ticker) << R"(",)"
+             << R"("erc20_asset_id":)" << erc.erc20_asset_id;
+      } else {
+        const auto &sal = boost::get<cryptonote::sal_token_t>(res.token.token);
+        json << R"("token_type":"sal",)"
+             << R"("supply":")" << sal.supply << R"(",)"
+             << R"("decimals":)" << sal.decimals << ","
+             << R"("metadata":")" << json_escape(sal.metadata) << R"(",)"
+             << R"("url":")" << json_escape(sal.url) << R"(")";
+      }
+
+      json << "}";
+      return json.str();
+    } catch (const std::exception &e) {
+      m_last_error = e.what() ? e.what() : "Unknown error";
+      return std::string(R"({"status":"error","error":")") +
+             json_escape(m_last_error) + "\"}";
     }
   }
 
@@ -6559,6 +6942,39 @@ public:
       fprintf(stderr,
               "[WASM] import_wallet_cache_hex: restored %zu transfers\n",
               num_transfers);
+
+      // CRITICAL FIX: Rebuild subaddress map after cache import
+      // The imported transfers reference subaddresses that may not be in
+      // the freshly-created wallet's m_subaddresses map. Without this,
+      // generate_key_image_helper will fail when trying to spend outputs.
+      std::set<uint32_t> subaddress_indices_needed;
+      for (size_t i = 0; i < num_transfers; ++i) {
+        const auto &td = m_wallet->get_transfer_details(i);
+        subaddress_indices_needed.insert(td.m_subaddr_index.minor);
+      }
+
+      // Ensure we have at least indices 0-99 plus all needed indices
+      uint32_t max_index = 100;
+      for (uint32_t idx : subaddress_indices_needed) {
+        if (idx > max_index) max_index = idx;
+      }
+
+      // Expand subaddresses to cover all needed indices
+      // This populates m_subaddresses with the correct public keys
+      uint32_t current_count = m_wallet->get_num_subaddresses(0);
+      if (max_index >= current_count) {
+        for (uint32_t i = current_count; i <= max_index + 10; ++i) {
+          try {
+            m_wallet->add_subaddress(0, "");
+          } catch (...) {
+            // Ignore errors - some indices may already exist
+          }
+        }
+      }
+
+      fprintf(stderr,
+              "[WASM] import_wallet_cache_hex: rebuilt subaddress map (max_index=%u, subaddresses=%u)\n",
+              max_index, m_wallet->get_num_subaddresses(0));
 
       std::ostringstream json;
       json << R"({"status":"success",)"
@@ -19221,6 +19637,9 @@ EMSCRIPTEN_BINDINGS(salvium_wallet) {
       // Balance
       .function("get_balance", &WasmWallet::get_balance)
       .function("get_unlocked_balance", &WasmWallet::get_unlocked_balance)
+      .function("get_balance_for_asset", &WasmWallet::get_balance_for_asset)
+      .function("get_unlocked_balance_for_asset",
+                &WasmWallet::get_unlocked_balance_for_asset)
       .function("get_wallet_diagnostic", &WasmWallet::get_wallet_diagnostic)
       .function("debug_transfer_vin", &WasmWallet::debug_transfer_vin)
       .function("debug_input_candidates", &WasmWallet::debug_input_candidates)
@@ -19280,12 +19699,18 @@ EMSCRIPTEN_BINDINGS(salvium_wallet) {
       .function("get_transfers_as_json", &WasmWallet::get_transfers_as_json)
       // Transaction Creation (Phase 6 Step 3)
       .function("create_transaction_json", &WasmWallet::create_transaction_json)
+      .function("create_transaction_with_asset_json",
+                &WasmWallet::create_transaction_with_asset_json)
       .function("create_stake_transaction_json",
                 &WasmWallet::create_stake_transaction_json)
       .function("create_return_transaction_json",
                 &WasmWallet::create_return_transaction_json)
       .function("create_sweep_all_transaction_json",
                 &WasmWallet::create_sweep_all_transaction_json)
+      .function("create_create_token_transaction_json",
+                &WasmWallet::create_create_token_transaction_json)
+      .function("get_tokens_json", &WasmWallet::get_tokens_json)
+      .function("get_token_info_json", &WasmWallet::get_token_info_json)
       .function("estimate_fee_json", &WasmWallet::estimate_fee_json)
       // Split Transaction Architecture (Prepare + Complete)
       // These separate input selection from signing, allowing deterministic
