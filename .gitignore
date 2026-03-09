@@ -21,6 +21,20 @@ boost_*
 libsodium-*
 openssl-*
 
+# Local upstream source dump used for inspection only.
+# The Docker build clones fresh upstream source and overlays the tracked files below.
+salvium-repo/src/**
+!salvium-repo/src/crypto/
+!salvium-repo/src/crypto/crypto-ops-data.c
+!salvium-repo/src/crypto/crypto-ops.c
+!salvium-repo/src/crypto/crypto-ops.h
+!salvium-repo/src/wallet/
+!salvium-repo/src/wallet/node_rpc_proxy.h
+!salvium-repo/src/wallet/tx_builder.cpp
+!salvium-repo/src/wallet/tx_builder.h
+!salvium-repo/src/wallet/wallet2.cpp
+!salvium-repo/src/wallet/wallet2.h
+
 # IDEs
 .vscode/
 .idea/

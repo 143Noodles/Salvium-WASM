@@ -102,14 +102,9 @@ RUN echo "=== Patching abstract_http_client.h for typeinfo emission ===" \
 COPY src/ /workspace/src/
 
 # ============================================================================
-# COPY LOCAL SALVIUM-REPO FILES (modified wallet source)
+# COPY LOCAL SALVIUM-REPO FILES (full 1.1 source + local patches)
 # ============================================================================
-COPY salvium-repo/src/wallet/node_rpc_proxy.h /workspace/salvium/src/wallet/node_rpc_proxy.h
-COPY salvium-repo/src/wallet/wallet2.h /workspace/salvium/src/wallet/wallet2.h
-COPY salvium-repo/src/wallet/tx_builder.h /workspace/salvium/src/wallet/tx_builder.h
-COPY salvium-repo/src/common/boost_serialization_helper.h /workspace/salvium/src/common/boost_serialization_helper.h
-COPY salvium-repo/src/wallet/wallet2.cpp /workspace/salvium/src/wallet/wallet2.cpp
-COPY salvium-repo/src/wallet/tx_builder.cpp /workspace/salvium/src/wallet/tx_builder.cpp
+COPY salvium-repo/src/ /workspace/salvium/src/
 
 # ============================================================================
 # PATCH: Replace threadpool.h with shadow header (no boost::thread)

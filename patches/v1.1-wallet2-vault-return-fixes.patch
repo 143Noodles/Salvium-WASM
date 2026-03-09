@@ -1,0 +1,339 @@
+--- a/src/wallet/wallet2.cpp
++++ b/src/wallet/wallet2.cpp
+@@ -2638,11 +2638,6 @@
+   for (size_t local_output_index = 0; local_output_index < n_scanned_enotes; ++local_output_index)
+   {
+     const auto &enote_scan_info = enote_scan_infos[local_output_index];
+-    if (!enote_scan_info || !enote_scan_info->subaddr_index)
+-      continue;
+-
+-    received_an_output = true;
+-
+     crypto::public_key onetime_address;
+     if (!cryptonote::get_output_public_key(tx.vout.at(local_output_index), onetime_address))
+     {
+@@ -2650,16 +2645,50 @@
+       continue;
+     }
+ 
++    std::optional<wallet::enote_view_incoming_scan_info_t> protocol_scan_info;
++    if (tx.type == cryptonote::transaction_type::PROTOCOL && (!enote_scan_info || !enote_scan_info->subaddr_index))
++    {
++      auto salvium_it = m_salvium_txs.find(onetime_address);
++      if (salvium_it != m_salvium_txs.end())
++      {
++        size_t origin_idx = salvium_it->second;
++        if (origin_idx < m_transfers.size())
++        {
++          const transfer_details &origin_td = m_transfers[origin_idx];
++          protocol_scan_info = wallet::enote_view_incoming_scan_info_t{};
++          protocol_scan_info->subaddr_index = carrot::subaddress_index_extended{
++            {origin_td.m_subaddr_index.major, origin_td.m_subaddr_index.minor},
++            carrot::AddressDeriveType::PreCarrot,
++            false
++          };
++          protocol_scan_info->address_spend_pubkey = onetime_address;
++          protocol_scan_info->amount_blinding_factor = rct::I;
++          protocol_scan_info->main_tx_pubkey_index = 0;
++          protocol_scan_info->is_carrot = false;
++          protocol_scan_info->is_return = true;
++          protocol_scan_info->amount = tx.vout.at(local_output_index).amount;
++          protocol_scan_info->asset_type = source_asset;
++          protocol_scan_info->payment_id = crypto::null_hash;
++        }
++      }
++    }
++
++    const auto *active_scan_info = protocol_scan_info ? &(*protocol_scan_info) : (enote_scan_info ? &(*enote_scan_info) : nullptr);
++    if (!active_scan_info || !active_scan_info->subaddr_index)
++      continue;
++
++    received_an_output = true;
++
+     // check for burning bug
+     const auto ot_it = m_pub_keys.find(onetime_address);
+     const transfer_details *burning_td = ot_it != m_pub_keys.cend() ? &m_transfers.at(ot_it->second) : nullptr;
+     const bool should_treat_as_burned = burning_td &&
+-      (burning_td->amount() >= enote_scan_info->amount || burning_td->m_spent);
++      (burning_td->amount() >= active_scan_info->amount || burning_td->m_spent);
+     if (should_treat_as_burned)
+     {
+       // We already have an older received transfer with a greater-than-or-equal amount
+       LOG_ERROR("Public key " << epee::string_tools::pod_to_hex(ot_it->first)
+-        << " from received " << print_money(enote_scan_info->amount) << " output already exists with "
++        << " from received " << print_money(active_scan_info->amount) << " output already exists with "
+         << (burning_td->m_spent ? "spent" : "unspent") << " "
+         << print_money(burning_td->amount()) << " in tx " << burning_td->m_txid << ", received output ignored");
+       continue;
+@@ -2671,33 +2700,41 @@
+     }
+ 
+     // update local received money counts
+-    const rct::xmr_amount extra_received_money = enote_scan_info->amount - (burning_td ? burning_td->amount() : 0);
++    const rct::xmr_amount extra_received_money = active_scan_info->amount - (burning_td ? burning_td->amount() : 0);
+     const cryptonote::subaddress_index subaddr_index_cn{
+-        enote_scan_info->subaddr_index->index.major, enote_scan_info->subaddr_index->index.minor};
++        active_scan_info->subaddr_index->index.major, active_scan_info->subaddr_index->index.minor};
++
++    bool is_stake_locked_output = false;
++    if (tx.type == cryptonote::transaction_type::STAKE)
++    {
++      if (onetime_address == tx.protocol_tx_data.return_address || onetime_address == tx.return_address)
++        is_stake_locked_output = true;
++    }
+ 
+     // we have to save even the 0 amount enotes since we need to save their one time addresses
+     // for some protocol txs.
+-    //if (enote_scan_info->amount > 0)
++    //if (active_scan_info->amount > 0)
+     {
+-      tx_money_got_in_outs[subaddr_index_cn][enote_scan_info->asset_type] += extra_received_money;
++      if (!is_stake_locked_output)
++        tx_money_got_in_outs[subaddr_index_cn][active_scan_info->asset_type] += extra_received_money;
+       tx_amounts_individual_outs[subaddr_index_cn].push_back(std::make_tuple(extra_received_money, onetime_address));
+     }
+ 
+     // set payment id
+     const bool ignore_long_pid = block_version >= IGNORE_LONG_PAYMENT_ID_FROM_BLOCK_VERSION;
+-    if (payment_id != crypto::null_hash && payment_id != enote_scan_info->payment_id)
++    if (payment_id != crypto::null_hash && payment_id != active_scan_info->payment_id)
+     {
+       LOG_ERROR("Calculated conflicting payment IDs in tx " << txid
+-        << ": " << payment_id << " and " << enote_scan_info->payment_id);
++        << ": " << payment_id << " and " << active_scan_info->payment_id);
+     }
+-    if (wallet::is_long_payment_id(enote_scan_info->payment_id) && ignore_long_pid)
++    if (wallet::is_long_payment_id(active_scan_info->payment_id) && ignore_long_pid)
+     {
+       MWARNING("Found OBSOLETE AND IGNORED unencrypted payment ID: these are bad for privacy, "
+         << "use subaddresses or encrypted payment IDs instead");
+     }
+-    else if (enote_scan_info->payment_id != payment_id)
++    else if (active_scan_info->payment_id != payment_id)
+     {
+-      payment_id = enote_scan_info->payment_id;
++      payment_id = active_scan_info->payment_id;
+       MDEBUG("Found payment ID " << payment_id << " in TX " << txid);
+     }
+ 
+@@ -2715,24 +2752,28 @@
+     td.m_asset_type_output_index = asset_type_o_indices.at(local_output_index);
+     td.m_tx = tx;
+     td.m_txid = txid;
+-    td.m_amount = enote_scan_info->amount;
+-    td.asset_type = enote_scan_info->asset_type;
++    td.m_amount = active_scan_info->amount;
++    td.asset_type = active_scan_info->asset_type;
+     if (use_fork_rules(get_salvium_one_proofs_fork(), 0) && td.asset_type != "SAL1")
+       td.asset_type = "SAL1";
+-    MINFO("Wallet received output: asset_type=" << enote_scan_info->asset_type << ", amount=" << enote_scan_info->amount << ", txid=" << txid); 
+-    td.m_pk_index = enote_scan_info->main_tx_pubkey_index;
++    MINFO("Wallet received output: asset_type=" << active_scan_info->asset_type << ", amount=" << active_scan_info->amount << ", txid=" << txid);
++    td.m_pk_index = active_scan_info->main_tx_pubkey_index;
+     td.m_subaddr_index = subaddr_index_cn;
+-    td.m_mask = enote_scan_info->amount_blinding_factor;
+-    td.m_recovered_spend_pubkey = enote_scan_info->address_spend_pubkey;
++    td.m_mask = active_scan_info->amount_blinding_factor;
++    td.m_recovered_spend_pubkey = active_scan_info->address_spend_pubkey;
+     td.m_rct = tx.version >= 2;
+     td.m_frozen = false;
+     if (subaddr_index_cn.major != 0 || subaddr_index_cn.minor != 0)
+     {
+-      if (m_subaddresses.find(enote_scan_info->address_spend_pubkey) == m_subaddresses.end())
++      if (m_subaddresses.find(active_scan_info->address_spend_pubkey) == m_subaddresses.end())
+         create_one_off_subaddress(subaddr_index_cn);
+     }
+-    td.m_td_origin_idx = m_salvium_txs.find(enote_scan_info->address_spend_pubkey) != m_salvium_txs.end() ?
+-      m_salvium_txs.at(enote_scan_info->address_spend_pubkey) : std::numeric_limits<uint64_t>::max();
++
++    crypto::public_key salvium_txs_lookup_key = active_scan_info->address_spend_pubkey;
++    if (tx.type == cryptonote::transaction_type::PROTOCOL || tx.type == cryptonote::transaction_type::RETURN)
++      salvium_txs_lookup_key = onetime_address;
++    td.m_td_origin_idx = m_salvium_txs.find(salvium_txs_lookup_key) != m_salvium_txs.end() ?
++      m_salvium_txs.at(salvium_txs_lookup_key) : std::numeric_limits<uint64_t>::max();
+ 
+     // update m_transfers key image values
+     td.m_key_image_known = bool(output_key_images[local_output_index]);
+@@ -2748,16 +2789,16 @@
+       }
+     }
+ 
+-    if (!td.m_key_image_known && enote_scan_info->is_carrot && tx.type != cryptonote::transaction_type::PROTOCOL && tx.type != cryptonote::transaction_type::RETURN)
++    if (!td.m_key_image_known && active_scan_info->is_carrot && tx.type != cryptonote::transaction_type::PROTOCOL && tx.type != cryptonote::transaction_type::RETURN)
+     {
+       try
+       {
+         const auto &subaddr_map = m_account.get_subaddress_map_ref();
+-        const bool in_map = (subaddr_map.find(enote_scan_info->address_spend_pubkey) != subaddr_map.end());
+-        const bool is_main = (enote_scan_info->address_spend_pubkey == m_account.get_keys().m_account_address.m_spend_public_key);
++        const bool in_map = (subaddr_map.find(active_scan_info->address_spend_pubkey) != subaddr_map.end());
++        const bool is_main = (active_scan_info->address_spend_pubkey == m_account.get_keys().m_account_address.m_spend_public_key);
+         if (in_map || is_main)
+         {
+-          crypto::key_image ki = m_account.derive_key_image(enote_scan_info->address_spend_pubkey, enote_scan_info->sender_extension_g, enote_scan_info->sender_extension_t, onetime_address);
++          crypto::key_image ki = m_account.derive_key_image(active_scan_info->address_spend_pubkey, active_scan_info->sender_extension_g, active_scan_info->sender_extension_t, onetime_address);
+           td.m_key_image = ki;
+           td.m_key_image_known = true;
+         }
+@@ -2768,7 +2809,7 @@
+       }
+     }
+ 
+-    if (!td.m_key_image_known && enote_scan_info->is_carrot && tx.type == cryptonote::transaction_type::TRANSFER)
++    if (!td.m_key_image_known && active_scan_info->is_carrot && tx.type == cryptonote::transaction_type::TRANSFER)
+     {
+       const auto &return_output_map = m_account.get_return_output_map_ref();
+       auto roi_it = return_output_map.find(onetime_address);
+@@ -2805,41 +2846,95 @@
+       }
+     }
+ 
+-    // override the key image for pre-carrot PROTOCOL/RETURN tx outputs.
+-    if (!enote_scan_info->is_carrot && td.m_td_origin_idx != std::numeric_limits<uint64_t>::max())
++    bool is_protocol_return_tx = (tx.type == cryptonote::transaction_type::PROTOCOL || tx.type == cryptonote::transaction_type::RETURN);
++    bool has_zero_key_image = (td.m_key_image == crypto::key_image{});
++    bool needs_key_image_override = is_protocol_return_tx && (!active_scan_info->is_carrot || has_zero_key_image);
++    if (needs_key_image_override)
+     {
+-      THROW_WALLET_EXCEPTION_IF(td.m_td_origin_idx >= get_num_transfer_details(), error::wallet_internal_error, "cannot locate return_payment TX origin in m_transfers");
+-      const transfer_details &td_origin = m_transfers[td.m_td_origin_idx];
+-      hw::device &hwdev =  m_account.get_device();
+-      hw::reset_mode rst(hwdev);
+-      hwdev.set_mode(hw::device::TRANSACTION_PARSE);
+-      const crypto::public_key tx_public_key = get_tx_pub_key_from_extra(tx);
+-      const std::vector<crypto::public_key> additional_tx_public_keys = get_additional_tx_pub_keys_from_extra(tx);
+-      keypair in_ephemeral;
+-      crypto::key_image ki;
+       origin_data origin_tx_data;
+-      origin_tx_data.tx_pub_key = get_tx_pub_key_from_extra(td_origin.m_tx, td_origin.m_pk_index);
+-      origin_tx_data.output_index = td_origin.m_internal_output_index;
+-      origin_tx_data.tx_type = td_origin.m_tx.type;
+-      rct::salvium_input_data_t sid;
+-      THROW_WALLET_EXCEPTION_IF(!cryptonote::generate_key_image_helper(
+-        m_account.get_keys(),
+-        m_account.get_subaddress_map_cn(),
+-        onetime_address,
+-        tx_public_key,
+-        additional_tx_public_keys,
+-        local_output_index,
+-        in_ephemeral,
+-        ki,
+-        hwdev,
+-        true,
+-        origin_tx_data,
+-        sid),
+-        error::wallet_internal_error,
+-        "failed to obtain key image for protocol_tx output"
+-      );
+-      td.m_key_image_known = true;
+-      td.m_key_image = ki;
++      bool have_origin_data = false;
++
++      if (td.m_td_origin_idx != std::numeric_limits<uint64_t>::max())
++      {
++        THROW_WALLET_EXCEPTION_IF(td.m_td_origin_idx >= get_num_transfer_details(), error::wallet_internal_error, "cannot locate return_payment TX origin in m_transfers");
++        const transfer_details &td_origin = m_transfers[td.m_td_origin_idx];
++        origin_tx_data.tx_pub_key = get_tx_pub_key_from_extra(td_origin.m_tx, td_origin.m_pk_index);
++        origin_tx_data.output_index = td_origin.m_internal_output_index;
++        origin_tx_data.tx_type = td_origin.m_tx.type;
++        have_origin_data = true;
++      }
++      else
++      {
++        for (const auto &ctd_entry : m_confirmed_txs)
++        {
++          const cryptonote::transaction_prefix &ctd_tx = ctd_entry.second.m_tx;
++          if (ctd_tx.type == cryptonote::transaction_type::STAKE || ctd_tx.type == cryptonote::transaction_type::AUDIT)
++          {
++            crypto::public_key stake_return_addr = crypto::null_pkey;
++            if (ctd_tx.return_address != crypto::null_pkey)
++              stake_return_addr = ctd_tx.return_address;
++            else if (ctd_tx.protocol_tx_data.return_address != crypto::null_pkey)
++              stake_return_addr = ctd_tx.protocol_tx_data.return_address;
++
++            if (stake_return_addr == onetime_address)
++            {
++              origin_tx_data.tx_pub_key = get_tx_pub_key_from_extra(ctd_tx);
++              origin_tx_data.output_index = 0;
++              origin_tx_data.tx_type = ctd_tx.type;
++              have_origin_data = true;
++              break;
++            }
++          }
++        }
++      }
++
++      if (have_origin_data)
++      {
++        hw::device &hwdev =  m_account.get_device();
++        hw::reset_mode rst(hwdev);
++        hwdev.set_mode(hw::device::TRANSACTION_PARSE);
++        const crypto::public_key tx_public_key = get_tx_pub_key_from_extra(tx);
++        const std::vector<crypto::public_key> additional_tx_public_keys = get_additional_tx_pub_keys_from_extra(tx);
++        keypair in_ephemeral;
++        crypto::key_image ki;
++        rct::salvium_input_data_t sid;
++        THROW_WALLET_EXCEPTION_IF(!cryptonote::generate_key_image_helper(
++          m_account.get_keys(),
++          m_account.get_subaddress_map_cn(),
++          onetime_address,
++          tx_public_key,
++          additional_tx_public_keys,
++          local_output_index,
++          in_ephemeral,
++          ki,
++          hwdev,
++          true,
++          origin_tx_data,
++          sid),
++          error::wallet_internal_error,
++          "failed to obtain key image for protocol_tx output"
++        );
++        td.m_key_image_known = true;
++        td.m_key_image = ki;
++      }
++      else
++      {
++        const auto &return_output_map = m_account.get_return_output_map_ref();
++        auto roi_it = return_output_map.find(onetime_address);
++        if (roi_it != return_output_map.end())
++        {
++          const auto &roi = roi_it->second;
++          crypto::secret_key k_return;
++          m_account.s_view_balance_dev.make_internal_return_privkey(roi.input_context, roi.K_o, k_return);
++          crypto::secret_key address_privkey_g = m_account.get_keys().m_spend_secret_key;
++          crypto::secret_key spend_key;
++          sc_add(reinterpret_cast<unsigned char*>(&spend_key), reinterpret_cast<const unsigned char*>(&address_privkey_g), reinterpret_cast<const unsigned char*>(&k_return));
++          crypto::key_image ki;
++          crypto::generate_key_image(onetime_address, spend_key, ki);
++          td.m_key_image_known = true;
++          td.m_key_image = ki;
++        }
++      }
+     }
+     td.m_key_image_request = m_watch_only; // for view wallets, that flag means "we want to request it"
+     td.m_key_image_partial = m_multisig;
+@@ -2895,6 +2990,23 @@
+ 
+       // Add a "locked coins" entry so users don't freak out when they STAKE/AUDIT
+       m_locked_coins.insert({onetime_address, {0, tx.amount_burnt, tx.source_asset_type}});
++
++      crypto::public_key return_address_to_track = crypto::null_pkey;
++      if (tx.type == cryptonote::transaction_type::STAKE)
++      {
++        if (tx.return_address != crypto::null_pkey)
++          return_address_to_track = tx.return_address;
++        else if (tx.protocol_tx_data.return_address != crypto::null_pkey)
++          return_address_to_track = tx.protocol_tx_data.return_address;
++      }
++      else if (tx.type == cryptonote::transaction_type::AUDIT)
++      {
++        if (tx.return_address != crypto::null_pkey)
++          return_address_to_track = tx.return_address;
++      }
++
++      if (return_address_to_track != crypto::null_pkey)
++        m_salvium_txs.insert({return_address_to_track, m_transfers.size() - 1});
+     }
+     
+     // update multisig info

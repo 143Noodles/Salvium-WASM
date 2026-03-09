@@ -1,73 +1,60 @@
 # WASM Wallet Patches
 
-This directory contains patches for the Salvium wallet source code that are required for the WASM wallet to function correctly.
+This directory contains two kinds of overlays:
 
-**NOTE:** Patches are automatically applied during the Docker build process. You don't need to manually apply them unless you're building outside of Docker.
+- patches applied to the fresh upstream clone during Docker builds
+- patches kept around so we can re-apply Vault-specific `wallet2` fixes after syncing `salvium-repo/src` to a newer upstream version
 
-## v5.30.0: m_salvium_txs Fix
+## Auto-applied During Docker Build
 
-**File:** `v5.30.0-m_salvium_txs-fix.patch`
+- `v5.41.0-fix-get-sources-index-oob.patch`
 
-**Issue:** STAKE/AUDIT transaction YIELD outputs were not being marked as spent, causing balance inflation (~66K SAL in production).
+The Dockerfile copies `patches/` into the build context and applies that upstream fix to `/workspace/salvium` before the local vendored source tree is copied in.
 
-**Root Cause:** 
-- When STAKE/AUDIT transactions are processed, their `return_address` was not being added to `m_salvium_txs` map
-- When YIELD/PROTOCOL outputs come at maturity, the wallet looks up `address_spend_pubkey` in `m_salvium_txs` to find the origin transfer
-- Without the origin transfer index (`m_td_origin_idx`), the key image cannot be generated
-- Without the key image, the output is never marked as spent when used in a later transaction
+## Vendored `wallet2` Overlay
 
-**Fix:** 
-Adds code to insert the `return_address` into `m_salvium_txs` when processing STAKE/AUDIT transactions, enabling proper YIELD output key image generation.
+- `v1.1-wallet2-vault-return-fixes.patch`
 
-## Automatic Application
+This patch targets `salvium-repo/src/wallet/wallet2.cpp`. It restores Vault-specific stake return handling that was lost when `wallet2.cpp` was refreshed to the 1.1 source:
 
-Patches are automatically applied during Docker build in the Dockerfile:
+- recover type-2 `PROTOCOL` returns when normal view scanning misses them
+- avoid counting the locked STAKE return output as spendable incoming funds
+- look up protocol return origins by `onetime_address`
+- recover no-change STAKE/AUDIT origins from `m_confirmed_txs`
+- re-seed `m_salvium_txs` with STAKE/AUDIT `return_address` values
 
-```dockerfile
-COPY patches/v5.30.0-m_salvium_txs-fix.patch /workspace/patches/
-RUN cd /workspace/salvium \
-    && git apply --verbose /workspace/patches/v5.30.0-m_salvium_txs-fix.patch
-```
+These fixes are already present in the vendored `salvium-repo/src/wallet/wallet2.cpp` tracked in this workspace. The patch file exists so future upstream refreshes can be re-patched instead of re-discovered manually.
 
-## Manual Application (for non-Docker builds)
+## Re-applying After an Upstream Refresh
 
-If you're building outside of Docker after updating Salvium source code:
+If `salvium-repo/src/` gets replaced from a newer upstream wallet release, run:
 
 ```bash
-cd wasm-build/salvium-repo
-
-# Apply the patch
-git apply ../patches/v5.30.0-m_salvium_txs-fix.patch
-
-# If the patch fails (e.g., due to line number changes), try with 3-way merge:
-git apply --3way ../patches/v5.30.0-m_salvium_txs-fix.patch
+./patches/apply-vault-wallet2-fixes.sh
 ```
 
-### To check if patch is already applied:
+Optionally pass a different target tree:
 
 ```bash
-cd wasm-build/salvium-repo
-git apply --check ../patches/v5.30.0-m_salvium_txs-fix.patch
+./patches/apply-vault-wallet2-fixes.sh /path/to/salvium-repo
 ```
 
-If it says "error: patch does not apply", the patch may already be applied or the code has changed significantly.
+The helper uses `git apply --3way` when the target is a git checkout, and falls back to plain `git apply` otherwise.
 
-### To reverse a patch:
+## Manual Checks
+
+From inside `salvium-repo/`:
 
 ```bash
-cd wasm-build/salvium-repo
-git apply -R ../patches/v5.30.0-m_salvium_txs-fix.patch
+git apply --check ../patches/v1.1-wallet2-vault-return-fixes.patch
 ```
 
-## Build Process
+If the check fails because the patch is already present, that is expected. If it fails because the context moved, refresh the patch from the current vendored file after updating the overlay.
 
-Normal Docker build (patches auto-applied):
+## Updating the Overlay
 
-```powershell
-cd wasm-build
-.\build_and_deploy.ps1 -fast
-```
+When Vault-specific `wallet2` logic changes:
 
-## Submitting Upstream
-
-These patches should ideally be submitted as pull requests to the official Salvium repository so they benefit all users and don't need to be maintained separately.
+1. update `salvium-repo/src/wallet/wallet2.cpp`
+2. regenerate `patches/v1.1-wallet2-vault-return-fixes.patch` from the before/after diff against `src/wallet/wallet2.cpp`
+3. keep the helper script pointing at the same patch file so the refresh workflow stays stable
