@@ -15,10 +15,10 @@
 #define WASM_PRODUCTION 1
 
 #if WASM_PRODUCTION
-// Redirect fprintf(stderr, ...) to no-op using statement expression
-// Avoids "left operand is void, right is int" error with ternary
-#define fprintf(stream, ...)                                                   \
-  (stream == stderr ? (void)0 : (void)::fprintf(stream, __VA_ARGS__))
+// Disable legacy fprintf-based diagnostics entirely in production WASM builds.
+// Some debug-only call sites pull in expressions/types that are not worth
+// keeping compile-clean while we harden native wallet correctness.
+#define fprintf(...) ((void)0)
 // Disable std_cerr output
 namespace {
 struct NullStream {
@@ -34,6 +34,7 @@ struct NullStream {
 #include <chrono>    // for benchmarking
 #include <cstdint>   // for uintptr_t
 #include <cstring>   // for memcpy
+#include <functional>
 #include <iomanip>   // for std::setw, std::setfill
 #include <memory>
 #include <set> // for std::set (CSP v6 key_images lookup)
@@ -52,6 +53,7 @@ struct NullStream {
 #include "carrot_core/config.h" // For CARROT_DOMAIN_SEP_INPUT_CONTEXT_COINBASE
 #include "carrot_core/core_types.h" // For input_context_t, view_tag_t
 #include "carrot_core/enote_utils.h" // For make_carrot_view_tag, make_carrot_uncontextualized_shared_key_receiver
+#include "carrot_core/scan.h"
 #include "carrot_impl/format_utils.h" // For is_carrot_transaction_v1
 #include "common/base58.h"
 #include "crypto/crypto.h"
@@ -65,6 +67,7 @@ extern "C" {
 #include "mnemonics/electrum-words.h"
 #include "mx25519.h"               // For mx25519_pubkey, mx25519_privkey
 #include "wallet/scanning_tools.h" // For view_incoming_scan_transaction
+#include "wallet/tx_builder.h"
 #include "wallet/wallet2.h"
 
 // Include crypto-ops.h for direct access to ge_* functions (for debugging)
@@ -603,6 +606,15 @@ private:
   bool m_initialized;
   std::string m_daemon_address;
 
+  static cryptonote::network_type
+  parse_network_type(const std::string &network) {
+    if (network == "testnet")
+      return cryptonote::TESTNET;
+    if (network == "stagenet")
+      return cryptonote::STAGENET;
+    return cryptonote::MAINNET;
+  }
+
   // Helper to check if wallet has a transaction (linear search)
   // This is needed because wallet2::have_tx is not available or private
   bool wallet_has_tx(const crypto::hash &txid) const {
@@ -748,14 +760,1157 @@ private:
     return result;
   }
 
+  void rebuild_wallet_derived_state() {
+    if (!m_wallet) {
+      return;
+    }
+
+    auto &account = m_wallet->get_account();
+    m_wallet->m_transfers_indices.clear();
+    m_wallet->m_locked_coins.clear();
+    m_wallet->m_salvium_txs.clear();
+    const auto &return_output_info = account.get_return_output_map_ref();
+    const auto &return_spend_metadata =
+        account.get_return_spend_metadata_map_ref();
+
+    struct transfer_return_hint_candidate {
+      crypto::public_key K_o = crypto::null_pkey;
+      carrot::return_scan_hint_t scan_hint;
+      size_t change_transfer_idx = std::numeric_limits<size_t>::max();
+    };
+    std::unordered_map<crypto::public_key, transfer_return_hint_candidate>
+        transfer_return_hint_candidates;
+
+    for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx) {
+      const auto &td = m_wallet->m_transfers[idx];
+      if (!td.asset_type.empty()) {
+        m_wallet->m_transfers_indices[td.asset_type].insert(idx);
+      }
+      const auto confirmed_it = m_wallet->m_confirmed_txs.find(td.m_txid);
+      if (confirmed_it == m_wallet->m_confirmed_txs.end()) {
+        continue;
+      }
+
+      // Rebuild the outgoing-transfer lookup table that live ingest populates
+      // from change outputs. Returned-transfer outputs depend on this map to
+      // recover their TRANSFER origin after a sparse restore.
+      if (td.m_subaddr_index.major == confirmed_it->second.m_subaddr_account) {
+        m_wallet->m_salvium_txs[td.get_public_key()] = idx;
+      }
+    }
+
+    for (const auto &confirmed_entry : m_wallet->m_confirmed_txs) {
+      const auto &ctd = confirmed_entry.second;
+      const auto &tx = ctd.m_tx;
+      if (tx.type != cryptonote::transaction_type::TRANSFER ||
+          !carrot::is_carrot_transaction_v1(tx) || tx.vout.empty()) {
+        continue;
+      }
+      if (tx.vin.empty() ||
+          tx.vin[0].type() != typeid(cryptonote::txin_to_key)) {
+        continue;
+      }
+
+      const carrot::input_context_t input_context =
+          carrot::make_carrot_input_context(
+              boost::get<cryptonote::txin_to_key>(tx.vin[0]).k_image);
+
+      for (size_t output_index = 0; output_index < tx.vout.size(); ++output_index) {
+        crypto::public_key K_o = crypto::null_pkey;
+        if (!get_output_public_key(tx.vout[output_index], K_o) ||
+            K_o == crypto::null_pkey) {
+          continue;
+        }
+
+        size_t change_index = std::numeric_limits<size_t>::max();
+        if (tx.version >= TRANSACTION_VERSION_N_OUTS) {
+          if (output_index >= tx.return_address_change_mask.size()) {
+            continue;
+          }
+
+          crypto::secret_key z_i;
+          std::vector<crypto::public_key> main_tx_ephemeral_pubkeys;
+          std::vector<crypto::public_key> additional_tx_ephemeral_pubkeys;
+          cryptonote::blobdata tx_extra_nonce;
+          if (!tools::wallet::parse_tx_extra_for_scanning(
+                  tx.extra, tx.vout.size(), main_tx_ephemeral_pubkeys,
+                  additional_tx_ephemeral_pubkeys, tx_extra_nonce)) {
+            continue;
+          }
+
+          crypto::public_key txkey_pub = crypto::null_pkey;
+          if (!additional_tx_ephemeral_pubkeys.empty()) {
+            if (additional_tx_ephemeral_pubkeys.size() != tx.vout.size()) {
+              continue;
+            }
+            txkey_pub = additional_tx_ephemeral_pubkeys[output_index];
+          } else {
+            txkey_pub = get_tx_pub_key_from_extra(tx);
+          }
+          if (txkey_pub == crypto::null_pkey) {
+            continue;
+          }
+
+          crypto::key_derivation derivation = AUTO_VAL_INIT(derivation);
+          if (!generate_key_derivation(txkey_pub,
+                                       account.get_keys().k_view_incoming,
+                                       derivation)) {
+            continue;
+          }
+          derivation_to_scalar(derivation, output_index, z_i);
+
+          struct {
+            char domain_separator[8];
+            crypto::secret_key output_index_key;
+          } buf;
+          std::memset(buf.domain_separator, 0x0, sizeof(buf.domain_separator));
+          std::strncpy(buf.domain_separator, "CHG_IDX", 8);
+          std::memcpy(buf.output_index_key.data, z_i.data,
+                      sizeof(crypto::secret_key));
+          crypto::secret_key eci_out;
+          keccak((uint8_t *)&buf, sizeof(buf), (uint8_t *)&eci_out,
+                 sizeof(eci_out));
+          change_index =
+              tx.return_address_change_mask[output_index] ^ eci_out.data[0];
+        } else {
+          if (tx.vout.size() != 2) {
+            continue;
+          }
+          change_index = (output_index == 0) ? 1 : 0;
+        }
+
+        if (change_index >= tx.vout.size() || change_index == output_index) {
+          continue;
+        }
+
+        crypto::public_key change_key = crypto::null_pkey;
+        if (!get_output_public_key(tx.vout[change_index], change_key) ||
+            change_key == crypto::null_pkey) {
+          continue;
+        }
+
+        const auto change_it = m_wallet->m_pub_keys.find(change_key);
+        if (change_it == m_wallet->m_pub_keys.end() ||
+            change_it->second >= m_wallet->m_transfers.size()) {
+          continue;
+        }
+        const auto &change_td = m_wallet->m_transfers[change_it->second];
+        if (change_td.m_tx.type != cryptonote::transaction_type::TRANSFER) {
+          continue;
+        }
+
+        crypto::secret_key k_return;
+        account.s_view_balance_dev.make_internal_return_privkey(
+            input_context, K_o, k_return);
+        crypto::public_key K_return = crypto::null_pkey;
+        if (!crypto::secret_key_to_public_key(k_return, K_return)) {
+          continue;
+        }
+        const crypto::public_key K_r = rct::rct2pk(
+            rct::addKeys(rct::pk2rct(K_return), rct::pk2rct(K_o)));
+
+        transfer_return_hint_candidate candidate;
+        candidate.K_o = K_o;
+        candidate.change_transfer_idx = change_it->second;
+        candidate.scan_hint = carrot::return_scan_hint_t(
+            input_context, K_o, K_r, change_td.m_tx.type,
+            cryptonote::get_tx_pub_key_from_extra(change_td.m_tx,
+                                                  change_td.m_pk_index),
+            change_td.m_internal_output_index);
+        transfer_return_hint_candidates[K_r] = candidate;
+      }
+    }
+
+    static constexpr uint64_t STAKE_LOCK_PERIOD = 21601;
+    const uint64_t wallet_height = m_wallet->get_blockchain_current_height();
+
+    std::unordered_map<size_t, size_t> payout_index_by_origin;
+    for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx) {
+      const auto &td = m_wallet->m_transfers[idx];
+      const auto &tx = td.m_tx;
+      if ((tx.type == cryptonote::transaction_type::PROTOCOL ||
+           tx.type == cryptonote::transaction_type::RETURN) &&
+          td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
+          td.m_td_origin_idx < m_wallet->m_transfers.size()) {
+        const auto &origin_td = m_wallet->m_transfers[td.m_td_origin_idx];
+        if (origin_td.m_tx.type == cryptonote::transaction_type::STAKE ||
+            origin_td.m_tx.type == cryptonote::transaction_type::AUDIT) {
+          payout_index_by_origin[td.m_td_origin_idx] = idx;
+        }
+      }
+    }
+
+    const auto is_currently_active_locked_stake =
+        [&](size_t transfer_idx) -> bool {
+      if (transfer_idx >= m_wallet->m_transfers.size()) {
+        return false;
+      }
+
+      const auto &stake_td = m_wallet->m_transfers[transfer_idx];
+      if (stake_td.m_tx.type != cryptonote::transaction_type::STAKE &&
+          stake_td.m_tx.type != cryptonote::transaction_type::AUDIT) {
+        return false;
+      }
+
+      if (payout_index_by_origin.find(transfer_idx) !=
+          payout_index_by_origin.end()) {
+        return false;
+      }
+
+      const uint64_t maturity_height =
+          stake_td.m_block_height + STAKE_LOCK_PERIOD;
+      return wallet_height < maturity_height;
+    };
+
+    for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx) {
+      auto &td = m_wallet->m_transfers[idx];
+      const auto &tx = td.m_tx;
+
+      if (tx.type == cryptonote::transaction_type::STAKE) {
+        crypto::public_key locked_output_key = crypto::null_pkey;
+        if (is_currently_active_locked_stake(idx) &&
+            td.m_internal_output_index < tx.vout.size() &&
+            get_output_public_key(tx.vout[td.m_internal_output_index],
+                                  locked_output_key)) {
+          std::string asset_type = tx.source_asset_type;
+          if (asset_type.empty()) {
+            asset_type = td.asset_type;
+          }
+
+          m_wallet->m_locked_coins[locked_output_key] = {
+              td.m_subaddr_index.major, tx.amount_burnt, asset_type};
+        }
+
+        crypto::public_key return_address_to_track = crypto::null_pkey;
+        if (tx.return_address != crypto::null_pkey) {
+          return_address_to_track = tx.return_address;
+        } else if (tx.protocol_tx_data.return_address != crypto::null_pkey) {
+          return_address_to_track = tx.protocol_tx_data.return_address;
+        }
+
+        if (return_address_to_track != crypto::null_pkey &&
+            m_wallet->m_salvium_txs.find(return_address_to_track) ==
+                m_wallet->m_salvium_txs.end()) {
+          m_wallet->m_salvium_txs[return_address_to_track] = idx;
+        }
+        continue;
+      }
+
+      if ((tx.type == cryptonote::transaction_type::PROTOCOL ||
+           tx.type == cryptonote::transaction_type::RETURN)) {
+        const crypto::public_key output_key = td.get_public_key();
+        const auto transfer_candidate_it =
+            transfer_return_hint_candidates.find(output_key);
+
+        const auto erase_locked_coin_if_stake_origin =
+            [&](const crypto::public_key &ko) {
+              if (ko == crypto::null_pkey) {
+                return;
+              }
+              const auto ko_it = m_wallet->m_pub_keys.find(ko);
+              if (ko_it == m_wallet->m_pub_keys.end() ||
+                  ko_it->second >= m_wallet->m_transfers.size()) {
+                return;
+              }
+              if (is_currently_active_locked_stake(ko_it->second)) {
+                return;
+              }
+              const auto &ko_td = m_wallet->m_transfers[ko_it->second];
+              if (ko_td.m_tx.type == cryptonote::transaction_type::AUDIT ||
+                  ko_td.m_tx.type == cryptonote::transaction_type::STAKE) {
+                m_wallet->m_locked_coins.erase(ko);
+              }
+            };
+
+        const auto erase_stale_locked_coin_links =
+            [&]() {
+              const auto scan_hint_it =
+                  m_wallet->m_return_scan_hints.find(output_key);
+              if (scan_hint_it != m_wallet->m_return_scan_hints.end()) {
+                erase_locked_coin_if_stake_origin(scan_hint_it->second.K_o);
+              }
+
+              const auto roi_it = return_output_info.find(output_key);
+              if (roi_it != return_output_info.end()) {
+                erase_locked_coin_if_stake_origin(roi_it->second.K_o);
+              }
+            };
+
+        const auto apply_origin_override =
+            [&](size_t origin_idx) {
+              if (origin_idx >= m_wallet->m_transfers.size() || origin_idx == idx) {
+                return;
+              }
+
+              const auto &origin_td = m_wallet->m_transfers[origin_idx];
+              td.m_td_origin_idx = origin_idx;
+
+              auto scan_hint_it = m_wallet->m_return_scan_hints.find(output_key);
+              if (scan_hint_it != m_wallet->m_return_scan_hints.end()) {
+                scan_hint_it->second = carrot::return_scan_hint_t(
+                    scan_hint_it->second.input_context,
+                    scan_hint_it->second.K_o,
+                    scan_hint_it->second.K_r,
+                    origin_td.m_tx.type,
+                    cryptonote::get_tx_pub_key_from_extra(origin_td.m_tx,
+                                                          origin_td.m_pk_index),
+                    origin_td.m_internal_output_index);
+                account.insert_return_scan_hints({{output_key, scan_hint_it->second}});
+              }
+            };
+
+        const auto apply_transfer_candidate_override =
+            [&](const transfer_return_hint_candidate &candidate) {
+              if (candidate.change_transfer_idx >= m_wallet->m_transfers.size() ||
+                  candidate.change_transfer_idx == idx) {
+                return false;
+              }
+
+              const auto &change_td =
+                  m_wallet->m_transfers[candidate.change_transfer_idx];
+              if (change_td.m_tx.type !=
+                  cryptonote::transaction_type::TRANSFER) {
+                return false;
+              }
+
+              erase_stale_locked_coin_links();
+              td.m_td_origin_idx = candidate.change_transfer_idx;
+              m_wallet->m_salvium_txs[output_key] =
+                  candidate.change_transfer_idx;
+              m_wallet->m_return_scan_hints[output_key] = candidate.scan_hint;
+              account.insert_return_scan_hints(
+                  {{output_key, candidate.scan_hint}});
+
+              const auto roi_it = return_output_info.find(output_key);
+              if (roi_it != return_output_info.end()) {
+                std::unordered_map<crypto::public_key,
+                                   carrot::return_output_info_t>
+                    repaired_roi;
+                repaired_roi[output_key] = carrot::return_output_info_t(
+                    roi_it->second.input_context,
+                    candidate.K_o,
+                    change_td.get_public_key(),
+                    roi_it->second.K_spend_pubkey,
+                    roi_it->second.key_image,
+                    roi_it->second.sum_g,
+                    roi_it->second.sender_extension_t);
+                account.insert_return_output_info(repaired_roi);
+                m_wallet->m_return_output_info[output_key] =
+                    repaired_roi.begin()->second;
+              }
+
+              return true;
+            };
+
+        const auto roi_it = return_output_info.find(output_key);
+        if (roi_it != return_output_info.end() &&
+            roi_it->second.K_change != crypto::null_pkey) {
+          const auto change_it = m_wallet->m_pub_keys.find(roi_it->second.K_change);
+          if (change_it != m_wallet->m_pub_keys.end() &&
+              change_it->second < m_wallet->m_transfers.size() &&
+              change_it->second != idx) {
+            const auto &change_td = m_wallet->m_transfers[change_it->second];
+            if (change_td.m_tx.type == cryptonote::transaction_type::TRANSFER) {
+              if (transfer_candidate_it !=
+                      transfer_return_hint_candidates.end() &&
+                  apply_transfer_candidate_override(
+                      transfer_candidate_it->second)) {
+                continue;
+              }
+              apply_origin_override(change_it->second);
+              m_wallet->m_salvium_txs[output_key] = change_it->second;
+              continue;
+            }
+          }
+        }
+
+        const auto apply_metadata_origin_override =
+            [&]() -> bool {
+              auto metadata_it = return_spend_metadata.find(output_key);
+              if (metadata_it == return_spend_metadata.end()) {
+                return false;
+              }
+
+              const auto &metadata = metadata_it->second;
+              if (metadata.K_spend_pubkey == crypto::null_pkey) {
+                return false;
+              }
+
+              size_t spend_origin_idx = std::numeric_limits<size_t>::max();
+              for (size_t candidate_idx = 0;
+                   candidate_idx < m_wallet->m_transfers.size();
+                   ++candidate_idx) {
+                if (candidate_idx == idx) {
+                  continue;
+                }
+                const auto &candidate_td = m_wallet->m_transfers[candidate_idx];
+                if (candidate_td.m_tx.type !=
+                    cryptonote::transaction_type::TRANSFER) {
+                  continue;
+                }
+                if (candidate_td.m_recovered_spend_pubkey !=
+                    metadata.K_spend_pubkey) {
+                  continue;
+                }
+                spend_origin_idx = candidate_idx;
+                break;
+              }
+
+              if (spend_origin_idx == std::numeric_limits<size_t>::max()) {
+                return false;
+              }
+
+              const auto &spend_origin_td =
+                  m_wallet->m_transfers[spend_origin_idx];
+              const crypto::public_key repaired_change_key =
+                  spend_origin_td.get_public_key();
+
+              erase_stale_locked_coin_links();
+              if (transfer_candidate_it !=
+                      transfer_return_hint_candidates.end() &&
+                  apply_transfer_candidate_override(
+                      transfer_candidate_it->second)) {
+                if (td.m_recovered_spend_pubkey == crypto::null_pkey) {
+                  td.m_recovered_spend_pubkey = metadata.K_spend_pubkey;
+                }
+                return true;
+              }
+
+              apply_origin_override(spend_origin_idx);
+              m_wallet->m_salvium_txs[output_key] = spend_origin_idx;
+
+              auto scan_hint_it = m_wallet->m_return_scan_hints.find(output_key);
+              auto roi_it = return_output_info.find(output_key);
+              const crypto::public_key repaired_ko =
+                  scan_hint_it != m_wallet->m_return_scan_hints.end()
+                      ? scan_hint_it->second.K_o
+                      : (roi_it != return_output_info.end()
+                             ? roi_it->second.K_o
+                             : crypto::null_pkey);
+              if (scan_hint_it != m_wallet->m_return_scan_hints.end()) {
+                const auto repaired_scan_hint = carrot::return_scan_hint_t(
+                    scan_hint_it->second.input_context,
+                    repaired_ko,
+                    output_key,
+                    spend_origin_td.m_tx.type,
+                    cryptonote::get_tx_pub_key_from_extra(
+                        spend_origin_td.m_tx, spend_origin_td.m_pk_index),
+                    spend_origin_td.m_internal_output_index);
+                m_wallet->m_return_scan_hints[output_key] =
+                    repaired_scan_hint;
+                account.insert_return_scan_hints(
+                    {{output_key, repaired_scan_hint}});
+              } else if (roi_it != return_output_info.end()) {
+                const auto &roi = roi_it->second;
+                const auto repaired_scan_hint = carrot::return_scan_hint_t(
+                    roi.input_context,
+                    repaired_ko,
+                    output_key,
+                    spend_origin_td.m_tx.type,
+                    cryptonote::get_tx_pub_key_from_extra(
+                        spend_origin_td.m_tx, spend_origin_td.m_pk_index),
+                    spend_origin_td.m_internal_output_index);
+                m_wallet->m_return_scan_hints[output_key] =
+                    repaired_scan_hint;
+                account.insert_return_scan_hints(
+                    {{output_key, repaired_scan_hint}});
+              }
+
+              if (roi_it != return_output_info.end()) {
+                std::unordered_map<crypto::public_key,
+                                   carrot::return_output_info_t>
+                    repaired_roi;
+                repaired_roi[output_key] = carrot::return_output_info_t(
+                    roi_it->second.input_context,
+                    repaired_ko,
+                    repaired_change_key,
+                    metadata.K_spend_pubkey,
+                    roi_it->second.key_image,
+                    roi_it->second.sum_g,
+                    roi_it->second.sender_extension_t);
+                account.insert_return_output_info(repaired_roi);
+                m_wallet->m_return_output_info[output_key] =
+                    repaired_roi.begin()->second;
+              }
+
+              if (td.m_recovered_spend_pubkey == crypto::null_pkey) {
+                td.m_recovered_spend_pubkey = metadata.K_spend_pubkey;
+              }
+              return true;
+            };
+
+        if (apply_metadata_origin_override()) {
+          continue;
+        }
+
+        if (transfer_candidate_it != transfer_return_hint_candidates.end()) {
+          const auto &candidate = transfer_candidate_it->second;
+          if (apply_transfer_candidate_override(candidate)) {
+            continue;
+          }
+        }
+
+        bool applied_transfer_origin_override = false;
+        auto scan_hint_it = m_wallet->m_return_scan_hints.find(output_key);
+        if (scan_hint_it != m_wallet->m_return_scan_hints.end()) {
+          const auto ko_it = m_wallet->m_pub_keys.find(scan_hint_it->second.K_o);
+          if (ko_it != m_wallet->m_pub_keys.end() &&
+              ko_it->second < m_wallet->m_transfers.size() &&
+              ko_it->second != idx) {
+            const auto &ko_origin_td = m_wallet->m_transfers[ko_it->second];
+            const bool should_prefer_ko_origin =
+                ko_origin_td.m_tx.type == cryptonote::transaction_type::TRANSFER &&
+                (td.m_td_origin_idx == std::numeric_limits<uint64_t>::max() ||
+                 td.m_td_origin_idx >= m_wallet->m_transfers.size() ||
+                 m_wallet->m_transfers[td.m_td_origin_idx].m_tx.type !=
+                     cryptonote::transaction_type::TRANSFER ||
+                 scan_hint_it->second.origin_tx_type !=
+                     cryptonote::transaction_type::TRANSFER);
+            if (should_prefer_ko_origin) {
+              apply_origin_override(ko_it->second);
+              m_wallet->m_salvium_txs[output_key] = ko_it->second;
+              applied_transfer_origin_override = true;
+            }
+          }
+        }
+
+        if (applied_transfer_origin_override) {
+          continue;
+        }
+
+        const auto origin_it = m_wallet->m_salvium_txs.find(output_key);
+        if (origin_it != m_wallet->m_salvium_txs.end() &&
+            origin_it->second < m_wallet->m_transfers.size() &&
+            origin_it->second != idx) {
+          const auto &mapped_origin_td = m_wallet->m_transfers[origin_it->second];
+          const bool should_prefer_mapped_origin =
+              td.m_td_origin_idx == std::numeric_limits<uint64_t>::max() ||
+              (mapped_origin_td.m_tx.type == cryptonote::transaction_type::TRANSFER &&
+               td.m_td_origin_idx < m_wallet->m_transfers.size() &&
+               m_wallet->m_transfers[td.m_td_origin_idx].m_tx.type !=
+                   cryptonote::transaction_type::TRANSFER);
+          if (should_prefer_mapped_origin) {
+            apply_origin_override(origin_it->second);
+          }
+        }
+
+        // Historical sparse restores can surface protocol-like outputs that
+        // scan as ours but have no recoverable origin and no return metadata.
+        // These orphan protocol rows must not contribute to authoritative
+        // balance state.
+        if (td.m_td_origin_idx == std::numeric_limits<uint64_t>::max()) {
+          const bool has_scan_hint =
+              m_wallet->m_return_scan_hints.find(output_key) !=
+              m_wallet->m_return_scan_hints.end();
+          const bool has_roi =
+              return_output_info.find(output_key) != return_output_info.end();
+          const bool has_spend_metadata =
+              return_spend_metadata.find(output_key) !=
+              return_spend_metadata.end();
+          if (!has_scan_hint && !has_roi && !has_spend_metadata) {
+            auto asset_indices_it =
+                m_wallet->m_transfers_indices.find(td.asset_type);
+            if (asset_indices_it != m_wallet->m_transfers_indices.end()) {
+              asset_indices_it->second.erase(idx);
+            }
+          }
+        }
+      }
+
+      if ((tx.type == cryptonote::transaction_type::PROTOCOL ||
+           tx.type == cryptonote::transaction_type::RETURN) &&
+          td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
+          td.m_td_origin_idx < m_wallet->m_transfers.size()) {
+        const auto &origin_td = m_wallet->m_transfers[td.m_td_origin_idx];
+        if (origin_td.m_tx.type != cryptonote::transaction_type::AUDIT &&
+            origin_td.m_tx.type != cryptonote::transaction_type::STAKE) {
+          continue;
+        }
+
+        if (is_currently_active_locked_stake(td.m_td_origin_idx)) {
+          continue;
+        }
+
+        crypto::public_key locked_output_key = crypto::null_pkey;
+        if (origin_td.m_internal_output_index < origin_td.m_tx.vout.size() &&
+            get_output_public_key(
+                origin_td.m_tx.vout[origin_td.m_internal_output_index],
+                locked_output_key)) {
+          m_wallet->m_locked_coins.erase(locked_output_key);
+        }
+      }
+    }
+
+    std::vector<crypto::public_key> stale_locked_keys;
+    stale_locked_keys.reserve(m_wallet->m_locked_coins.size());
+    for (const auto &entry : m_wallet->m_locked_coins) {
+      const crypto::public_key &locked_key = entry.first;
+      const auto source_it = m_wallet->m_pub_keys.find(locked_key);
+      if (source_it == m_wallet->m_pub_keys.end() ||
+          source_it->second >= m_wallet->m_transfers.size()) {
+        continue;
+      }
+
+      const auto &source_td = m_wallet->m_transfers[source_it->second];
+      if (source_td.m_tx.type != cryptonote::transaction_type::STAKE &&
+          source_td.m_tx.type != cryptonote::transaction_type::AUDIT) {
+        continue;
+      }
+
+      if (is_currently_active_locked_stake(source_it->second)) {
+        continue;
+      }
+
+      bool linked_via_return_state = false;
+      for (const auto &scan_hint_entry : m_wallet->m_return_scan_hints) {
+        if (scan_hint_entry.second.K_o == locked_key) {
+          linked_via_return_state = true;
+          break;
+        }
+      }
+      if (!linked_via_return_state) {
+        for (const auto &roi_entry : m_wallet->m_return_output_info) {
+          if (roi_entry.second.K_o == locked_key) {
+            linked_via_return_state = true;
+            break;
+          }
+        }
+      }
+
+      const bool has_linked_payout =
+          payout_index_by_origin.find(source_it->second) !=
+          payout_index_by_origin.end();
+      if (has_linked_payout || linked_via_return_state) {
+        stale_locked_keys.push_back(locked_key);
+      }
+    }
+
+    for (const auto &locked_key : stale_locked_keys) {
+      m_wallet->m_locked_coins.erase(locked_key);
+    }
+
+  }
+
+  void restore_account_cached_maps() {
+    if (!m_wallet) {
+      return;
+    }
+
+    auto &account = m_wallet->get_account();
+
+    if (!m_wallet->m_subaddresses_extended.empty()) {
+      account.insert_subaddresses(m_wallet->m_subaddresses_extended);
+    }
+
+    if (!m_wallet->m_return_output_info.empty()) {
+      account.insert_return_output_info(m_wallet->m_return_output_info);
+    }
+
+    if (!m_wallet->m_return_scan_hints.empty()) {
+      account.insert_return_scan_hints(m_wallet->m_return_scan_hints);
+    }
+
+    if (!m_wallet->m_return_spend_metadata.empty()) {
+      account.insert_return_spend_metadata(m_wallet->m_return_spend_metadata);
+    }
+  }
+
+  const tools::wallet2::transfer_details *find_origin_transfer_from_scan_hint(
+      const carrot::return_scan_hint_t &scan_hint) const {
+    if (!m_wallet ||
+        scan_hint.origin_tx_type == cryptonote::transaction_type::UNSET) {
+      return nullptr;
+    }
+
+    for (const auto &td : m_wallet->m_transfers) {
+      if (td.m_tx.type != scan_hint.origin_tx_type) {
+        continue;
+      }
+      if (td.m_internal_output_index != scan_hint.origin_output_index) {
+        continue;
+      }
+
+      const crypto::public_key candidate_tx_pub_key =
+          cryptonote::get_tx_pub_key_from_extra(td.m_tx, td.m_pk_index);
+      const crypto::public_key candidate_tx_pub_key_default =
+          cryptonote::get_tx_pub_key_from_extra(td.m_tx);
+      if (candidate_tx_pub_key == scan_hint.origin_tx_pub_key ||
+          candidate_tx_pub_key_default == scan_hint.origin_tx_pub_key) {
+        return &td;
+      }
+    }
+
+    return nullptr;
+  }
+
+  crypto::key_image derive_wallet_key_image_for_return(
+      const carrot::carrot_and_legacy_account &account,
+      const crypto::public_key &address_spend_pubkey,
+      const crypto::secret_key &sender_extension_g,
+      const crypto::secret_key &sender_extension_t,
+      const crypto::public_key &onetime_address) const {
+    if (account.get_keys().s_master == crypto::null_skey) {
+      return account.derive_key_image_view_only(address_spend_pubkey,
+                                                sender_extension_g,
+                                                sender_extension_t,
+                                                onetime_address);
+    }
+    return account.derive_key_image(address_spend_pubkey, sender_extension_g,
+                                    sender_extension_t, onetime_address);
+  }
+
+  bool try_derive_return_sender_extensions_from_tx_prefix(
+      const tools::wallet2::transfer_details &td,
+      const carrot::return_scan_hint_t &scan_hint,
+      carrot::carrot_and_legacy_account &account,
+      crypto::secret_key &sender_extension_g_out,
+      crypto::secret_key &sender_extension_t_out) const {
+    sender_extension_g_out = crypto::null_skey;
+    sender_extension_t_out = crypto::null_skey;
+
+    if (!carrot::is_carrot_transaction_v1(td.m_tx)) {
+      return false;
+    }
+
+    std::vector<mx25519_pubkey> enote_ephemeral_pubkeys;
+    std::optional<carrot::encrypted_payment_id_t> encrypted_payment_id;
+    if (!carrot::try_load_carrot_extra_v1(td.m_tx.extra,
+                                          enote_ephemeral_pubkeys,
+                                          encrypted_payment_id) ||
+        enote_ephemeral_pubkeys.empty()) {
+      return false;
+    }
+
+    const bool shared_ephemeral_pubkey = enote_ephemeral_pubkeys.size() == 1;
+    const size_t ephemeral_pubkey_index =
+        shared_ephemeral_pubkey ? 0 : td.m_internal_output_index;
+    if (ephemeral_pubkey_index >= enote_ephemeral_pubkeys.size()) {
+      return false;
+    }
+
+    const auto derive_input_context_from_tx =
+        [](const cryptonote::transaction_prefix &tx_prefix,
+           carrot::input_context_t &input_context_out) -> bool {
+      if (tx_prefix.vin.empty()) {
+        return false;
+      }
+      if (tx_prefix.vin[0].type() == typeid(cryptonote::txin_to_key)) {
+        input_context_out = carrot::make_carrot_input_context(
+            boost::get<cryptonote::txin_to_key>(tx_prefix.vin[0]).k_image);
+        return true;
+      }
+      if (tx_prefix.vin[0].type() == typeid(cryptonote::txin_gen)) {
+        input_context_out = carrot::make_carrot_input_context_coinbase(
+            boost::get<cryptonote::txin_gen>(tx_prefix.vin[0]).height);
+        return true;
+      }
+      return false;
+    };
+
+    carrot::input_context_t return_input_context = carrot::gen_input_context();
+    const bool have_return_input_context =
+        derive_input_context_from_tx(td.m_tx, return_input_context);
+
+    crypto::secret_key k_return = crypto::null_skey;
+    account.s_view_balance_dev.make_internal_return_privkey(
+        scan_hint.input_context, scan_hint.K_o, k_return);
+
+    mx25519_pubkey shared_secret_return_unctx;
+    if (!carrot::make_carrot_uncontextualized_shared_key_receiver(
+            k_return, enote_ephemeral_pubkeys[ephemeral_pubkey_index],
+            shared_secret_return_unctx)) {
+      return false;
+    }
+
+    crypto::hash shared_secret_return;
+    carrot::make_carrot_sender_receiver_secret(
+        shared_secret_return_unctx.data,
+        enote_ephemeral_pubkeys[ephemeral_pubkey_index],
+        have_return_input_context ? return_input_context : scan_hint.input_context,
+        shared_secret_return);
+
+    const rct::key amount_commitment = rct::commit(td.amount(), td.m_mask);
+    carrot::make_carrot_onetime_address_extension_g(
+        shared_secret_return, amount_commitment, sender_extension_g_out);
+    carrot::make_carrot_onetime_address_extension_t(
+        shared_secret_return, amount_commitment, sender_extension_t_out);
+    return sender_extension_g_out != crypto::null_skey &&
+           sender_extension_t_out != crypto::null_skey;
+  }
+
+  void repair_return_output_metadata_from_transfers() {
+    if (!m_wallet) {
+      return;
+    }
+
+    auto &account = m_wallet->get_account();
+    const auto &return_scan_hints = account.get_return_scan_hint_map_ref();
+    const auto &return_output_info = account.get_return_output_map_ref();
+    const auto &return_spend_metadata =
+        account.get_return_spend_metadata_map_ref();
+    if (return_scan_hints.empty()) {
+      return;
+    }
+
+    std::unordered_set<crypto::public_key> candidate_output_keys;
+    candidate_output_keys.reserve(return_scan_hints.size());
+    for (const auto &entry : return_scan_hints) {
+      candidate_output_keys.insert(entry.first);
+    }
+    if (candidate_output_keys.empty()) {
+      return;
+    }
+
+    for (auto &td : m_wallet->m_transfers) {
+      if (td.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
+          td.m_tx.type != cryptonote::transaction_type::RETURN) {
+        continue;
+      }
+
+      if (td.m_internal_output_index >= td.m_tx.vout.size()) {
+        continue;
+      }
+      crypto::public_key output_key = crypto::null_pkey;
+      if (!get_output_public_key(td.m_tx.vout[td.m_internal_output_index],
+                                 output_key)) {
+        continue;
+      }
+
+      if (!candidate_output_keys.count(output_key)) {
+        continue;
+      }
+
+      auto scan_hint_it = return_scan_hints.find(output_key);
+      if (scan_hint_it == return_scan_hints.end()) {
+        continue;
+      }
+      const auto &scan_hint = scan_hint_it->second;
+      auto roi_it = return_output_info.find(output_key);
+      auto metadata_it = return_spend_metadata.find(output_key);
+
+      const bool placeholder_roi =
+          roi_it != return_output_info.end() &&
+          carrot::is_return_output_placeholder_hint(roi_it->second);
+
+      const auto transfer_candidate =
+          find_transfer_origin_candidate_for_return_key(output_key);
+      const tools::wallet2::transfer_details *origin_td =
+          find_origin_transfer_from_scan_hint(scan_hint);
+      if ((!origin_td ||
+           origin_td->m_tx.type != cryptonote::transaction_type::TRANSFER ||
+           placeholder_roi) &&
+          transfer_candidate &&
+          std::get<1>(*transfer_candidate) < m_wallet->m_transfers.size()) {
+        const auto &candidate_td =
+            m_wallet->m_transfers[std::get<1>(*transfer_candidate)];
+        if (candidate_td.m_tx.type == cryptonote::transaction_type::TRANSFER) {
+          origin_td = &candidate_td;
+        }
+      }
+
+      const crypto::public_key change_output_key =
+          origin_td ? origin_td->get_public_key() : scan_hint.K_o;
+      std::vector<crypto::public_key> spend_pubkey_candidates;
+      if (roi_it != return_output_info.end() &&
+          roi_it->second.K_spend_pubkey != crypto::null_pkey) {
+        spend_pubkey_candidates.push_back(roi_it->second.K_spend_pubkey);
+      }
+      if (origin_td &&
+          origin_td->m_recovered_spend_pubkey != crypto::null_pkey) {
+        spend_pubkey_candidates.push_back(origin_td->m_recovered_spend_pubkey);
+      }
+      if (td.m_recovered_spend_pubkey != crypto::null_pkey) {
+        spend_pubkey_candidates.push_back(td.m_recovered_spend_pubkey);
+      }
+
+      crypto::secret_key sender_extension_g = crypto::null_skey;
+      crypto::secret_key sender_extension_t = crypto::null_skey;
+      crypto::key_image repaired_key_image = crypto::key_image{};
+
+      if (metadata_it != return_spend_metadata.end()) {
+        sender_extension_g = metadata_it->second.sum_g;
+        sender_extension_t = metadata_it->second.sender_extension_t;
+        repaired_key_image = metadata_it->second.key_image;
+      } else if (roi_it != return_output_info.end()) {
+        sender_extension_g = roi_it->second.sum_g;
+        sender_extension_t = roi_it->second.sender_extension_t;
+        repaired_key_image = roi_it->second.key_image;
+      }
+
+      if (sender_extension_g == crypto::null_skey ||
+          sender_extension_t == crypto::null_skey) {
+        try_derive_return_sender_extensions_from_tx_prefix(
+            td, scan_hint, account, sender_extension_g, sender_extension_t);
+      }
+
+      crypto::public_key canonical_spend_pubkey = crypto::null_pkey;
+      for (const auto &candidate_spend_pubkey : spend_pubkey_candidates) {
+        if (candidate_spend_pubkey == crypto::null_pkey) {
+          continue;
+        }
+        if (!account.can_open_fcmp_onetime_address(candidate_spend_pubkey,
+                                                   sender_extension_g,
+                                                   sender_extension_t,
+                                                   output_key)) {
+          continue;
+        }
+        canonical_spend_pubkey = candidate_spend_pubkey;
+        break;
+      }
+
+      if (canonical_spend_pubkey == crypto::null_pkey ||
+          sender_extension_g == crypto::null_skey ||
+          sender_extension_t == crypto::null_skey) {
+        continue;
+      }
+
+      if (origin_td && origin_td->m_tx.type == cryptonote::transaction_type::TRANSFER) {
+        const auto repaired_scan_hint = carrot::return_scan_hint_t(
+            scan_hint.input_context,
+            scan_hint.K_o,
+            output_key,
+            origin_td->m_tx.type,
+            cryptonote::get_tx_pub_key_from_extra(origin_td->m_tx,
+                                                  origin_td->m_pk_index),
+            origin_td->m_internal_output_index);
+        account.insert_return_scan_hints({{output_key, repaired_scan_hint}});
+        m_wallet->m_return_scan_hints[output_key] = repaired_scan_hint;
+
+        td.m_td_origin_idx = static_cast<size_t>(origin_td - &m_wallet->m_transfers[0]);
+        m_wallet->m_salvium_txs[output_key] = td.m_td_origin_idx;
+      }
+
+      std::unordered_map<crypto::public_key, carrot::return_output_info_t>
+          repaired_roi;
+      repaired_roi[output_key] = carrot::return_output_info_t(
+          scan_hint.input_context,
+          scan_hint.K_o,
+          change_output_key,
+          canonical_spend_pubkey,
+          repaired_key_image != crypto::key_image{} ? repaired_key_image : td.m_key_image,
+          sender_extension_g,
+          sender_extension_t);
+      account.insert_return_output_info(repaired_roi);
+      m_wallet->m_return_output_info[output_key] = repaired_roi.begin()->second;
+
+      td.m_recovered_spend_pubkey = canonical_spend_pubkey;
+
+      const size_t transfer_idx =
+          static_cast<size_t>(&td - &m_wallet->m_transfers[0]);
+      const crypto::key_image prior_key_image = td.m_key_image;
+      try {
+        if (repaired_key_image == crypto::key_image{}) {
+          repaired_key_image = derive_wallet_key_image_for_return(
+              account, canonical_spend_pubkey, sender_extension_g,
+              sender_extension_t, output_key);
+        }
+        td.m_key_image = repaired_key_image;
+        td.m_key_image_known = true;
+      } catch (const std::exception &) {
+        continue;
+      }
+      if (prior_key_image != crypto::key_image{}) {
+        auto prior_it = m_wallet->m_key_images.find(prior_key_image);
+        if (prior_it != m_wallet->m_key_images.end() &&
+            prior_it->second == transfer_idx) {
+          m_wallet->m_key_images.erase(prior_it);
+        }
+      }
+      m_wallet->m_key_images[td.m_key_image] = transfer_idx;
+
+      m_wallet->materialize_return_spend_metadata(
+          output_key, scan_hint, change_output_key, canonical_spend_pubkey,
+          td.m_key_image,
+          sender_extension_g, sender_extension_t);
+    }
+  }
+
+  std::optional<std::tuple<crypto::public_key, size_t, int>>
+  find_transfer_origin_candidate_for_return_key(
+      const crypto::public_key &return_key) const {
+    if (!m_wallet) {
+      return std::nullopt;
+    }
+
+    auto &account = m_wallet->get_account();
+    const auto &return_output_info = account.get_return_output_map_ref();
+    const auto roi_it = return_output_info.find(return_key);
+    if (roi_it != return_output_info.end() &&
+        roi_it->second.K_change != crypto::null_pkey) {
+      const auto change_it = m_wallet->m_pub_keys.find(roi_it->second.K_change);
+      if (change_it != m_wallet->m_pub_keys.end() &&
+          change_it->second < m_wallet->m_transfers.size()) {
+        const auto &origin_td = m_wallet->m_transfers[change_it->second];
+        if (origin_td.m_tx.type == cryptonote::transaction_type::TRANSFER) {
+          return std::make_tuple(roi_it->second.K_change, change_it->second,
+                                 static_cast<int>(origin_td.m_tx.type));
+        }
+      }
+    }
+
+    const auto &return_spend_metadata =
+        account.get_return_spend_metadata_map_ref();
+    const auto metadata_it = return_spend_metadata.find(return_key);
+    if (metadata_it != return_spend_metadata.end() &&
+        metadata_it->second.K_spend_pubkey != crypto::null_pkey) {
+      for (size_t candidate_idx = 0; candidate_idx < m_wallet->m_transfers.size();
+           ++candidate_idx) {
+        const auto &origin_td = m_wallet->m_transfers[candidate_idx];
+        if (origin_td.m_tx.type != cryptonote::transaction_type::TRANSFER) {
+          continue;
+        }
+        if (origin_td.m_recovered_spend_pubkey !=
+            metadata_it->second.K_spend_pubkey) {
+          continue;
+        }
+        if (origin_td.m_tx.type == cryptonote::transaction_type::TRANSFER) {
+          return std::make_tuple(origin_td.get_public_key(),
+                                 candidate_idx,
+                                 static_cast<int>(origin_td.m_tx.type));
+        }
+      }
+    }
+
+    for (const auto &confirmed_entry : m_wallet->m_confirmed_txs) {
+      const auto &ctd = confirmed_entry.second;
+      const auto &tx = ctd.m_tx;
+      if (tx.type != cryptonote::transaction_type::TRANSFER ||
+          !carrot::is_carrot_transaction_v1(tx) || tx.vout.empty() ||
+          tx.vin.empty() ||
+          tx.vin[0].type() != typeid(cryptonote::txin_to_key)) {
+        continue;
+      }
+
+      const carrot::input_context_t input_context =
+          carrot::make_carrot_input_context(
+              boost::get<cryptonote::txin_to_key>(tx.vin[0]).k_image);
+
+      for (size_t output_index = 0; output_index < tx.vout.size(); ++output_index) {
+        crypto::public_key K_o = crypto::null_pkey;
+        if (!get_output_public_key(tx.vout[output_index], K_o) ||
+            K_o == crypto::null_pkey) {
+          continue;
+        }
+
+        size_t change_index = std::numeric_limits<size_t>::max();
+        if (tx.version >= TRANSACTION_VERSION_N_OUTS) {
+          if (output_index >= tx.return_address_change_mask.size()) {
+            continue;
+          }
+
+          crypto::secret_key z_i;
+          std::vector<crypto::public_key> main_tx_ephemeral_pubkeys;
+          std::vector<crypto::public_key> additional_tx_ephemeral_pubkeys;
+          cryptonote::blobdata tx_extra_nonce;
+          if (!tools::wallet::parse_tx_extra_for_scanning(
+                  tx.extra, tx.vout.size(), main_tx_ephemeral_pubkeys,
+                  additional_tx_ephemeral_pubkeys, tx_extra_nonce)) {
+            continue;
+          }
+
+          crypto::public_key txkey_pub = crypto::null_pkey;
+          if (!additional_tx_ephemeral_pubkeys.empty()) {
+            if (additional_tx_ephemeral_pubkeys.size() != tx.vout.size()) {
+              continue;
+            }
+            txkey_pub = additional_tx_ephemeral_pubkeys[output_index];
+          } else {
+            txkey_pub = get_tx_pub_key_from_extra(tx);
+          }
+          if (txkey_pub == crypto::null_pkey) {
+            continue;
+          }
+
+          crypto::key_derivation derivation = AUTO_VAL_INIT(derivation);
+          if (!generate_key_derivation(txkey_pub,
+                                       account.get_keys().k_view_incoming,
+                                       derivation)) {
+            continue;
+          }
+          derivation_to_scalar(derivation, output_index, z_i);
+
+          struct {
+            char domain_separator[8];
+            crypto::secret_key output_index_key;
+          } buf;
+          std::memset(buf.domain_separator, 0x0, sizeof(buf.domain_separator));
+          std::strncpy(buf.domain_separator, "CHG_IDX", 8);
+          std::memcpy(buf.output_index_key.data, z_i.data,
+                      sizeof(crypto::secret_key));
+          crypto::secret_key eci_out;
+          keccak((uint8_t *)&buf, sizeof(buf), (uint8_t *)&eci_out,
+                 sizeof(eci_out));
+          change_index =
+              tx.return_address_change_mask[output_index] ^ eci_out.data[0];
+        } else {
+          if (tx.vout.size() != 2) {
+            continue;
+          }
+          change_index = (output_index == 0) ? 1 : 0;
+        }
+
+        if (change_index >= tx.vout.size() || change_index == output_index) {
+          continue;
+        }
+
+        crypto::public_key change_key = crypto::null_pkey;
+        if (!get_output_public_key(tx.vout[change_index], change_key) ||
+            change_key == crypto::null_pkey) {
+          continue;
+        }
+
+        const auto change_it = m_wallet->m_pub_keys.find(change_key);
+        if (change_it == m_wallet->m_pub_keys.end() ||
+            change_it->second >= m_wallet->m_transfers.size()) {
+          continue;
+        }
+
+        const auto &change_td = m_wallet->m_transfers[change_it->second];
+        if (change_td.m_tx.type != cryptonote::transaction_type::TRANSFER) {
+          continue;
+        }
+
+        crypto::secret_key k_return;
+        account.s_view_balance_dev.make_internal_return_privkey(
+            input_context, K_o, k_return);
+        crypto::public_key K_return = crypto::null_pkey;
+        if (!crypto::secret_key_to_public_key(k_return, K_return)) {
+          continue;
+        }
+        const crypto::public_key candidate_K_r = rct::rct2pk(
+            rct::addKeys(rct::pk2rct(K_return), rct::pk2rct(K_o)));
+        if (candidate_K_r == return_key) {
+          return std::make_tuple(K_o, change_it->second,
+                                 static_cast<int>(change_td.m_tx.type));
+        }
+      }
+    }
+
+    return std::nullopt;
+  }
+
 public:
   WasmWallet()
+      : m_initialized(false), m_daemon_address("seed01.salvium.io:19081") {
+    // Create HTTP client factory (returns stub clients that do nothing)
+    auto http_factory = std::make_unique<net::http::client_factory>();
+
+    m_wallet = std::make_unique<tools::wallet2>(
+        cryptonote::MAINNET,    // Network type
+        1,                      // KDF rounds
+        true,                   // Unattended mode
+        std::move(http_factory) // HTTP client factory (stub)
+    );
+    g_wallet_instance = m_wallet.get();
+  }
+
+  WasmWallet(const std::string &network)
       : m_initialized(false), m_daemon_address("/api/wallet-rpc") {
     // Create HTTP client factory (returns stub clients that do nothing)
     auto http_factory = std::make_unique<net::http::client_factory>();
 
     m_wallet = std::make_unique<tools::wallet2>(
-        cryptonote::TESTNET,    // Network type (test build)
+        parse_network_type(network), // Network type
         1,                      // KDF rounds
         true,                   // Unattended mode
         std::move(http_factory) // HTTP client factory (stub)
@@ -1548,6 +2703,7 @@ public:
 
             // Also add to wallet2::m_subaddresses for process_new_transaction
             m_wallet->m_subaddresses[pkey] = {0, 0};
+            m_wallet->m_subaddresses_extended[pkey] = return_idx;
             count++;
           } else {
             skipped++;
@@ -1615,11 +2771,10 @@ public:
       // Phase 2 have correct key_images; entries we add here have placeholders
       // but that's okay for no-change STAKE detection.
 
-      // Get existing return_output_map to avoid overwriting valid entries
-      const auto &existing_map = account.get_return_output_map_ref();
+      // Scan hints are the canonical "known return address" registry.
+      const auto &existing_scan_hints = account.get_return_scan_hint_map_ref();
 
-      std::unordered_map<crypto::public_key, carrot::return_output_info_t>
-          new_entries;
+      std::unordered_map<crypto::public_key, carrot::return_scan_hint_t> new_scan_hints;
       int registered = 0;
       int errors = 0;
       int skipped = 0;
@@ -1672,7 +2827,7 @@ public:
         }
 
         // Skip if already registered
-        if (existing_map.find(K_r) != existing_map.end()) {
+        if (existing_scan_hints.find(K_r) != existing_scan_hints.end()) {
           skipped++;
           continue;
         }
@@ -1680,9 +2835,6 @@ public:
         // Compute input_context from tx_first_key_image
         carrot::input_context_t input_context =
             carrot::make_carrot_input_context(tx_first_ki);
-
-        // For STAKE TX without change, K_o (stake output) IS the P_change
-        crypto::public_key K_change = K_o;
 
         // Compute k_return using s_view_balance
         crypto::secret_key k_return;
@@ -1703,32 +2855,33 @@ public:
           continue;
         }
 
-        // SIMPLIFIED APPROACH: Store minimal info with placeholder values
-        // scan_return_output only uses input_context, K_o, K_change - it
-        // re-derives the rest The key_image, x, y are only needed when
-        // spending, which we don't do (view-only)
-        crypto::key_image placeholder_ki;
-        memset(&placeholder_ki, 0, sizeof(placeholder_ki));
-        crypto::secret_key placeholder_sum_g, placeholder_sender_extension_t;
-        memset(&placeholder_sum_g, 0, sizeof(placeholder_sum_g));
-        memset(&placeholder_sender_extension_t, 0,
-               sizeof(placeholder_sender_extension_t));
-        crypto::public_key placeholder_K_spend_pubkey;
-        memset(&placeholder_K_spend_pubkey, 0,
-               sizeof(placeholder_K_spend_pubkey));
+        cryptonote::transaction_type origin_tx_type =
+            cryptonote::transaction_type::UNSET;
+        crypto::public_key origin_tx_pub_key = crypto::null_pkey;
+        uint64_t origin_output_index = 0;
+        auto transfer_it = m_wallet->m_pub_keys.find(K_o);
+        if (transfer_it != m_wallet->m_pub_keys.end() &&
+            transfer_it->second < m_wallet->m_transfers.size()) {
+          const auto &origin_td = m_wallet->m_transfers[transfer_it->second];
+          origin_tx_type = origin_td.m_tx.type;
+          origin_tx_pub_key =
+              cryptonote::get_tx_pub_key_from_extra(origin_td.m_tx,
+                                                    origin_td.m_pk_index);
+          origin_output_index = origin_td.m_internal_output_index;
+        }
 
-        // Create return_output_info entry using v1.0.7 constructor signature
-        carrot::return_output_info_t roi(
-            input_context, K_o, K_change, placeholder_K_spend_pubkey,
-            placeholder_ki, placeholder_sum_g, placeholder_sender_extension_t);
-
-        new_entries[K_r] = roi;
+        new_scan_hints[K_r] = carrot::return_scan_hint_t(
+            input_context, K_o, K_r, origin_tx_type, origin_tx_pub_key,
+            origin_output_index);
         registered++;
       }
 
       // Batch insert
-      if (!new_entries.empty()) {
-        account.insert_return_output_info(new_entries);
+      if (!new_scan_hints.empty()) {
+        account.insert_return_scan_hints(new_scan_hints);
+        for (const auto &entry : new_scan_hints) {
+          m_wallet->m_return_scan_hints[entry.first] = entry.second;
+        }
       }
 
       DEBUG_LOG("[WasmWallet] register_stake_return_info: registered=%d, "
@@ -1959,11 +3112,9 @@ public:
   // Balance - returned as strings for JavaScript BigInt compatibility
   // ========================================================================
 
-  // v5.47.2 FIX: Use balance_per_subaddress() instead of balance()
-  // wallet2::balance() includes m_locked_coins which causes double-counting
-  // when bulk-ingesting transactions (STAKE tx adds to m_locked_coins, but
-  // YIELD tx doesn't properly remove it during out-of-order ingest).
-  // JavaScript tracks stakes separately, so we don't need m_locked_coins.
+  // Keep a "liquid only" helper for diagnostics and state snapshots.
+  // The public get_balance() API should mirror wallet2::balance() and include
+  // active locked stake once derived state has been rebuilt correctly.
   uint64_t get_balance_without_locked_coins(const std::string& asset_type) const {
     uint64_t total = 0;
     for (const auto &pair : m_wallet->balance_per_subaddress(0, asset_type, false)) {
@@ -1976,10 +3127,11 @@ public:
     if (!m_initialized)
       return "0";
     try {
-      // v5.47.2 FIX: Use balance_per_subaddress() sum to exclude m_locked_coins
-      // which can be incorrect during out-of-order bulk ingest.
-      uint64_t bal_sal = get_balance_without_locked_coins("SAL");
-      uint64_t bal_sal1 = get_balance_without_locked_coins("SAL1");
+      // Native balance must include active locked stake. Any stale
+      // m_locked_coins state should be fixed by rebuild_wallet_derived_state()
+      // after cache import and sparse/incremental ingest.
+      uint64_t bal_sal = m_wallet->balance(0, "SAL", false);
+      uint64_t bal_sal1 = m_wallet->balance(0, "SAL1", false);
       return std::to_string(bal_sal + bal_sal1);
     } catch (...) {
       return "0";
@@ -2006,7 +3158,7 @@ public:
       if (asset_type.empty()) {
         return "0";
       }
-      return std::to_string(get_balance_without_locked_coins(asset_type));
+      return std::to_string(m_wallet->balance(0, asset_type, false));
     } catch (...) {
       return "0";
     }
@@ -2022,6 +3174,722 @@ public:
       return std::to_string(m_wallet->unlocked_balance(0, asset_type, false));
     } catch (...) {
       return "0";
+    }
+  }
+
+  std::string get_wallet_state_snapshot() const {
+    if (!m_initialized) {
+      return R"({"success":false,"error":"Wallet not initialized"})";
+    }
+
+    try {
+      std::set<std::string> asset_types = {"SAL", "SAL1"};
+      for (const auto &entry : m_wallet->m_transfers_indices) {
+        if (!entry.first.empty()) {
+          asset_types.insert(entry.first);
+        }
+      }
+      for (const auto &entry : m_wallet->m_locked_coins) {
+        if (!entry.second.m_asset_type.empty()) {
+          asset_types.insert(entry.second.m_asset_type);
+        }
+      }
+
+      uint64_t total_balance = 0;
+      uint64_t total_unlocked = 0;
+      uint64_t total_locked_stake = 0;
+
+      std::ostringstream oss;
+      oss << "{";
+      oss << "\"success\":true,";
+      oss << "\"wallet_height\":" << m_wallet->get_blockchain_current_height() << ",";
+      oss << "\"refresh_start_height\":" << m_wallet->get_refresh_from_block_height() << ",";
+      oss << "\"daemon_height\":" << m_wallet->m_blockchain.size() << ",";
+      oss << "\"transfer_count\":" << m_wallet->m_transfers.size() << ",";
+      oss << "\"transfers_indices_asset_count\":" << m_wallet->m_transfers_indices.size() << ",";
+      oss << "\"key_image_count\":" << m_wallet->m_key_images.size() << ",";
+      oss << "\"pub_key_count\":" << m_wallet->m_pub_keys.size() << ",";
+      oss << "\"salvium_tx_count\":" << m_wallet->m_salvium_txs.size() << ",";
+      oss << "\"locked_coin_count\":" << m_wallet->m_locked_coins.size() << ",";
+
+      oss << "\"assets\":[";
+      bool first_asset = true;
+      for (const auto &asset_type : asset_types) {
+        uint64_t balance = get_balance_without_locked_coins(asset_type);
+        uint64_t unlocked = m_wallet->unlocked_balance(0, asset_type, false);
+        uint64_t locked_stake = 0;
+        size_t transfer_index_count = 0;
+
+        auto transfer_indices_it = m_wallet->m_transfers_indices.find(asset_type);
+        if (transfer_indices_it != m_wallet->m_transfers_indices.end()) {
+          transfer_index_count = transfer_indices_it->second.size();
+        }
+
+        for (const auto &entry : m_wallet->m_locked_coins) {
+          if (entry.second.m_asset_type == asset_type) {
+            locked_stake += entry.second.m_amount;
+          }
+        }
+
+        total_balance += balance;
+        total_unlocked += unlocked;
+        total_locked_stake += locked_stake;
+
+        if (!first_asset) {
+          oss << ",";
+        }
+        first_asset = false;
+
+        oss << "{"
+            << "\"asset_type\":\"" << asset_type << "\","
+            << "\"balance\":\"" << balance << "\","
+            << "\"unlocked_balance\":\"" << unlocked << "\","
+            << "\"locked_stake\":\"" << locked_stake << "\","
+            << "\"transfer_index_count\":" << transfer_index_count
+            << "}";
+      }
+      oss << "],";
+
+      oss << "\"totals\":{"
+          << "\"balance\":\"" << total_balance << "\","
+          << "\"unlocked_balance\":\"" << total_unlocked << "\","
+          << "\"locked_stake\":\"" << total_locked_stake << "\""
+          << "},";
+
+      oss << "\"active_locked_stakes\":[";
+      bool first_locked = true;
+      for (const auto &entry : m_wallet->m_locked_coins) {
+        if (!first_locked) {
+          oss << ",";
+        }
+        first_locked = false;
+        oss << "{"
+            << "\"key\":\"" << epee::string_tools::pod_to_hex(entry.first) << "\","
+            << "\"amount\":\"" << entry.second.m_amount << "\","
+            << "\"asset_type\":\"" << entry.second.m_asset_type << "\","
+            << "\"index_major\":" << entry.second.m_index_major
+            << "}";
+      }
+      oss << "]";
+      oss << "}";
+
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    } catch (...) {
+      return R"({"success":false,"error":"Unknown error building wallet state snapshot"})";
+    }
+  }
+
+  std::string check_wallet_health() const {
+    if (!m_initialized) {
+      return R"({"success":false,"error":"Wallet not initialized"})";
+    }
+
+    try {
+      const uint64_t total_balance = m_wallet->balance(0, "SAL", false) +
+                                     m_wallet->balance(0, "SAL1", false);
+      const uint64_t unlocked_balance =
+          m_wallet->unlocked_balance(0, "SAL", false) +
+          m_wallet->unlocked_balance(0, "SAL1", false);
+      const auto &return_scan_hints =
+          m_wallet->get_account().get_return_scan_hint_map_ref();
+      const auto &return_spend_metadata =
+          m_wallet->get_account().get_return_spend_metadata_map_ref();
+      const auto &return_output_map =
+          m_wallet->get_account().get_return_output_map_ref();
+      const uint64_t wallet_height = m_wallet->get_blockchain_current_height();
+
+      size_t issue_count = 0;
+      size_t invalid_spend_metadata_count = 0;
+      size_t missing_spend_metadata_count = 0;
+      size_t stale_locked_coin_count = 0;
+      size_t placeholder_roi_count = 0;
+
+      std::ostringstream oss;
+      oss << "{";
+      oss << "\"success\":true,";
+      oss << "\"wallet_height\":" << wallet_height << ",";
+      oss << "\"issue_count\":";
+
+      std::ostringstream issues;
+      bool first_issue = true;
+      auto append_issue =
+          [&](const std::string &severity, const std::string &code,
+              const std::string &message,
+              const std::function<void(std::ostringstream &)> &append_extra =
+                  nullptr) {
+            if (!first_issue) {
+              issues << ",";
+            }
+            first_issue = false;
+            ++issue_count;
+            issues << "{"
+                   << "\"severity\":\"" << severity << "\","
+                   << "\"code\":\"" << code << "\","
+                   << "\"message\":\"" << message << "\"";
+            if (append_extra) {
+              append_extra(issues);
+            }
+            issues << "}";
+          };
+
+      if (unlocked_balance > total_balance) {
+        append_issue("error", "unlocked_exceeds_total",
+                     "Unlocked balance exceeds total balance",
+                     [&](std::ostringstream &issue) {
+                       issue << ",\"total_balance\":\"" << total_balance << "\""
+                             << ",\"unlocked_balance\":\"" << unlocked_balance
+                             << "\"";
+                     });
+      }
+
+      for (const auto &entry : return_spend_metadata) {
+        const auto &metadata = entry.second;
+        if (!carrot::is_return_spend_metadata_complete(metadata)) {
+          continue;
+        }
+
+        auto scan_hint_it = return_scan_hints.find(entry.first);
+        const bool semantically_invalid =
+            !carrot::is_return_spend_metadata_semantically_valid(
+                metadata, entry.first,
+                scan_hint_it != return_scan_hints.end()
+                    ? &scan_hint_it->second
+                    : nullptr);
+        if (!semantically_invalid) {
+          continue;
+        }
+
+        ++invalid_spend_metadata_count;
+        append_issue("error", "invalid_return_spend_metadata",
+                     "Return spend metadata is complete but still placeholder-shaped",
+                     [&](std::ostringstream &issue) {
+                       issue << ",\"return_key\":\""
+                             << epee::string_tools::pod_to_hex(entry.first) << "\""
+                             << ",\"spend_pubkey\":\""
+                             << epee::string_tools::pod_to_hex(metadata.K_spend_pubkey)
+                             << "\"";
+                     });
+      }
+
+      for (const auto &entry : return_output_map) {
+        if (!carrot::is_return_output_placeholder_hint(entry.second)) {
+          continue;
+        }
+        ++placeholder_roi_count;
+      }
+
+      for (const auto &td : m_wallet->m_transfers) {
+        if (td.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
+            td.m_tx.type != cryptonote::transaction_type::RETURN) {
+          continue;
+        }
+        if (td.m_spent) {
+          continue;
+        }
+        if (td.m_internal_output_index >= td.m_tx.vout.size()) {
+          continue;
+        }
+
+        crypto::public_key output_key = crypto::null_pkey;
+        if (!get_output_public_key(td.m_tx.vout[td.m_internal_output_index],
+                                   output_key)) {
+          continue;
+        }
+
+        const auto scan_hint_it = return_scan_hints.find(output_key);
+        if (scan_hint_it == return_scan_hints.end()) {
+          continue;
+        }
+
+        const auto spend_metadata_it = return_spend_metadata.find(output_key);
+        const bool has_complete_spend_metadata =
+            spend_metadata_it != return_spend_metadata.end() &&
+            carrot::is_return_spend_metadata_semantically_valid(
+                spend_metadata_it->second, output_key, &scan_hint_it->second);
+
+        if (has_complete_spend_metadata) {
+          continue;
+        }
+
+        ++missing_spend_metadata_count;
+        append_issue("error", "missing_return_spend_metadata",
+                     "Return payout has scan hint but no canonical spend metadata",
+                     [&](std::ostringstream &issue) {
+                       issue << ",\"txid\":\""
+                             << epee::string_tools::pod_to_hex(td.m_txid) << "\""
+                             << ",\"return_key\":\""
+                             << epee::string_tools::pod_to_hex(output_key) << "\""
+                             << ",\"origin_idx\":" << td.m_td_origin_idx;
+                     });
+      }
+
+      for (const auto &entry : m_wallet->m_locked_coins) {
+        auto origin_it = m_wallet->m_pub_keys.find(entry.first);
+        if (origin_it == m_wallet->m_pub_keys.end() ||
+            origin_it->second >= m_wallet->m_transfers.size()) {
+          continue;
+        }
+
+        bool payout_seen = false;
+        for (const auto &td : m_wallet->m_transfers) {
+          if (td.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
+              td.m_tx.type != cryptonote::transaction_type::RETURN) {
+            continue;
+          }
+          if (td.m_td_origin_idx == origin_it->second) {
+            payout_seen = true;
+            break;
+          }
+        }
+
+        if (!payout_seen) {
+          continue;
+        }
+
+        ++stale_locked_coin_count;
+        append_issue("error", "stale_locked_coin",
+                     "Stake origin still appears in locked coin set after payout",
+                     [&](std::ostringstream &issue) {
+                       issue << ",\"locked_key\":\""
+                             << epee::string_tools::pod_to_hex(entry.first) << "\"";
+                     });
+      }
+
+      const bool healthy = issue_count == 0;
+      oss << issue_count << ",";
+      oss << "\"healthy\":" << (healthy ? "true" : "false") << ",";
+      oss << "\"summary\":{"
+          << "\"total_balance\":\"" << total_balance << "\","
+          << "\"unlocked_balance\":\"" << unlocked_balance << "\","
+          << "\"locked_coin_count\":" << m_wallet->m_locked_coins.size() << ","
+          << "\"return_scan_hint_count\":" << return_scan_hints.size() << ","
+          << "\"return_spend_metadata_count\":" << return_spend_metadata.size()
+          << ",\"placeholder_roi_count\":" << placeholder_roi_count
+          << ",\"invalid_spend_metadata_count\":"
+          << invalid_spend_metadata_count
+          << ",\"missing_spend_metadata_count\":"
+          << missing_spend_metadata_count
+          << ",\"stale_locked_coin_count\":" << stale_locked_coin_count << "},";
+      oss << "\"issues\":[" << issues.str() << "]";
+      oss << "}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    } catch (...) {
+      return R"({"success":false,"error":"Unknown error building wallet health"})";
+    }
+  }
+
+  std::string validate_outputs_for_send() const {
+    if (!m_initialized) {
+      return R"({"valid":false,"needs_refresh":true,"error":"Wallet not initialized"})";
+    }
+
+    try {
+      const uint64_t current_chain_height =
+          m_wallet->get_blockchain_current_height();
+      const uint64_t top_block_index =
+          current_chain_height > 0 ? current_chain_height - 1 : 0;
+      const uint64_t ignore_above = m_wallet->ignore_outputs_above();
+      const uint64_t ignore_below = m_wallet->ignore_outputs_below();
+      size_t checked_outputs = 0;
+      size_t failed_outputs = 0;
+      bool needs_refresh = false;
+      std::ostringstream failures;
+      bool first_failed = true;
+
+      for (size_t i = 0; i < m_wallet->m_transfers.size(); ++i) {
+        const auto &td = m_wallet->m_transfers[i];
+        const auto asset_indices_it =
+            m_wallet->m_transfers_indices.find(td.asset_type);
+        const bool asset_index_hit =
+            asset_indices_it != m_wallet->m_transfers_indices.end() &&
+            asset_indices_it->second.count(i) == 1;
+        if (!asset_index_hit) {
+          continue;
+        }
+        size_t blocks_locked_for = CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE;
+        if (td.m_tx.type == cryptonote::transaction_type::MINER ||
+            td.m_tx.type == cryptonote::transaction_type::PROTOCOL) {
+          blocks_locked_for = CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW;
+        }
+        const bool height_unlocked =
+            top_block_index >= td.m_block_height + blocks_locked_for;
+        const bool matches_send_selection =
+            td.m_tx.type != cryptonote::transaction_type::STAKE &&
+            td.m_tx.type != cryptonote::transaction_type::AUDIT &&
+            !td.m_spent && td.amount() > 0 && td.m_key_image_known &&
+            !td.m_key_image_partial && !td.m_frozen && height_unlocked &&
+            td.amount() >= ignore_below && td.amount() <= ignore_above;
+        if (!matches_send_selection) {
+          continue;
+        }
+
+        ++checked_outputs;
+        cryptonote::tx_source_entry src;
+        src.amount = td.amount();
+        src.rct = td.is_rct();
+        src.carrot = td.is_carrot();
+        src.coinbase = !td.m_tx.vin.empty() &&
+                       td.m_tx.vin[0].type() == typeid(cryptonote::txin_gen);
+        src.block_index = td.m_block_height;
+        src.asset_type = td.asset_type;
+        src.mask = td.m_mask;
+        src.address_spend_pubkey = td.m_recovered_spend_pubkey;
+
+        if (td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
+            td.m_td_origin_idx < m_wallet->m_transfers.size()) {
+          const auto &td_origin = m_wallet->m_transfers[td.m_td_origin_idx];
+          src.origin_tx_data.tx_type = td_origin.m_tx.type;
+          src.origin_tx_data.tx_pub_key =
+              cryptonote::get_tx_pub_key_from_extra(td_origin.m_tx,
+                                                    td_origin.m_pk_index);
+          src.origin_tx_data.output_index = td_origin.m_internal_output_index;
+        }
+
+        cryptonote::tx_source_entry::output_entry real_oe;
+        real_oe.first = td.m_asset_type_output_index;
+        real_oe.second.dest = rct::pk2rct(td.get_public_key());
+        real_oe.second.mask = rct::commit(td.amount(), td.m_mask);
+        src.outputs.push_back(real_oe);
+        src.real_output = 0;
+        src.real_output_in_tx_index = td.m_internal_output_index;
+        src.real_out_tx_key =
+            cryptonote::get_tx_pub_key_from_extra(td.m_tx, td.m_pk_index);
+        src.real_out_additional_tx_keys =
+            cryptonote::get_additional_tx_pub_keys_from_extra(td.m_tx);
+        if (!td.m_tx.vin.empty() &&
+            td.m_tx.vin[0].type() == typeid(cryptonote::txin_to_key)) {
+          src.first_rct_key_image =
+              boost::get<cryptonote::txin_to_key>(td.m_tx.vin[0]).k_image;
+        }
+
+        crypto::secret_key x_out = crypto::null_skey;
+        crypto::secret_key y_out = crypto::null_skey;
+        std::string path;
+        const auto confirmed_it = m_wallet->m_confirmed_txs.find(td.m_txid);
+        const bool ok =
+            (confirmed_it != m_wallet->m_confirmed_txs.end())
+                ? tools::wallet::try_get_address_openings_x_y(
+                      confirmed_it->second.m_tx, src, *m_wallet, x_out, y_out,
+                      &path)
+                : tools::wallet::try_get_address_openings_x_y(
+                      td.m_tx, src, *m_wallet, x_out, y_out, &path);
+        if (ok) {
+          continue;
+        }
+
+        needs_refresh = true;
+        ++failed_outputs;
+        if (!first_failed) {
+          failures << ",";
+        }
+        first_failed = false;
+        crypto::public_key output_key = td.get_public_key();
+        const auto &return_scan_hints =
+            m_wallet->get_account().get_return_scan_hint_map_ref();
+        const auto &return_output_map =
+            m_wallet->get_account().get_return_output_map_ref();
+        const auto &return_spend_metadata =
+            m_wallet->get_account().get_return_spend_metadata_map_ref();
+        auto scan_hint_it = return_scan_hints.find(output_key);
+        const auto return_it = return_output_map.find(output_key);
+        const auto spend_metadata_it = return_spend_metadata.find(output_key);
+        int ko_origin_tx_type = -1;
+        uint64_t ko_origin_idx = std::numeric_limits<uint64_t>::max();
+        std::string ko_hex;
+        if (scan_hint_it != return_scan_hints.end()) {
+          ko_hex = epee::string_tools::pod_to_hex(scan_hint_it->second.K_o);
+          const auto ko_it = m_wallet->m_pub_keys.find(scan_hint_it->second.K_o);
+          if (ko_it != m_wallet->m_pub_keys.end() &&
+              ko_it->second < m_wallet->m_transfers.size()) {
+            ko_origin_idx = ko_it->second;
+            ko_origin_tx_type =
+                static_cast<int>(m_wallet->m_transfers[ko_it->second].m_tx.type);
+          }
+        }
+        int transfer_candidate_origin_idx = -1;
+        int transfer_candidate_origin_tx_type = -1;
+        std::string transfer_candidate_ko_hex;
+        const auto transfer_candidate =
+            find_transfer_origin_candidate_for_return_key(output_key);
+        if (transfer_candidate) {
+          transfer_candidate_ko_hex =
+              epee::string_tools::pod_to_hex(std::get<0>(*transfer_candidate));
+          transfer_candidate_origin_idx =
+              static_cast<int>(std::get<1>(*transfer_candidate));
+          transfer_candidate_origin_tx_type =
+              std::get<2>(*transfer_candidate);
+        }
+        const bool runtime_full_tx_cached =
+            m_wallet->m_runtime_full_txs.find(td.m_txid) !=
+            m_wallet->m_runtime_full_txs.end();
+        const auto persisted_it = m_wallet->m_return_output_info.find(output_key);
+        const bool persisted_map_hit =
+            persisted_it != m_wallet->m_return_output_info.end();
+        auto skey_state = [](const crypto::secret_key &key) -> std::string {
+          return key == crypto::null_skey ? "zero" : "set";
+        };
+        const bool return_map_hit = return_it != return_output_map.end();
+        const bool return_map_spendable =
+            return_map_hit &&
+            return_it->second.K_spend_pubkey != crypto::null_pkey &&
+            return_it->second.sum_g != crypto::null_skey &&
+            return_it->second.sender_extension_t != crypto::null_skey;
+        const bool spend_metadata_hit =
+            spend_metadata_it != return_spend_metadata.end();
+        const bool spend_metadata_complete =
+            spend_metadata_hit &&
+            carrot::is_return_spend_metadata_complete(spend_metadata_it->second);
+        bool spend_metadata_semantically_valid = false;
+        bool spend_metadata_can_open = false;
+        if (spend_metadata_hit) {
+          const auto &metadata = spend_metadata_it->second;
+          spend_metadata_semantically_valid =
+              carrot::is_return_spend_metadata_semantically_valid(
+                  metadata, output_key, nullptr);
+          if (spend_metadata_complete && spend_metadata_semantically_valid) {
+            try {
+              spend_metadata_can_open =
+                  m_wallet->get_account().can_open_fcmp_onetime_address(
+                      metadata.K_spend_pubkey,
+                      metadata.sum_g,
+                      metadata.sender_extension_t,
+                      output_key);
+            } catch (...) {
+              spend_metadata_can_open = false;
+            }
+          }
+        }
+        const std::string roi_sum_g_prefix =
+            return_map_hit ? skey_state(return_it->second.sum_g) : "none";
+        const std::string roi_sender_t_prefix =
+            return_map_hit ? skey_state(return_it->second.sender_extension_t)
+                           : "none";
+        const std::string persisted_roi_sum_g_prefix =
+            persisted_map_hit ? skey_state(persisted_it->second.sum_g) : "none";
+        const std::string persisted_roi_sender_t_prefix =
+            persisted_map_hit
+                ? skey_state(persisted_it->second.sender_extension_t)
+                : "none";
+        const std::string spend_metadata_sum_g_prefix =
+            spend_metadata_hit ? skey_state(spend_metadata_it->second.sum_g)
+                               : "none";
+        const std::string spend_metadata_sender_t_prefix =
+            spend_metadata_hit
+                ? skey_state(spend_metadata_it->second.sender_extension_t)
+                : "none";
+        failures << "{"
+                 << "\"idx\":" << i << ","
+                 << "\"txid\":\"" << epee::string_tools::pod_to_hex(td.m_txid)
+                 << "\","
+                 << "\"path\":\"" << path << "\","
+                 << "\"tx_type\":" << static_cast<int>(td.m_tx.type) << ","
+                 << "\"origin_tx_type\":"
+                 << ((td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
+                      td.m_td_origin_idx < m_wallet->m_transfers.size())
+                         ? static_cast<int>(
+                               m_wallet->m_transfers[td.m_td_origin_idx].m_tx.type)
+                         : -1)
+                 << ","
+                 << "\"scan_hint_origin_tx_type\":"
+                 << (scan_hint_it != return_scan_hints.end()
+                         ? static_cast<int>(scan_hint_it->second.origin_tx_type)
+                         : -1)
+                 << ","
+                 << "\"scan_hint_ko\":\"" << ko_hex << "\","
+                 << "\"scan_hint_ko_origin_idx\":"
+                 << (ko_origin_idx == std::numeric_limits<uint64_t>::max()
+                         ? -1
+                         : static_cast<int64_t>(ko_origin_idx))
+                 << ","
+                 << "\"scan_hint_ko_origin_tx_type\":" << ko_origin_tx_type
+                 << ","
+                 << "\"return_map_hit\":"
+                 << (return_map_hit ? "true" : "false") << ","
+                 << "\"return_map_spendable\":"
+                 << (return_map_spendable ? "true" : "false") << ","
+                 << "\"spend_metadata_hit\":"
+                 << (spend_metadata_hit ? "true" : "false") << ","
+                 << "\"spend_metadata_complete\":"
+                 << (spend_metadata_complete ? "true" : "false") << ","
+                 << "\"spend_metadata_semantically_valid\":"
+                 << (spend_metadata_semantically_valid ? "true" : "false") << ","
+                 << "\"spend_metadata_can_open\":"
+                 << (spend_metadata_can_open ? "true" : "false") << ","
+                 << "\"transfer_candidate_ko\":\"" << transfer_candidate_ko_hex
+                 << "\","
+                 << "\"transfer_candidate_origin_idx\":"
+                 << transfer_candidate_origin_idx << ","
+                 << "\"transfer_candidate_origin_tx_type\":"
+                 << transfer_candidate_origin_tx_type << ","
+                 << "\"runtime_full_tx_cached\":"
+                 << (runtime_full_tx_cached ? "true" : "false")
+                 << "}";
+      }
+
+      std::ostringstream oss;
+      oss << "{"
+          << "\"valid\":" << (failed_outputs == 0 ? "true" : "false") << ","
+          << "\"needs_refresh\":" << (needs_refresh ? "true" : "false") << ","
+          << "\"checked_outputs\":" << checked_outputs << ","
+          << "\"failed_outputs\":" << failed_outputs << ","
+          << "\"failures\":[" << failures.str() << "]"
+          << "}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"valid\":false,\"needs_refresh\":true,\"error\":\"" +
+             std::string(e.what()) + "\"}";
+    } catch (...) {
+      return R"({"valid":false,"needs_refresh":true,"error":"Unknown output validation error"})";
+    }
+  }
+
+  std::string get_stake_lifecycle() const {
+    if (!m_initialized) {
+      return R"({"success":false,"error":"Wallet not initialized"})";
+    }
+
+    try {
+      static constexpr uint64_t STAKE_LOCK_PERIOD = 21601;
+
+      uint64_t total_supply = 0;
+      uint64_t total_locked = 0;
+      uint64_t total_burnt = 0;
+      uint64_t total_yield = 0;
+      uint64_t yield_per_stake = 0;
+      uint64_t ybi_data_size = 0;
+      std::vector<tools::wallet2::yield_payout_t> payouts;
+      const bool have_yield_data = m_wallet->get_yield_summary_info(
+          total_burnt, total_supply, total_locked, total_yield, yield_per_stake,
+          ybi_data_size, payouts);
+
+      std::unordered_map<std::string, uint64_t> reward_by_stake_txid;
+      for (const auto &payout : payouts) {
+        reward_by_stake_txid[std::get<1>(payout)] = std::get<4>(payout);
+      }
+
+      std::unordered_map<size_t, size_t> payout_index_by_origin;
+      for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx) {
+        const auto &td = m_wallet->m_transfers[idx];
+        if ((td.m_tx.type == cryptonote::transaction_type::PROTOCOL ||
+             td.m_tx.type == cryptonote::transaction_type::RETURN) &&
+            td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
+            td.m_td_origin_idx < m_wallet->m_transfers.size()) {
+          payout_index_by_origin[td.m_td_origin_idx] = idx;
+        }
+      }
+
+      const uint64_t wallet_height = m_wallet->get_blockchain_current_height();
+      size_t active_count = 0;
+      size_t returned_count = 0;
+      size_t matured_pending_count = 0;
+
+      std::ostringstream oss;
+      oss << "{";
+      oss << "\"success\":true,";
+      oss << "\"wallet_height\":" << wallet_height << ",";
+      oss << "\"stake_lock_period\":" << STAKE_LOCK_PERIOD << ",";
+      oss << "\"yield_info_available\":"
+          << (have_yield_data ? "true" : "false") << ",";
+      oss << "\"yield_info_size\":" << ybi_data_size << ",";
+      oss << "\"yield_per_stake\":\"" << yield_per_stake << "\",";
+      oss << "\"total_locked_network\":\"" << total_locked << "\",";
+      oss << "\"stakes\":[";
+
+      bool first = true;
+      for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx) {
+        const auto &td = m_wallet->m_transfers[idx];
+        if (td.m_tx.type != cryptonote::transaction_type::STAKE) {
+          continue;
+        }
+
+        crypto::public_key return_address = td.m_tx.return_address;
+        if (return_address == crypto::null_pkey) {
+          return_address = td.m_tx.protocol_tx_data.return_address;
+        }
+
+        crypto::public_key stake_output_key = crypto::null_pkey;
+        if (td.m_internal_output_index < td.m_tx.vout.size()) {
+          get_output_public_key(td.m_tx.vout[td.m_internal_output_index],
+                                stake_output_key);
+        }
+
+        const uint64_t maturity_height = td.m_block_height + STAKE_LOCK_PERIOD;
+        auto payout_it = payout_index_by_origin.find(idx);
+        const bool has_payout = payout_it != payout_index_by_origin.end();
+        const tools::wallet2::transfer_details *payout_td =
+            has_payout ? &m_wallet->m_transfers[payout_it->second] : nullptr;
+        const bool still_locked =
+            stake_output_key != crypto::null_pkey &&
+            m_wallet->m_locked_coins.find(stake_output_key) !=
+                m_wallet->m_locked_coins.end();
+
+        std::string status;
+        if (has_payout) {
+          status = "returned";
+          ++returned_count;
+        } else if (wallet_height >= maturity_height) {
+          status = "matured_pending_payout";
+          ++matured_pending_count;
+        } else {
+          status = "active";
+          ++active_count;
+        }
+
+        const std::string stake_txid =
+            epee::string_tools::pod_to_hex(td.m_txid);
+        const uint64_t realized_reward =
+            payout_td && payout_td->m_amount > td.m_tx.amount_burnt
+                ? payout_td->m_amount - td.m_tx.amount_burnt
+                : 0;
+        const uint64_t derived_reward =
+            reward_by_stake_txid.count(stake_txid)
+                ? reward_by_stake_txid.at(stake_txid)
+                : realized_reward;
+
+        if (!first) {
+          oss << ",";
+        }
+        first = false;
+        oss << "{"
+            << "\"stake_txid\":\"" << stake_txid << "\","
+            << "\"asset_type\":\"" << td.asset_type << "\","
+            << "\"principal\":\"" << td.m_tx.amount_burnt << "\","
+            << "\"stake_height\":" << td.m_block_height << ","
+            << "\"maturity_height\":" << maturity_height << ","
+            << "\"status\":\"" << status << "\","
+            << "\"return_address\":\""
+            << epee::string_tools::pod_to_hex(return_address) << "\","
+            << "\"stake_output_key\":\""
+            << epee::string_tools::pod_to_hex(stake_output_key) << "\","
+            << "\"still_locked\":" << (still_locked ? "true" : "false") << ","
+            << "\"derived_reward\":\"" << derived_reward << "\","
+            << "\"realized_reward\":\"" << realized_reward << "\"";
+
+        if (payout_td) {
+          oss << ",\"payout_txid\":\""
+              << epee::string_tools::pod_to_hex(payout_td->m_txid) << "\""
+              << ",\"payout_height\":" << payout_td->m_block_height
+              << ",\"payout_amount\":\"" << payout_td->m_amount << "\"";
+        }
+
+        oss << "}";
+      }
+
+      oss << "],";
+      oss << "\"summary\":{"
+          << "\"active_count\":" << active_count << ","
+          << "\"returned_count\":" << returned_count << ","
+          << "\"matured_pending_count\":" << matured_pending_count << "}";
+      oss << "}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    } catch (...) {
+      return R"({"success":false,"error":"Unknown error building stake lifecycle"})";
     }
   }
 
@@ -2098,12 +3966,12 @@ public:
       uint64_t total_amount = 0;
       uint64_t spent_amount = 0;
       size_t spent_count = 0;
-      
+
       // v5.47.1: Track asset type breakdown to debug balance discrepancy
       uint64_t sal_total = 0, sal_spent = 0, sal_unspent = 0;
       uint64_t sal1_total = 0, sal1_spent = 0, sal1_unspent = 0;
       size_t sal_count = 0, sal1_count = 0, other_count = 0;
-      
+
       // v5.47.3: Track key_image_known status to debug spent detection gap
       size_t ki_known_count = 0, ki_unknown_count = 0;
       size_t ki_known_unspent = 0, ki_unknown_unspent = 0;
@@ -2116,7 +3984,7 @@ public:
       for (size_t i = 0; i < transfers.size(); ++i) {
         const auto &td = transfers[i];
         total_amount += td.m_amount;
-        
+
         // v5.47.3: Track key_image_known
         if (td.m_key_image_known) {
           ki_known_count++;
@@ -2128,7 +3996,7 @@ public:
             ki_unknown_unspent_amount += td.m_amount;
           }
         }
-        
+
         // Track by asset type (field is 'asset_type' not 'm_asset_type')
         const std::string &asset = td.asset_type;
         if (asset == "SAL") {
@@ -2698,7 +4566,7 @@ public:
 
     try {
       auto &account = m_wallet->get_account();
-      const auto &return_map = account.get_return_output_map_ref();
+      const auto &return_map = account.get_return_scan_hint_map_ref();
 
       if (return_map.empty()) {
         return "";
@@ -2988,6 +4856,150 @@ public:
     } catch (const std::exception &e) {
       m_last_error = e.what();
       return false;
+    }
+  }
+
+  std::string get_runtime_full_tx_candidate_hashes() const {
+    if (!m_initialized) {
+      return R"({"success":false,"error":"Wallet not initialized","hashes":[]})";
+    }
+
+    try {
+      std::vector<std::string> hashes;
+      hashes.reserve(64);
+      std::unordered_set<crypto::hash> seen;
+
+      for (const auto &td : m_wallet->m_transfers) {
+        if (td.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
+            td.m_tx.type != cryptonote::transaction_type::RETURN) {
+          continue;
+        }
+
+        if (!seen.insert(td.m_txid).second) {
+          continue;
+        }
+
+        const auto runtime_it = m_wallet->m_runtime_full_txs.find(td.m_txid);
+        if (runtime_it != m_wallet->m_runtime_full_txs.end()) {
+          continue;
+        }
+
+        hashes.push_back(epee::string_tools::pod_to_hex(td.m_txid));
+      }
+
+      std::ostringstream oss;
+      oss << "{\"success\":true,\"count\":" << hashes.size() << ",\"hashes\":[";
+      for (size_t i = 0; i < hashes.size(); ++i) {
+        if (i > 0) {
+          oss << ",";
+        }
+        oss << "\"" << hashes[i] << "\"";
+      }
+      oss << "]}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return std::string(R"({"success":false,"error":")") + e.what() +
+             R"(","hashes":[]})";
+    }
+  }
+
+  std::string cache_runtime_full_txs_from_sparse(uintptr_t ptr, size_t size) {
+    if (!m_initialized) {
+      return R"({"success":false,"error":"Wallet not initialized"})";
+    }
+    if (ptr == 0 || size < 8) {
+      return R"({"success":false,"error":"Sparse data too small"})";
+    }
+
+    try {
+      const uint8_t *data = reinterpret_cast<const uint8_t *>(ptr);
+      if (!(memcmp(data, "SPR3", 4) == 0 || memcmp(data, "SPR4", 4) == 0 ||
+            memcmp(data, "SPR5", 4) == 0 || memcmp(data, "SPR6", 4) == 0)) {
+        return R"({"success":false,"error":"Unsupported sparse format"})";
+      }
+
+      const bool has_timestamp = (memcmp(data, "SPR5", 4) == 0 ||
+                                  memcmp(data, "SPR6", 4) == 0);
+      const bool has_block_version = (memcmp(data, "SPR6", 4) == 0);
+      const bool has_asset_indices = (memcmp(data, "SPR4", 4) == 0 ||
+                                      memcmp(data, "SPR5", 4) == 0 ||
+                                      memcmp(data, "SPR6", 4) == 0);
+      uint32_t tx_count = 0;
+      memcpy(&tx_count, data + 4, 4);
+
+      size_t offset = 8;
+      size_t stored = 0;
+      size_t parsed = 0;
+
+      for (uint32_t tx_index = 0; tx_index < tx_count && offset + 46 <= size;
+           ++tx_index) {
+        offset += 4; // global index
+        offset += 4; // block height
+        if (has_timestamp) {
+          if (offset + 8 > size) break;
+          offset += 8;
+        }
+        if (has_block_version) {
+          if (offset + 1 > size) break;
+          offset += 1;
+        }
+
+        if (offset + 32 > size) break;
+        crypto::hash tx_hash = crypto::null_hash;
+        memcpy(&tx_hash, data + offset, 32);
+        offset += 32;
+
+        if (offset + 2 > size) break;
+        uint16_t output_count = 0;
+        memcpy(&output_count, data + offset, 2);
+        offset += 2;
+        if (offset + static_cast<size_t>(output_count) * 4 > size) break;
+        offset += static_cast<size_t>(output_count) * 4;
+
+        if (has_asset_indices) {
+          if (offset + 2 > size) break;
+          uint16_t asset_count = 0;
+          memcpy(&asset_count, data + offset, 2);
+          offset += 2;
+          if (offset + static_cast<size_t>(asset_count) * 4 > size) break;
+          offset += static_cast<size_t>(asset_count) * 4;
+        }
+
+        if (offset + 4 > size) break;
+        uint32_t blob_size = 0;
+        memcpy(&blob_size, data + offset, 4);
+        offset += 4;
+        if (offset + blob_size > size) break;
+
+        std::string tx_blob(reinterpret_cast<const char *>(data + offset),
+                            blob_size);
+        offset += blob_size;
+        ++parsed;
+
+        cryptonote::transaction tx;
+        crypto::hash parsed_tx_hash = crypto::null_hash;
+        crypto::hash tx_prefix_hash = crypto::null_hash;
+        if (!cryptonote::parse_and_validate_tx_from_blob(
+                tx_blob, tx, parsed_tx_hash, tx_prefix_hash)) {
+          continue;
+        }
+        if (parsed_tx_hash != tx_hash) {
+          continue;
+        }
+
+        m_wallet->m_runtime_full_txs[tx_hash] = std::move(tx);
+        ++stored;
+      }
+
+      std::ostringstream oss;
+      oss << "{\"success\":true,\"parsed\":" << parsed
+          << ",\"stored\":" << stored
+          << ",\"runtime_full_tx_count\":" << m_wallet->m_runtime_full_txs.size()
+          << "}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return std::string(R"({"success":false,"error":")") + e.what() +
+             R"("})";
     }
   }
 
@@ -4273,6 +6285,12 @@ public:
       m_wallet->refresh(m_wallet->is_trusted_daemon());
 
       uint64_t height_after = m_wallet->get_blockchain_current_height();
+      // Sparse ingest mutates multiple interdependent caches. Rebuild the
+      // derived maps from m_transfers before reporting balance so incremental
+      // scans converge on the same internal state as a full rescan.
+      rebuild_wallet_derived_state();
+      repair_return_output_metadata_from_transfers();
+
       uint64_t balance_after = m_wallet->balance(0, "SAL", false) +
                                m_wallet->balance(0, "SAL1", false);
 
@@ -5275,7 +7293,8 @@ public:
       json << R"({"status":"success","transactions":[)";
 
       bool first = true;
-      for (const auto &ptx : ptx_vector) {
+      for (size_t ptx_index = 0; ptx_index < ptx_vector.size(); ++ptx_index) {
+        const auto &ptx = ptx_vector[ptx_index];
         if (!first)
           json << ",";
         first = false;
@@ -5446,7 +7465,8 @@ public:
            << R"(","transactions":[)";
 
       bool first = true;
-      for (const auto &ptx : ptx_vector) {
+      for (size_t ptx_index = 0; ptx_index < ptx_vector.size(); ++ptx_index) {
+        const auto &ptx = ptx_vector[ptx_index];
         if (!first)
           json << ",";
         first = false;
@@ -5622,7 +7642,8 @@ public:
       json << R"({"status":"success","transactions":[)";
 
       bool first = true;
-      for (const auto &ptx : ptx_vector) {
+      for (size_t ptx_index = 0; ptx_index < ptx_vector.size(); ++ptx_index) {
+        const auto &ptx = ptx_vector[ptx_index];
         if (!first)
           json << ",";
         first = false;
@@ -5782,7 +7803,8 @@ public:
       json << R"({"status":"success","transactions":[)";
 
       bool first = true;
-      for (const auto &ptx : ptx_vector) {
+      for (size_t ptx_index = 0; ptx_index < ptx_vector.size(); ++ptx_index) {
+        const auto &ptx = ptx_vector[ptx_index];
         if (!first)
           json << ",";
         first = false;
@@ -5987,7 +8009,8 @@ public:
       uint64_t total_fee = 0;
 
       bool first = true;
-      for (const auto &ptx : ptx_vector) {
+      for (size_t ptx_index = 0; ptx_index < ptx_vector.size(); ++ptx_index) {
+        const auto &ptx = ptx_vector[ptx_index];
         if (!first)
           json << ",";
         first = false;
@@ -6003,6 +8026,43 @@ public:
         crypto::hash tx_hash;
         cryptonote::get_transaction_hash(ptx.tx, tx_hash);
         std::string tx_hash_str = epee::string_tools::pod_to_hex(tx_hash);
+
+        std_cerr << "[WASM DEBUG] sweep_all tx[" << ptx_index
+                 << "] hash=" << tx_hash_str
+                 << " selected_transfers=" << ptx.selected_transfers.size()
+                 << std::endl;
+        for (size_t transfer_idx : ptx.selected_transfers) {
+          if (transfer_idx >= m_wallet->m_transfers.size()) {
+            std_cerr << "  [selected] idx=" << transfer_idx
+                     << " out_of_range" << std::endl;
+            continue;
+          }
+          const auto &td = m_wallet->m_transfers[transfer_idx];
+          std_cerr << "  [selected] idx=" << transfer_idx
+                   << " txid=" << epee::string_tools::pod_to_hex(td.m_txid)
+                   << " type=" << static_cast<int>(td.m_tx.type)
+                   << " amount=" << td.amount()
+                   << " ki=" << epee::string_tools::pod_to_hex(td.m_key_image)
+                   << " output_key="
+                   << epee::string_tools::pod_to_hex(td.get_public_key())
+                   << " recovered_spend_pubkey="
+                   << epee::string_tools::pod_to_hex(
+                          td.m_recovered_spend_pubkey)
+                   << " origin_idx=" << td.m_td_origin_idx
+                   << std::endl;
+        }
+        for (size_t vini = 0; vini < ptx.tx.vin.size(); ++vini) {
+          if (ptx.tx.vin[vini].type() == typeid(cryptonote::txin_to_key)) {
+            const auto &txin =
+                boost::get<cryptonote::txin_to_key>(ptx.tx.vin[vini]);
+            std_cerr << "  [vin] i=" << vini
+                     << " ki=" << epee::string_tools::pod_to_hex(txin.k_image)
+                     << " key_offsets=" << txin.key_offsets.size()
+                     << std::endl;
+          } else {
+            std_cerr << "  [vin] i=" << vini << " non_to_key" << std::endl;
+          }
+        }
 
         // Calculate amount from outputs (for sweep_all, amount varies per tx)
         uint64_t tx_amount = 0;
@@ -6943,6 +9003,24 @@ public:
               "[WASM] import_wallet_cache_hex: restored %zu transfers\n",
               num_transfers);
 
+      // Rehydrate the account's return-subaddress and return-output lookup maps.
+      // The CLI load path repopulates these from wallet2's persisted fields; raw
+      // cache deserialization in WASM must do the same or restored return/protocol
+      // outputs may become visible-but-unspendable after refresh.
+      restore_account_cached_maps();
+
+      // Rebuild derived lookup state from the authoritative transfer set. Full
+      // rescan naturally recreates these maps; cache import must do the same to
+      // avoid stale balance/spent state after long-lived sessions or older
+      // cache payloads.
+      rebuild_wallet_derived_state();
+
+      // Older stake-return registrations can leave placeholder-only
+      // return_output_info entries behind. Re-scan restored payout transfers and
+      // overwrite those placeholders with the real spend metadata so imported
+      // state preserves CLI-equivalent spendability.
+      repair_return_output_metadata_from_transfers();
+
       // CRITICAL FIX: Rebuild subaddress map after cache import
       // The imported transfers reference subaddresses that may not be in
       // the freshly-created wallet's m_subaddresses map. Without this,
@@ -6973,8 +9051,10 @@ public:
       }
 
       fprintf(stderr,
-              "[WASM] import_wallet_cache_hex: rebuilt subaddress map (max_index=%u, subaddresses=%u)\n",
-              max_index, m_wallet->get_num_subaddresses(0));
+              "[WASM] import_wallet_cache_hex: rebuilt subaddress map (max_index=%u, subaddresses=%u, transfers_indices=%zu, key_images=%zu, locked_coins=%zu)\n",
+              max_index, m_wallet->get_num_subaddresses(0),
+              m_wallet->m_transfers_indices.size(), m_wallet->m_key_images.size(),
+              m_wallet->m_locked_coins.size());
 
       std::ostringstream json;
       json << R"({"status":"success",)"
@@ -7428,7 +9508,7 @@ public:
       // updates Only rebuild if wallet TX count changed (indicating new TXs
       // were added)
       size_t wallet_tx_count = m_wallet->get_num_transfer_details();
-      
+
       // SANITY CHECK: Prevent cascade failures from corrupted wallet state
       // A wallet with >1M transfers is unrealistic and indicates corruption
       const size_t MAX_SANE_TRANSFER_COUNT = 1000000;
@@ -7439,7 +9519,7 @@ public:
             << R"(,"build_id":")" << SPARSE_GUARDRAILS_BUILD << R"("})";
         return err.str();
       }
-      
+
       trace_step = 3; // Before cache rebuild check
       if (wallet_tx_count != m_existing_txs_cache_size) {
         trace_step = 31; // Inside cache rebuild
@@ -8528,10 +10608,10 @@ public:
           // ================================================================
           try {
             trace_step = 810 + static_cast<int>(i % 100); // Enter spent detection block
-            
+
             // FIX_DEBUG: Trace spent detection for STAKE transactions
             bool is_stake = (tx.type == cryptonote::transaction_type::STAKE);
-            
+
             // v5.36.0 SAFETY: Check tx.vin.size() sanity before iterating
             // Malformed transactions could have corrupted vin causing bad_array_new_length
             const size_t vin_size = tx.vin.size();
@@ -8540,7 +10620,7 @@ public:
               DEBUG_LOG("[SPENT_DETECT] SKIP: tx.vin.size()=%zu exceeds sanity limit\n", vin_size);
             } else {
               trace_step = 820 + static_cast<int>(i % 100); // vin_size validated
-              
+
               if (is_stake) {
                 DEBUG_LOG(
                     "[FIX_DEBUG] Checking inputs for STAKE tx %s "
@@ -8554,15 +10634,15 @@ public:
               size_t vin_idx = 0;
               for (const auto &in : tx.vin) {
                 trace_step = 840 + static_cast<int>(i % 100); // Inside vin loop
-                
+
                 // v5.36.0 SAFETY: Validate variant type before accessing
                 if (in.empty()) {
                   vin_idx++;
                   continue;  // Skip empty variants
                 }
-                
+
                 trace_step = 841 + static_cast<int>(i % 100); // After empty check
-                
+
                 if (in.type() != typeid(cryptonote::txin_to_key)) {
                   if (is_stake)
                     DEBUG_LOG("[FIX_DEBUG] Input skipped (not txin_to_key)\n");
@@ -8571,7 +10651,7 @@ public:
                 }
 
                 trace_step = 842 + static_cast<int>(i % 100); // Before boost::get
-                
+
                 // v5.36.0 SAFETY: Use boost::get with pointer form first to validate
                 const cryptonote::txin_to_key *p_in_to_key =
                     boost::get<cryptonote::txin_to_key>(&in);
@@ -8593,11 +10673,11 @@ public:
                 }
 
                 trace_step = 844 + static_cast<int>(i % 100); // Before m_key_images.find
-                
+
                 auto ki_it = m_wallet->m_key_images.find(in_to_key.k_image);
-                
+
                 trace_step = 845 + static_cast<int>(i % 100); // After m_key_images.find
-                
+
                 if (ki_it != m_wallet->m_key_images.end()) {
                   // FIX v5.31.4: Bounds check to prevent WASM crash
                   size_t transfer_idx = ki_it->second;
@@ -8609,7 +10689,7 @@ public:
                   }
 
                   trace_step = 846 + static_cast<int>(i % 100); // Before transfers access
-                  
+
                   if (transfer_idx < m_wallet->m_transfers.size()) {
                     auto &spent_td = m_wallet->m_transfers[transfer_idx];
                     if (!spent_td.m_spent) {
@@ -8860,6 +10940,13 @@ public:
         }
       }
       trace_step = 940; // After post-processing block
+
+      // Sparse ingestion can process transactions and spent markers out of
+      // order. Rebuild derived caches from the authoritative transfer set
+      // before reporting balance so incremental scans converge on the same
+      // internal state as a full rescan or cache restore.
+      rebuild_wallet_derived_state();
+      repair_return_output_metadata_from_transfers();
 
       uint64_t balance_after = m_wallet->balance(0, "SAL", false) +
                                m_wallet->balance(0, "SAL1", false);
@@ -9357,6 +11444,138 @@ public:
     }
   }
 
+  std::string debug_locked_coin_provenance(
+      const std::string &asset_type = "SAL1") {
+    if (!m_initialized) {
+      return R"({"success":false,"error":"Wallet not initialized"})";
+    }
+
+    try {
+      std::ostringstream oss;
+      oss << "{\"success\":true";
+      oss << ",\"asset_type\":\"" << asset_type << "\"";
+      oss << ",\"entries\":[";
+
+      bool first = true;
+      for (const auto &lc : m_wallet->m_locked_coins) {
+        if (lc.second.m_asset_type != asset_type) {
+          continue;
+        }
+
+        const crypto::public_key &locked_key = lc.first;
+
+        const auto pub_it = m_wallet->m_pub_keys.find(locked_key);
+        const bool source_hit =
+            pub_it != m_wallet->m_pub_keys.end() &&
+            pub_it->second < m_wallet->m_transfers.size();
+        const tools::wallet2::transfer_details *source_td =
+            source_hit ? &m_wallet->m_transfers[pub_it->second] : nullptr;
+
+        std::vector<size_t> linked_protocol_indices;
+        std::vector<size_t> linked_scan_hint_indices;
+        std::vector<size_t> linked_roi_indices;
+
+        for (size_t i = 0; i < m_wallet->m_transfers.size(); ++i) {
+          const auto &td = m_wallet->m_transfers[i];
+          if (td.asset_type != asset_type) {
+            continue;
+          }
+          if (td.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
+              td.m_tx.type != cryptonote::transaction_type::RETURN) {
+            continue;
+          }
+
+          if (td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
+              td.m_td_origin_idx < m_wallet->m_transfers.size() &&
+              td.m_td_origin_idx == pub_it->second) {
+            linked_protocol_indices.push_back(i);
+          }
+
+          const crypto::public_key output_key = td.get_public_key();
+          const auto scan_hint_it = m_wallet->m_return_scan_hints.find(output_key);
+          if (scan_hint_it != m_wallet->m_return_scan_hints.end() &&
+              scan_hint_it->second.K_o == locked_key) {
+            linked_scan_hint_indices.push_back(i);
+          }
+
+          const auto roi_it = m_wallet->m_return_output_info.find(output_key);
+          if (roi_it != m_wallet->m_return_output_info.end() &&
+              roi_it->second.K_o == locked_key) {
+            linked_roi_indices.push_back(i);
+          }
+        }
+
+        if (!first) {
+          oss << ",";
+        }
+        first = false;
+
+        oss << "{"
+            << "\"locked_key\":\""
+            << epee::string_tools::pod_to_hex(locked_key) << "\","
+            << "\"amount\":\"" << lc.second.m_amount << "\","
+            << "\"index_major\":" << lc.second.m_index_major << ","
+            << "\"source_hit\":" << (source_hit ? "true" : "false");
+
+        if (source_hit) {
+          oss << ",\"source_transfer\":{"
+              << "\"idx\":" << pub_it->second << ","
+              << "\"txid\":\""
+              << epee::string_tools::pod_to_hex(source_td->m_txid) << "\","
+              << "\"tx_type\":" << static_cast<int>(source_td->m_tx.type) << ","
+              << "\"amount\":\"" << source_td->amount() << "\","
+              << "\"amount_burnt\":\"" << source_td->m_tx.amount_burnt << "\","
+              << "\"spent\":" << (source_td->m_spent ? "true" : "false") << ","
+              << "\"block_height\":" << source_td->m_block_height
+              << "}";
+        }
+
+        oss << ",\"linked_protocol_indices\":[";
+        for (size_t j = 0; j < linked_protocol_indices.size(); ++j) {
+          if (j) oss << ",";
+          const auto &td = m_wallet->m_transfers[linked_protocol_indices[j]];
+          oss << "{"
+              << "\"idx\":" << linked_protocol_indices[j] << ","
+              << "\"txid\":\""
+              << epee::string_tools::pod_to_hex(td.m_txid) << "\","
+              << "\"origin_idx\":"
+              << (td.m_td_origin_idx == std::numeric_limits<uint64_t>::max()
+                      ? -1
+                      : static_cast<long long>(td.m_td_origin_idx))
+              << "}";
+        }
+        oss << "],\"linked_scan_hint_indices\":[";
+        for (size_t j = 0; j < linked_scan_hint_indices.size(); ++j) {
+          if (j) oss << ",";
+          const auto &td = m_wallet->m_transfers[linked_scan_hint_indices[j]];
+          const auto scan_hint_it =
+              m_wallet->m_return_scan_hints.find(td.get_public_key());
+          oss << "{"
+              << "\"idx\":" << linked_scan_hint_indices[j] << ","
+              << "\"txid\":\""
+              << epee::string_tools::pod_to_hex(td.m_txid) << "\","
+              << "\"origin_tx_type\":"
+              << static_cast<int>(scan_hint_it->second.origin_tx_type) << "}";
+        }
+        oss << "],\"linked_roi_indices\":[";
+        for (size_t j = 0; j < linked_roi_indices.size(); ++j) {
+          if (j) oss << ",";
+          const auto &td = m_wallet->m_transfers[linked_roi_indices[j]];
+          oss << "{"
+              << "\"idx\":" << linked_roi_indices[j] << ","
+              << "\"txid\":\""
+              << epee::string_tools::pod_to_hex(td.m_txid) << "\"}";
+        }
+        oss << "]}";
+      }
+
+      oss << "]}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
   // ========================================================================
   // DEBUG: Transfer VIN inspection
   // Returns JSON array of transfer details including vin.size() for debugging
@@ -9584,6 +11803,1278 @@ public:
     }
   }
 
+  std::string debug_balance_gap_outputs(const std::string &asset_type = "SAL1",
+                                        int limit = 50) {
+    if (!m_initialized) {
+      return R"({"success":false,"error":"Wallet not initialized"})";
+    }
+    if (!m_wallet) {
+      return R"({"success":false,"error":"Wallet missing"})";
+    }
+
+    try {
+      if (limit <= 0) {
+        limit = 50;
+      }
+
+      const bool have_asset_index =
+          m_wallet->m_transfers_indices.count(asset_type) > 0;
+      const auto *asset_indices =
+          have_asset_index ? &m_wallet->m_transfers_indices.at(asset_type)
+                           : nullptr;
+
+      std::ostringstream oss;
+      oss << "{\"success\":true";
+      oss << ",\"asset_type\":\"" << asset_type << "\"";
+      oss << ",\"balance\":" << m_wallet->balance(0, asset_type, false);
+      oss << ",\"unlocked_balance\":"
+          << m_wallet->unlocked_balance(0, asset_type, false);
+      oss << ",\"m_locked_coins_total\":";
+      uint64_t locked_total = 0;
+      for (const auto &entry : m_wallet->m_locked_coins) {
+        if (entry.second.m_asset_type == asset_type) {
+          locked_total += entry.second.m_amount;
+        }
+      }
+      oss << locked_total;
+
+      uint64_t gap_total = 0;
+      uint64_t unindexed_total = 0;
+      size_t gap_count = 0;
+      size_t unindexed_count = 0;
+
+      oss << ",\"balance_not_unlocked\":[";
+      bool first_gap = true;
+      for (size_t i = 0; i < m_wallet->m_transfers.size(); ++i) {
+        const auto &td = m_wallet->m_transfers[i];
+        if (td.asset_type != asset_type || td.m_subaddr_index.major != 0) {
+          continue;
+        }
+
+        const bool is_spent_loose = m_wallet->is_spent(td, false);
+        const bool counted_in_balance = !is_spent_loose && !td.m_frozen;
+        const bool counted_in_unlocked =
+            counted_in_balance && m_wallet->is_transfer_unlocked(td);
+        const bool locked_coin_hit =
+            m_wallet->m_locked_coins.find(td.get_public_key()) !=
+            m_wallet->m_locked_coins.end();
+
+        if (!counted_in_balance || counted_in_unlocked || locked_coin_hit) {
+          continue;
+        }
+
+        gap_total += td.amount();
+        ++gap_count;
+        if (gap_count > static_cast<size_t>(limit)) {
+          continue;
+        }
+
+        if (!first_gap) {
+          oss << ",";
+        }
+        first_gap = false;
+        oss << "{"
+            << "\"idx\":" << i << ","
+            << "\"txid\":\"" << epee::string_tools::pod_to_hex(td.m_txid)
+            << "\","
+            << "\"amount\":\"" << td.amount() << "\","
+            << "\"tx_type\":" << static_cast<int>(td.m_tx.type) << ","
+            << "\"block_height\":" << td.m_block_height << ","
+            << "\"unlock_time\":" << td.m_tx.unlock_time << ","
+            << "\"is_transfer_unlocked\":"
+            << (m_wallet->is_transfer_unlocked(td) ? "true" : "false") << ","
+            << "\"asset_index_hit\":"
+            << ((asset_indices && asset_indices->count(i) == 1) ? "true"
+                                                                : "false")
+            << ","
+            << "\"output_key\":\""
+            << epee::string_tools::pod_to_hex(td.get_public_key()) << "\""
+            << "}";
+      }
+      oss << "]";
+      oss << ",\"balance_not_unlocked_count\":" << gap_count;
+      oss << ",\"balance_not_unlocked_total\":" << gap_total;
+
+      oss << ",\"unindexed_liquid_outputs\":[";
+      bool first_unindexed = true;
+      for (size_t i = 0; i < m_wallet->m_transfers.size(); ++i) {
+        const auto &td = m_wallet->m_transfers[i];
+        if (td.asset_type != asset_type || td.m_subaddr_index.major != 0) {
+          continue;
+        }
+
+        const bool is_spent_loose = m_wallet->is_spent(td, false);
+        const bool liquid = !is_spent_loose && !td.m_frozen &&
+                            m_wallet->is_transfer_unlocked(td);
+        const bool asset_index_hit =
+            asset_indices && asset_indices->count(i) == 1;
+        if (!liquid || asset_index_hit) {
+          continue;
+        }
+
+        unindexed_total += td.amount();
+        ++unindexed_count;
+        if (unindexed_count > static_cast<size_t>(limit)) {
+          continue;
+        }
+
+        if (!first_unindexed) {
+          oss << ",";
+        }
+        first_unindexed = false;
+        oss << "{"
+            << "\"idx\":" << i << ","
+            << "\"txid\":\"" << epee::string_tools::pod_to_hex(td.m_txid)
+            << "\","
+            << "\"amount\":\"" << td.amount() << "\","
+            << "\"tx_type\":" << static_cast<int>(td.m_tx.type) << ","
+            << "\"block_height\":" << td.m_block_height << ","
+            << "\"output_key\":\""
+            << epee::string_tools::pod_to_hex(td.get_public_key()) << "\""
+            << "}";
+      }
+      oss << "]";
+      oss << ",\"unindexed_liquid_count\":" << unindexed_count;
+      oss << ",\"unindexed_liquid_total\":" << unindexed_total;
+      oss << "}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  std::string debug_balance_contributors(const std::string &asset_type = "SAL1",
+                                         int limit = 100) {
+    if (!m_initialized) {
+      return R"({"success":false,"error":"Wallet not initialized"})";
+    }
+    if (!m_wallet) {
+      return R"({"success":false,"error":"Wallet missing"})";
+    }
+
+    try {
+      if (limit <= 0) {
+        limit = 100;
+      }
+
+      std::ostringstream oss;
+      oss << "{\"success\":true";
+      oss << ",\"asset_type\":\"" << asset_type << "\"";
+      oss << ",\"official_balance\":" << get_balance_without_locked_coins(asset_type);
+      oss << ",\"official_unlocked\":"
+          << m_wallet->unlocked_balance(0, asset_type, false);
+
+      const bool have_asset_index =
+          m_wallet->m_transfers_indices.count(asset_type) > 0;
+      const auto *asset_indices =
+          have_asset_index ? &m_wallet->m_transfers_indices.at(asset_type)
+                           : nullptr;
+
+      uint64_t confirmed_balance_total = 0;
+      uint64_t confirmed_unlocked_total = 0;
+      uint64_t confirmed_skipped_type_total = 0;
+      uint64_t unconfirmed_tx_total = 0;
+      uint64_t unconfirmed_payment_total = 0;
+      size_t suspicious_count = 0;
+      size_t counted_count = 0;
+
+      oss << ",\"counted_contributors\":[";
+      bool first_counted = true;
+      std::ostringstream suspicious_oss;
+      suspicious_oss << "[";
+      bool first_suspicious = true;
+      if (asset_indices) {
+        for (const auto &idx : *asset_indices) {
+          if (idx >= m_wallet->m_transfers.size()) {
+            continue;
+          }
+          const auto &td = m_wallet->m_transfers[idx];
+          const bool skipped_type =
+              td.m_tx.type == cryptonote::transaction_type::AUDIT &&
+              m_wallet->m_locked_coins.find(td.get_public_key()) !=
+                  m_wallet->m_locked_coins.end();
+          const bool spent_loose = m_wallet->is_spent(td, false);
+          const bool unlocked = m_wallet->is_transfer_unlocked(td);
+          const bool in_balance = !skipped_type && !spent_loose && !td.m_frozen;
+          const bool in_unlocked = in_balance && unlocked;
+
+          if (skipped_type && !spent_loose && !td.m_frozen) {
+            confirmed_skipped_type_total += td.amount();
+          }
+          if (in_balance) {
+            confirmed_balance_total += td.amount();
+          }
+          if (in_unlocked) {
+            confirmed_unlocked_total += td.amount();
+          }
+
+          if (in_balance) {
+            ++counted_count;
+            if (counted_count <= static_cast<size_t>(limit)) {
+              if (!first_counted) {
+                oss << ",";
+              }
+              first_counted = false;
+              oss << "{"
+                  << "\"idx\":" << idx << ","
+                  << "\"txid\":\"" << epee::string_tools::pod_to_hex(td.m_txid) << "\","
+                  << "\"tx_type\":" << static_cast<int>(td.m_tx.type) << ","
+                  << "\"m_amount\":\"" << td.m_amount << "\","
+                  << "\"amount\":\"" << td.amount() << "\","
+                  << "\"amount_diff\":\""
+                  << static_cast<long long>(td.amount()) - static_cast<long long>(td.m_amount)
+                  << "\","
+                  << "\"spent_loose\":" << (spent_loose ? "true" : "false") << ","
+                  << "\"m_spent\":" << (td.m_spent ? "true" : "false") << ","
+                  << "\"frozen\":" << (td.m_frozen ? "true" : "false") << ","
+                  << "\"unlocked\":" << (unlocked ? "true" : "false") << ","
+                  << "\"skipped_type\":" << (skipped_type ? "true" : "false") << ","
+                  << "\"in_balance\":true,"
+                  << "\"in_unlocked\":" << (in_unlocked ? "true" : "false") << ","
+                  << "\"output_key\":\"" << epee::string_tools::pod_to_hex(td.get_public_key()) << "\""
+                  << "}";
+            }
+          }
+
+          const bool suspicious =
+              skipped_type || td.amount() != td.m_amount || idx == 762;
+          if (!suspicious) {
+            continue;
+          }
+
+          ++suspicious_count;
+          if (suspicious_count > static_cast<size_t>(limit)) {
+            continue;
+          }
+          if (!first_suspicious) {
+            suspicious_oss << ",";
+          }
+          first_suspicious = false;
+          suspicious_oss << "{"
+                         << "\"idx\":" << idx << ","
+                         << "\"txid\":\"" << epee::string_tools::pod_to_hex(td.m_txid) << "\","
+                         << "\"tx_type\":" << static_cast<int>(td.m_tx.type) << ","
+                         << "\"m_amount\":\"" << td.m_amount << "\","
+                         << "\"amount\":\"" << td.amount() << "\","
+                         << "\"amount_diff\":\""
+                         << static_cast<long long>(td.amount()) - static_cast<long long>(td.m_amount)
+                         << "\","
+                         << "\"spent_loose\":" << (spent_loose ? "true" : "false") << ","
+                         << "\"m_spent\":" << (td.m_spent ? "true" : "false") << ","
+                         << "\"frozen\":" << (td.m_frozen ? "true" : "false") << ","
+                         << "\"unlocked\":" << (unlocked ? "true" : "false") << ","
+                         << "\"skipped_type\":" << (skipped_type ? "true" : "false") << ","
+                         << "\"in_balance\":" << (in_balance ? "true" : "false") << ","
+                         << "\"in_unlocked\":" << (in_unlocked ? "true" : "false") << ","
+                         << "\"output_key\":\"" << epee::string_tools::pod_to_hex(td.get_public_key()) << "\""
+                         << "}";
+        }
+      }
+      oss << "]";
+      suspicious_oss << "]";
+      oss << ",\"counted_contributor_count\":" << counted_count;
+      oss << ",\"confirmed_contributors\":" << suspicious_oss.str();
+      oss << ",\"confirmed_balance_total\":" << confirmed_balance_total;
+      oss << ",\"confirmed_unlocked_total\":" << confirmed_unlocked_total;
+      oss << ",\"confirmed_skipped_type_total\":" << confirmed_skipped_type_total;
+
+      oss << ",\"unconfirmed_txs\":[";
+      bool first_unconfirmed = true;
+      size_t unconfirmed_tx_count = 0;
+      for (const auto &entry : m_wallet->m_unconfirmed_txs) {
+        const auto &utx = entry.second;
+        if (utx.m_tx.source_asset_type != asset_type ||
+            utx.m_subaddr_account != 0 ||
+            utx.m_state == tools::wallet2::unconfirmed_transfer_details::failed) {
+          continue;
+        }
+        const bool confirmed =
+            m_wallet->m_confirmed_txs.find(entry.first) != m_wallet->m_confirmed_txs.end();
+        if (confirmed) {
+          continue;
+        }
+        uint64_t contribution = utx.m_change;
+        for (const auto &dest : utx.m_dests) {
+          auto index = m_wallet->get_subaddress_index(dest.addr);
+          if (index && (*index).major == 0) {
+            contribution += dest.amount;
+          }
+        }
+        unconfirmed_tx_total += contribution;
+        ++unconfirmed_tx_count;
+        if (unconfirmed_tx_count > static_cast<size_t>(limit)) {
+          continue;
+        }
+        if (!first_unconfirmed) {
+          oss << ",";
+        }
+        first_unconfirmed = false;
+        oss << "{"
+            << "\"txid\":\"" << epee::string_tools::pod_to_hex(entry.first) << "\","
+            << "\"tx_type\":" << static_cast<int>(utx.m_tx.type) << ","
+            << "\"source_asset_type\":\"" << utx.m_tx.source_asset_type << "\","
+            << "\"amount_in\":\"" << utx.m_amount_in << "\","
+            << "\"amount_out\":\"" << utx.m_amount_out << "\","
+            << "\"change\":\"" << utx.m_change << "\","
+            << "\"state\":" << static_cast<int>(utx.m_state) << ","
+            << "\"contribution\":\"" << contribution << "\""
+            << "}";
+      }
+      oss << "]";
+      oss << ",\"unconfirmed_tx_total\":" << unconfirmed_tx_total;
+
+      oss << ",\"unconfirmed_payments\":[";
+      bool first_payment = true;
+      size_t unconfirmed_payment_count = 0;
+      for (const auto &entry : m_wallet->m_unconfirmed_payments) {
+        const auto &payment = entry.second.m_pd;
+        if (payment.m_subaddr_index.major != 0 || payment.m_asset_type != asset_type) {
+          continue;
+        }
+        if (m_wallet->m_confirmed_txs.find(payment.m_tx_hash) !=
+            m_wallet->m_confirmed_txs.end()) {
+          continue;
+        }
+
+        bool already_confirmed_payment = false;
+        for (const auto &confirmed_payment : m_wallet->m_payments) {
+          if (confirmed_payment.second.m_tx_hash == payment.m_tx_hash &&
+              confirmed_payment.second.m_subaddr_index.major == 0 &&
+              confirmed_payment.second.m_asset_type == asset_type) {
+            already_confirmed_payment = true;
+            break;
+          }
+        }
+        if (already_confirmed_payment) {
+          continue;
+        }
+
+        unconfirmed_payment_total += payment.m_amount;
+        ++unconfirmed_payment_count;
+        if (unconfirmed_payment_count > static_cast<size_t>(limit)) {
+          continue;
+        }
+        if (!first_payment) {
+          oss << ",";
+        }
+        first_payment = false;
+        oss << "{"
+            << "\"txid\":\"" << epee::string_tools::pod_to_hex(payment.m_tx_hash) << "\","
+            << "\"asset_type\":\"" << payment.m_asset_type << "\","
+            << "\"amount\":\"" << payment.m_amount << "\""
+            << "}";
+      }
+      oss << "]";
+      oss << ",\"unconfirmed_payment_total\":" << unconfirmed_payment_total;
+      oss << "}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  std::string debug_spend_openings(const std::string &asset_type = "SAL1",
+                                   int max_failures = 20) {
+    if (!m_initialized) {
+      return R"({"success":false,"error":"Wallet not initialized"})";
+    }
+    if (!m_wallet) {
+      return R"({"success":false,"error":"Wallet missing"})";
+    }
+
+    try {
+      if (max_failures <= 0) {
+        max_failures = 20;
+      }
+
+      const uint64_t wallet_height = m_wallet->get_blockchain_current_height();
+      const auto &return_map = m_wallet->get_account().get_return_output_map_ref();
+      const auto &return_scan_hints =
+          m_wallet->get_account().get_return_scan_hint_map_ref();
+      const auto &return_spend_metadata =
+          m_wallet->get_account().get_return_spend_metadata_map_ref();
+      std::ostringstream oss;
+      oss << "{\"success\":true";
+      oss << ",\"asset_type\":\"" << asset_type << "\"";
+      oss << ",\"wallet_height\":" << wallet_height;
+      oss << ",\"return_output_map_size\":" << return_map.size();
+      oss << ",\"return_scan_hint_map_size\":" << return_scan_hints.size();
+      oss << ",\"return_spend_metadata_map_size\":" << return_spend_metadata.size();
+
+      size_t checked_count = 0;
+      size_t spendable_count = 0;
+      size_t failure_count = 0;
+
+      oss << ",\"failures\":[";
+      bool first_failure = true;
+
+      for (size_t i = 0; i < m_wallet->m_transfers.size(); ++i) {
+        const auto &td = m_wallet->m_transfers[i];
+        if (td.asset_type != asset_type) {
+          continue;
+        }
+
+        ++checked_count;
+
+        const bool is_spendable = !td.m_spent && td.amount() > 0 &&
+                                  !td.m_frozen &&
+                                  m_wallet->is_transfer_unlocked(td) &&
+                                  td.m_key_image_known &&
+                                  !td.m_key_image_partial;
+        if (!is_spendable) {
+          continue;
+        }
+
+        ++spendable_count;
+
+        cryptonote::tx_source_entry src;
+        src.amount = td.amount();
+        src.rct = td.is_rct();
+        src.carrot = td.is_carrot();
+        src.coinbase = !td.m_tx.vin.empty() &&
+                       td.m_tx.vin[0].type() == typeid(cryptonote::txin_gen);
+        src.block_index = td.m_block_height;
+        src.asset_type = td.asset_type;
+        src.mask = td.m_mask;
+        src.address_spend_pubkey = td.m_recovered_spend_pubkey;
+
+        if (td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
+            td.m_td_origin_idx < m_wallet->m_transfers.size()) {
+          const auto &td_origin = m_wallet->m_transfers[td.m_td_origin_idx];
+          src.origin_tx_data.tx_type = td_origin.m_tx.type;
+          src.origin_tx_data.tx_pub_key =
+              cryptonote::get_tx_pub_key_from_extra(td_origin.m_tx,
+                                                    td_origin.m_pk_index);
+          src.origin_tx_data.output_index = td_origin.m_internal_output_index;
+        }
+
+        cryptonote::tx_source_entry::output_entry real_oe;
+        real_oe.first = td.m_asset_type_output_index;
+        real_oe.second.dest = rct::pk2rct(td.get_public_key());
+        real_oe.second.mask = rct::commit(td.amount(), td.m_mask);
+        src.outputs.push_back(real_oe);
+        src.real_output = 0;
+        src.real_output_in_tx_index = td.m_internal_output_index;
+        src.real_out_tx_key =
+            cryptonote::get_tx_pub_key_from_extra(td.m_tx, td.m_pk_index);
+        src.real_out_additional_tx_keys =
+            cryptonote::get_additional_tx_pub_keys_from_extra(td.m_tx);
+        if (!td.m_tx.vin.empty() &&
+            td.m_tx.vin[0].type() == typeid(cryptonote::txin_to_key)) {
+          src.first_rct_key_image =
+              boost::get<cryptonote::txin_to_key>(td.m_tx.vin[0]).k_image;
+        }
+
+        crypto::secret_key x_out = crypto::null_skey;
+        crypto::secret_key y_out = crypto::null_skey;
+        std::string path;
+        const auto confirmed_it = m_wallet->m_confirmed_txs.find(td.m_txid);
+        const bool ok =
+            (confirmed_it != m_wallet->m_confirmed_txs.end())
+                ? tools::wallet::try_get_address_openings_x_y(
+                      confirmed_it->second.m_tx, src, *m_wallet, x_out, y_out,
+                      &path)
+                : tools::wallet::try_get_address_openings_x_y(
+                      td.m_tx, src, *m_wallet, x_out, y_out, &path);
+        if (ok) {
+          continue;
+        }
+
+        ++failure_count;
+        if (!first_failure) {
+          oss << ",";
+        }
+        first_failure = false;
+
+        const crypto::public_key output_key = td.get_public_key();
+        const auto return_it = return_map.find(output_key);
+        const bool return_map_hit = return_it != return_map.end();
+        bool return_map_spendable = false;
+        const auto scan_hint_it = return_scan_hints.find(output_key);
+        const bool scan_hint_hit = scan_hint_it != return_scan_hints.end();
+        const auto spend_metadata_it = return_spend_metadata.find(output_key);
+        const bool spend_metadata_hit =
+            spend_metadata_it != return_spend_metadata.end();
+        bool spend_metadata_complete = false;
+        bool persisted_map_hit = false;
+        bool persisted_map_spendable = false;
+        const tools::wallet2::transfer_details *origin_td = nullptr;
+        if (td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
+            td.m_td_origin_idx < m_wallet->m_transfers.size()) {
+          origin_td = &m_wallet->m_transfers[td.m_td_origin_idx];
+        }
+        if (return_map_hit) {
+          const auto &roi = return_it->second;
+          return_map_spendable =
+              roi.K_spend_pubkey != crypto::null_pkey &&
+              roi.sum_g != crypto::null_skey &&
+              roi.sender_extension_t != crypto::null_skey;
+        }
+        if (spend_metadata_hit) {
+          const auto &metadata = spend_metadata_it->second;
+          spend_metadata_complete =
+              carrot::is_return_spend_metadata_semantically_valid(
+                  metadata, output_key,
+                  scan_hint_hit ? &scan_hint_it->second : nullptr);
+        }
+        const auto persisted_it = m_wallet->m_return_output_info.find(output_key);
+        persisted_map_hit = persisted_it != m_wallet->m_return_output_info.end();
+        if (persisted_map_hit) {
+          const auto &roi = persisted_it->second;
+          persisted_map_spendable =
+              roi.K_spend_pubkey != crypto::null_pkey &&
+              roi.sum_g != crypto::null_skey &&
+              roi.sender_extension_t != crypto::null_skey;
+        }
+        oss << "{"
+            << "\"idx\":" << i << ","
+            << "\"amount\":\"" << td.m_amount << "\","
+            << "\"block_height\":" << td.m_block_height << ","
+            << "\"tx_type\":" << static_cast<int>(td.m_tx.type) << ","
+            << "\"origin_idx\":" << td.m_td_origin_idx << ","
+            << "\"subaddr_major\":" << td.m_subaddr_index.major << ","
+            << "\"subaddr_minor\":" << td.m_subaddr_index.minor << ","
+            << "\"path\":\"" << path << "\","
+            << "\"return_map_hit\":"
+            << (return_map_hit ? "true" : "false") << ","
+            << "\"return_map_spendable\":"
+            << (return_map_spendable ? "true" : "false") << ","
+            << "\"scan_hint_hit\":"
+            << (scan_hint_hit ? "true" : "false") << ","
+            << "\"spend_metadata_hit\":"
+            << (spend_metadata_hit ? "true" : "false") << ","
+            << "\"spend_metadata_complete\":"
+            << (spend_metadata_complete ? "true" : "false") << ","
+            << "\"persisted_map_hit\":"
+            << (persisted_map_hit ? "true" : "false") << ","
+            << "\"persisted_map_spendable\":"
+            << (persisted_map_spendable ? "true" : "false") << ","
+            << "\"key_image_known\":"
+            << (td.m_key_image_known ? "true" : "false") << ","
+            << "\"recovered_spend_pubkey\":\""
+            << epee::string_tools::pod_to_hex(td.m_recovered_spend_pubkey) << "\","
+            << "\"output_key\":\""
+            << epee::string_tools::pod_to_hex(output_key) << "\","
+            << "\"txid\":\"" << epee::string_tools::pod_to_hex(td.m_txid)
+            << "\"";
+
+        if (origin_td) {
+          oss << ",\"origin_transfer\":{"
+              << "\"tx_type\":" << static_cast<int>(origin_td->m_tx.type) << ","
+              << "\"txid\":\"" << epee::string_tools::pod_to_hex(origin_td->m_txid) << "\","
+              << "\"internal_output_index\":" << origin_td->m_internal_output_index << ","
+              << "\"recovered_spend_pubkey\":\""
+              << epee::string_tools::pod_to_hex(origin_td->m_recovered_spend_pubkey) << "\","
+              << "\"output_key\":\""
+              << epee::string_tools::pod_to_hex(origin_td->get_public_key()) << "\""
+              << "}";
+        }
+
+        if (return_map_hit) {
+          const auto &roi = return_it->second;
+          oss << ",\"roi\":{"
+              << "\"K_o\":\"" << epee::string_tools::pod_to_hex(roi.K_o) << "\","
+              << "\"K_change\":\"" << epee::string_tools::pod_to_hex(roi.K_change) << "\","
+              << "\"K_spend_pubkey\":\"" << epee::string_tools::pod_to_hex(roi.K_spend_pubkey) << "\","
+              << "\"key_image\":\"" << epee::string_tools::pod_to_hex(roi.key_image) << "\","
+              << "\"sum_g_zero\":" << (roi.sum_g == crypto::null_skey ? "true" : "false") << ","
+              << "\"sender_extension_t_zero\":" << (roi.sender_extension_t == crypto::null_skey ? "true" : "false")
+              << "}";
+        }
+
+        if (persisted_map_hit) {
+          const auto &roi = persisted_it->second;
+          oss << ",\"persisted_roi\":{"
+              << "\"K_o\":\"" << epee::string_tools::pod_to_hex(roi.K_o) << "\","
+              << "\"K_change\":\"" << epee::string_tools::pod_to_hex(roi.K_change) << "\","
+              << "\"K_spend_pubkey\":\"" << epee::string_tools::pod_to_hex(roi.K_spend_pubkey) << "\","
+              << "\"key_image\":\"" << epee::string_tools::pod_to_hex(roi.key_image) << "\","
+              << "\"sum_g_zero\":" << (roi.sum_g == crypto::null_skey ? "true" : "false") << ","
+              << "\"sender_extension_t_zero\":" << (roi.sender_extension_t == crypto::null_skey ? "true" : "false")
+              << "}";
+        }
+
+        if (scan_hint_hit) {
+          const auto &scan_hint = scan_hint_it->second;
+          oss << ",\"scan_hint\":{"
+              << "\"K_o\":\"" << epee::string_tools::pod_to_hex(scan_hint.K_o) << "\","
+              << "\"K_r\":\"" << epee::string_tools::pod_to_hex(scan_hint.K_r) << "\","
+              << "\"origin_tx_type\":" << static_cast<int>(scan_hint.origin_tx_type) << ","
+              << "\"origin_tx_pub_key\":\""
+              << epee::string_tools::pod_to_hex(scan_hint.origin_tx_pub_key) << "\","
+              << "\"origin_output_index\":" << scan_hint.origin_output_index
+              << "}";
+        }
+
+        if (spend_metadata_hit) {
+          const auto &metadata = spend_metadata_it->second;
+          oss << ",\"spend_metadata\":{"
+              << "\"K_r\":\"" << epee::string_tools::pod_to_hex(metadata.K_r) << "\","
+              << "\"K_spend_pubkey\":\""
+              << epee::string_tools::pod_to_hex(metadata.K_spend_pubkey) << "\","
+              << "\"key_image\":\"" << epee::string_tools::pod_to_hex(metadata.key_image) << "\","
+              << "\"sum_g_zero\":"
+              << (metadata.sum_g == crypto::null_skey ? "true" : "false") << ","
+              << "\"sender_extension_t_zero\":"
+              << (metadata.sender_extension_t == crypto::null_skey ? "true" : "false")
+              << "}";
+        }
+
+        oss << "}";
+
+        if (failure_count >= static_cast<size_t>(max_failures)) {
+          break;
+        }
+      }
+
+      oss << "]";
+      oss << ",\"checked_count\":" << checked_count;
+      oss << ",\"spendable_count\":" << spendable_count;
+      oss << ",\"failure_count\":" << failure_count;
+      oss << "}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  std::string debug_target_outputs(
+      const std::string &asset_type = "SAL1",
+      const std::string &txid_prefixes_csv =
+          "01fdc422,b2fba66d,0ac09ddf") {
+    if (!m_initialized) {
+      return R"({"success":false,"error":"Wallet not initialized"})";
+    }
+    if (!m_wallet) {
+      return R"({"success":false,"error":"Wallet missing"})";
+    }
+
+    try {
+      std::vector<std::string> prefixes;
+      {
+        std::stringstream ss(txid_prefixes_csv);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+          item.erase(std::remove_if(item.begin(), item.end(), ::isspace),
+                     item.end());
+          if (!item.empty()) {
+            prefixes.push_back(item);
+          }
+        }
+      }
+
+      const uint64_t current_chain_height =
+          m_wallet->get_blockchain_current_height();
+      const uint64_t top_block_index =
+          current_chain_height > 0 ? current_chain_height - 1 : 0;
+      const auto &return_map = m_wallet->get_account().get_return_output_map_ref();
+      const auto &return_scan_hints =
+          m_wallet->get_account().get_return_scan_hint_map_ref();
+      const auto &return_spend_metadata =
+          m_wallet->get_account().get_return_spend_metadata_map_ref();
+      const auto &persisted_roi = m_wallet->m_return_output_info;
+      const auto unburned_transfers_by_key_image =
+          tools::wallet::collect_non_burned_transfers_by_key_image(
+              m_wallet->m_transfers, *m_wallet);
+      const bool have_asset_index =
+          m_wallet->m_transfers_indices.count(asset_type) > 0;
+      const auto *asset_indices =
+          have_asset_index ? &m_wallet->m_transfers_indices.at(asset_type)
+                           : nullptr;
+
+      uint64_t locked_asset_total = 0;
+      size_t locked_asset_count = 0;
+      for (const auto &entry : m_wallet->m_locked_coins) {
+        if (entry.second.m_asset_type == asset_type) {
+          locked_asset_total += entry.second.m_amount;
+          ++locked_asset_count;
+        }
+      }
+
+      std::ostringstream oss;
+      oss << "{\"success\":true";
+      oss << ",\"asset_type\":\"" << asset_type << "\"";
+      oss << ",\"wallet_height\":" << current_chain_height;
+      oss << ",\"balance\":" << m_wallet->balance(0, asset_type, false);
+      oss << ",\"unlocked_balance\":"
+          << m_wallet->unlocked_balance(0, asset_type, false);
+      oss << ",\"locked_asset_count\":" << locked_asset_count;
+      oss << ",\"locked_asset_total\":" << locked_asset_total;
+      oss << ",\"return_output_map_size\":" << return_map.size();
+      oss << ",\"return_scan_hint_map_size\":" << return_scan_hints.size();
+      oss << ",\"return_spend_metadata_map_size\":" << return_spend_metadata.size();
+      oss << ",\"persisted_return_output_info_size\":" << persisted_roi.size();
+      oss << ",\"targets\":[";
+
+      bool first_target = true;
+      for (size_t i = 0; i < m_wallet->m_transfers.size(); ++i) {
+        const auto &td = m_wallet->m_transfers[i];
+        const std::string txid_hex = epee::string_tools::pod_to_hex(td.m_txid);
+
+        bool target_match = prefixes.empty();
+        for (const auto &prefix : prefixes) {
+          if (txid_hex.rfind(prefix, 0) == 0) {
+            target_match = true;
+            break;
+          }
+        }
+        if (!target_match) {
+          continue;
+        }
+
+        if (!first_target) {
+          oss << ",";
+        }
+        first_target = false;
+
+        const crypto::public_key output_key = td.get_public_key();
+        const bool is_spent_loose = m_wallet->is_spent(td, false);
+        const bool is_spent_strict = m_wallet->is_spent(td, true);
+        const bool is_unlocked = m_wallet->is_transfer_unlocked(td);
+        const bool counted_in_balance = !is_spent_loose && !td.m_frozen;
+        const bool counted_in_unlocked = counted_in_balance && is_unlocked;
+        const bool debug_spend_openings_spendable =
+            counted_in_unlocked && td.amount() > 0 && td.m_key_image_known &&
+            !td.m_key_image_partial;
+        const bool create_tx_all_legacy_candidate =
+            !is_spent_loose && !td.m_frozen && !td.m_key_image_partial &&
+            td.is_rct() && is_unlocked && td.m_subaddr_index.major == 0 &&
+            td.asset_type == asset_type;
+        const auto locked_it = m_wallet->m_locked_coins.find(output_key);
+        const bool locked_coin_hit = locked_it != m_wallet->m_locked_coins.end();
+        const size_t blocks_locked_for =
+            (td.m_tx.type == cryptonote::transaction_type::MINER ||
+             td.m_tx.type == cryptonote::transaction_type::PROTOCOL)
+                ? CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW
+                : CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE;
+        const bool carrot_basic_candidate =
+            !locked_coin_hit && !td.m_spent &&
+            td.amount() > 0 && td.m_key_image_known && !td.m_key_image_partial &&
+            !td.m_frozen &&
+            (top_block_index + 1 >= td.m_block_height + blocks_locked_for) &&
+            td.m_subaddr_index.major == 0 && td.amount() >= 1 &&
+            td.amount() <= MONEY_SUPPLY && td.asset_type == asset_type;
+        const crypto::key_image effective_key_image =
+            tools::wallet::get_effective_transfer_key_image(td, *m_wallet);
+        const auto unburned_it =
+            unburned_transfers_by_key_image.find(effective_key_image);
+        const bool unburned_map_hit =
+            unburned_it != unburned_transfers_by_key_image.end();
+        const long long unburned_best_idx =
+            unburned_map_hit ? static_cast<long long>(unburned_it->second) : -1;
+        const bool carrot_selected_candidate =
+            carrot_basic_candidate && unburned_map_hit &&
+            unburned_it->second == i;
+
+        const bool asset_index_hit =
+            asset_indices && asset_indices->count(i) == 1;
+
+        const auto return_it = return_map.find(output_key);
+        const bool return_map_hit = return_it != return_map.end();
+        const auto scan_hint_it = return_scan_hints.find(output_key);
+        const bool scan_hint_hit = scan_hint_it != return_scan_hints.end();
+        const auto spend_metadata_it = return_spend_metadata.find(output_key);
+        const bool spend_metadata_hit =
+            spend_metadata_it != return_spend_metadata.end();
+        const auto persisted_it = persisted_roi.find(output_key);
+        const bool persisted_hit = persisted_it != persisted_roi.end();
+
+        bool return_map_openable = false;
+        if (return_map_hit) {
+          const auto &roi = return_it->second;
+          return_map_openable =
+              roi.K_spend_pubkey != crypto::null_pkey &&
+              roi.sum_g != crypto::null_skey &&
+              roi.sender_extension_t != crypto::null_skey;
+        }
+
+        bool persisted_openable = false;
+        if (persisted_hit) {
+          const auto &roi = persisted_it->second;
+          persisted_openable =
+              roi.K_spend_pubkey != crypto::null_pkey &&
+              roi.sum_g != crypto::null_skey &&
+              roi.sender_extension_t != crypto::null_skey;
+        }
+
+        bool spend_metadata_complete = false;
+        bool spend_metadata_valid = false;
+        bool spend_metadata_open = false;
+        if (spend_metadata_hit) {
+          const auto &metadata = spend_metadata_it->second;
+          spend_metadata_complete =
+              carrot::is_return_spend_metadata_complete(metadata);
+          spend_metadata_valid =
+              carrot::is_return_spend_metadata_semantically_valid(
+                  metadata, output_key,
+                  scan_hint_hit ? &scan_hint_it->second : nullptr);
+          if (scan_hint_hit && spend_metadata_complete && spend_metadata_valid) {
+            spend_metadata_open =
+                m_wallet->get_account().can_open_fcmp_onetime_address(
+                    metadata.K_spend_pubkey, metadata.sum_g,
+                    metadata.sender_extension_t, output_key);
+          }
+        }
+
+        const auto runtime_full_it = m_wallet->m_runtime_full_txs.find(td.m_txid);
+        const bool runtime_tx_hit =
+            runtime_full_it != m_wallet->m_runtime_full_txs.end();
+
+        oss << "{"
+            << "\"idx\":" << i << ","
+            << "\"txid\":\"" << txid_hex << "\","
+            << "\"asset_type\":\"" << td.asset_type << "\","
+            << "\"amount\":\"" << td.amount() << "\","
+            << "\"tx_type\":" << static_cast<int>(td.m_tx.type) << ","
+            << "\"block_height\":" << td.m_block_height << ","
+            << "\"internal_output_index\":" << td.m_internal_output_index << ","
+            << "\"asset_output_index\":" << td.m_asset_type_output_index << ","
+            << "\"subaddr_major\":" << td.m_subaddr_index.major << ","
+            << "\"subaddr_minor\":" << td.m_subaddr_index.minor << ","
+            << "\"m_spent\":" << (td.m_spent ? "true" : "false") << ","
+            << "\"is_spent_loose\":" << (is_spent_loose ? "true" : "false") << ","
+            << "\"is_spent_strict\":" << (is_spent_strict ? "true" : "false") << ","
+            << "\"frozen\":" << (td.m_frozen ? "true" : "false") << ","
+            << "\"unlocked\":" << (is_unlocked ? "true" : "false") << ","
+            << "\"key_image_known\":"
+            << (td.m_key_image_known ? "true" : "false") << ","
+            << "\"key_image_partial\":"
+            << (td.m_key_image_partial ? "true" : "false") << ","
+            << "\"counted_in_balance\":"
+            << (counted_in_balance ? "true" : "false") << ","
+            << "\"counted_in_unlocked\":"
+            << (counted_in_unlocked ? "true" : "false") << ","
+            << "\"debug_spend_openings_spendable\":"
+            << (debug_spend_openings_spendable ? "true" : "false") << ","
+            << "\"create_tx_all_legacy_candidate\":"
+            << (create_tx_all_legacy_candidate ? "true" : "false") << ","
+            << "\"carrot_basic_candidate\":"
+            << (carrot_basic_candidate ? "true" : "false") << ","
+            << "\"carrot_selected_candidate\":"
+            << (carrot_selected_candidate ? "true" : "false") << ","
+            << "\"asset_index_hit\":"
+            << (asset_index_hit ? "true" : "false") << ","
+            << "\"locked_coin_hit\":"
+            << (locked_coin_hit ? "true" : "false") << ","
+            << "\"runtime_tx_hit\":"
+            << (runtime_tx_hit ? "true" : "false") << ","
+            << "\"stored_key_image\":\""
+            << epee::string_tools::pod_to_hex(td.m_key_image) << "\","
+            << "\"effective_key_image\":\""
+            << epee::string_tools::pod_to_hex(effective_key_image) << "\","
+            << "\"unburned_map_hit\":"
+            << (unburned_map_hit ? "true" : "false") << ","
+            << "\"unburned_best_idx\":" << unburned_best_idx << ","
+            << "\"output_key\":\""
+            << epee::string_tools::pod_to_hex(output_key) << "\","
+            << "\"recovered_spend_pubkey\":\""
+            << epee::string_tools::pod_to_hex(td.m_recovered_spend_pubkey) << "\","
+            << "\"origin_idx\":"
+            << (td.m_td_origin_idx == std::numeric_limits<uint64_t>::max()
+                    ? -1
+                    : static_cast<long long>(td.m_td_origin_idx)) << ","
+            << "\"return_map_hit\":"
+            << (return_map_hit ? "true" : "false") << ","
+            << "\"return_map_openable\":"
+            << (return_map_openable ? "true" : "false") << ","
+            << "\"scan_hint_hit\":"
+            << (scan_hint_hit ? "true" : "false") << ","
+            << "\"spend_metadata_hit\":"
+            << (spend_metadata_hit ? "true" : "false") << ","
+            << "\"spend_metadata_complete\":"
+            << (spend_metadata_complete ? "true" : "false") << ","
+            << "\"spend_metadata_valid\":"
+            << (spend_metadata_valid ? "true" : "false") << ","
+            << "\"spend_metadata_open\":"
+            << (spend_metadata_open ? "true" : "false") << ","
+            << "\"persisted_hit\":"
+            << (persisted_hit ? "true" : "false") << ","
+            << "\"persisted_openable\":"
+            << (persisted_openable ? "true" : "false");
+
+        if (locked_coin_hit) {
+          oss << ",\"locked_coin\":{"
+              << "\"amount\":\"" << locked_it->second.m_amount << "\","
+              << "\"asset_type\":\"" << locked_it->second.m_asset_type << "\""
+              << "}";
+        }
+
+        if (scan_hint_hit) {
+          const auto &scan_hint = scan_hint_it->second;
+          oss << ",\"scan_hint\":{"
+              << "\"K_o\":\""
+              << epee::string_tools::pod_to_hex(scan_hint.K_o) << "\","
+              << "\"K_r\":\""
+              << epee::string_tools::pod_to_hex(scan_hint.K_r) << "\","
+              << "\"origin_tx_type\":"
+              << static_cast<int>(scan_hint.origin_tx_type) << ","
+              << "\"origin_output_index\":" << scan_hint.origin_output_index
+              << "}";
+        }
+
+        if (return_map_hit) {
+          const auto &roi = return_it->second;
+          oss << ",\"roi\":{"
+              << "\"K_o\":\"" << epee::string_tools::pod_to_hex(roi.K_o)
+              << "\","
+              << "\"K_change\":\""
+              << epee::string_tools::pod_to_hex(roi.K_change) << "\","
+              << "\"K_spend_pubkey\":\""
+              << epee::string_tools::pod_to_hex(roi.K_spend_pubkey) << "\","
+              << "\"sum_g_zero\":"
+              << (roi.sum_g == crypto::null_skey ? "true" : "false") << ","
+              << "\"sender_extension_t_zero\":"
+              << (roi.sender_extension_t == crypto::null_skey ? "true"
+                                                              : "false")
+              << "}";
+        }
+
+        if (persisted_hit) {
+          const auto &roi = persisted_it->second;
+          oss << ",\"persisted_roi\":{"
+              << "\"K_o\":\"" << epee::string_tools::pod_to_hex(roi.K_o)
+              << "\","
+              << "\"K_change\":\""
+              << epee::string_tools::pod_to_hex(roi.K_change) << "\","
+              << "\"K_spend_pubkey\":\""
+              << epee::string_tools::pod_to_hex(roi.K_spend_pubkey) << "\","
+              << "\"sum_g_zero\":"
+              << (roi.sum_g == crypto::null_skey ? "true" : "false") << ","
+              << "\"sender_extension_t_zero\":"
+              << (roi.sender_extension_t == crypto::null_skey ? "true"
+                                                              : "false")
+              << "}";
+        }
+
+        if (spend_metadata_hit) {
+          const auto &metadata = spend_metadata_it->second;
+          oss << ",\"spend_metadata\":{"
+              << "\"K_r\":\""
+              << epee::string_tools::pod_to_hex(metadata.K_r) << "\","
+              << "\"K_spend_pubkey\":\""
+              << epee::string_tools::pod_to_hex(metadata.K_spend_pubkey)
+              << "\","
+              << "\"key_image\":\""
+              << epee::string_tools::pod_to_hex(metadata.key_image) << "\","
+              << "\"sum_g_zero\":"
+              << (metadata.sum_g == crypto::null_skey ? "true" : "false")
+              << ","
+              << "\"sender_extension_t_zero\":"
+              << (metadata.sender_extension_t == crypto::null_skey ? "true"
+                                                                   : "false")
+              << "}";
+        }
+
+        if (td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
+            td.m_td_origin_idx < m_wallet->m_transfers.size()) {
+          const auto &origin_td = m_wallet->m_transfers[td.m_td_origin_idx];
+          oss << ",\"origin_transfer\":{"
+              << "\"idx\":" << td.m_td_origin_idx << ","
+              << "\"txid\":\""
+              << epee::string_tools::pod_to_hex(origin_td.m_txid) << "\","
+              << "\"tx_type\":" << static_cast<int>(origin_td.m_tx.type) << ","
+              << "\"output_key\":\""
+              << epee::string_tools::pod_to_hex(origin_td.get_public_key())
+              << "\","
+              << "\"recovered_spend_pubkey\":\""
+              << epee::string_tools::pod_to_hex(
+                     origin_td.m_recovered_spend_pubkey)
+              << "\""
+              << "}";
+        }
+
+        oss << "}";
+      }
+
+      oss << "]}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  std::string debug_sweep_inputs(const std::string &asset_type = "SAL1") {
+    if (!m_initialized) {
+      return R"({"success":false,"error":"Wallet not initialized"})";
+    }
+    if (!m_wallet) {
+      return R"({"success":false,"error":"Wallet missing"})";
+    }
+
+    try {
+      const uint64_t current_chain_height = m_wallet->get_blockchain_current_height();
+      if (current_chain_height == 0) {
+        return R"({"success":false,"error":"chain height is 0"})";
+      }
+      const uint64_t top_block_index = current_chain_height - 1;
+
+      tools::wallet2::transfer_container transfers;
+      m_wallet->get_transfers(transfers, asset_type);
+
+      const auto unburned_transfers_by_key_image =
+          tools::wallet::collect_non_burned_transfers_by_key_image(
+              transfers, *m_wallet);
+
+      std::ostringstream oss;
+      oss << "{\"success\":true";
+      oss << ",\"asset_type\":\"" << asset_type << "\"";
+      oss << ",\"wallet_height\":" << current_chain_height;
+      oss << ",\"selected_inputs\":[";
+
+      bool first = true;
+      size_t selected_count = 0;
+      for (std::size_t transfer_idx = 0; transfer_idx < transfers.size(); ++transfer_idx) {
+        const auto &td = transfers.at(transfer_idx);
+        size_t blocks_locked_for = CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE;
+        if (td.m_tx.type == cryptonote::transaction_type::MINER ||
+            td.m_tx.type == cryptonote::transaction_type::PROTOCOL) {
+          blocks_locked_for = CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW;
+        }
+
+        const bool usable_for_selection =
+            !td.m_spent &&
+            td.amount() > 0 &&
+            td.m_key_image_known &&
+            !td.m_key_image_partial &&
+            !td.m_frozen &&
+            (top_block_index + 1 >= td.m_block_height + blocks_locked_for) &&
+            td.m_subaddr_index.major == 0 &&
+            td.amount() >= 1 &&
+            td.amount() <= MONEY_SUPPLY &&
+            td.asset_type == asset_type;
+
+        if (!usable_for_selection) {
+          continue;
+        }
+
+        const auto effectiveKeyImage =
+            tools::wallet::get_effective_transfer_key_image(td, *m_wallet);
+        const auto ki_it = unburned_transfers_by_key_image.find(effectiveKeyImage);
+        if (ki_it == unburned_transfers_by_key_image.cend() ||
+            ki_it->second != transfer_idx) {
+          continue;
+        }
+
+        if (!first) {
+          oss << ",";
+        }
+        first = false;
+        ++selected_count;
+
+        oss << "{"
+            << "\"container_idx\":" << transfer_idx << ","
+            << "\"txid\":\"" << epee::string_tools::pod_to_hex(td.m_txid) << "\","
+            << "\"amount\":\"" << td.amount() << "\","
+            << "\"tx_type\":" << static_cast<int>(td.m_tx.type) << ","
+            << "\"block_height\":" << td.m_block_height << ","
+            << "\"global_output_index\":" << td.m_global_output_index << ","
+            << "\"asset_output_index\":" << td.m_asset_type_output_index << ","
+            << "\"internal_output_index\":" << td.m_internal_output_index << ","
+            << "\"subaddr_major\":" << td.m_subaddr_index.major << ","
+            << "\"subaddr_minor\":" << td.m_subaddr_index.minor << ","
+            << "\"spent\":" << (td.m_spent ? "true" : "false") << ","
+            << "\"frozen\":" << (td.m_frozen ? "true" : "false") << ","
+            << "\"key_image_known\":" << (td.m_key_image_known ? "true" : "false") << ","
+            << "\"key_image_partial\":" << (td.m_key_image_partial ? "true" : "false") << ","
+            << "\"unlocked\":" << (m_wallet->is_transfer_unlocked(td) ? "true" : "false") << ","
+            << "\"stored_key_image\":\"" << epee::string_tools::pod_to_hex(td.m_key_image) << "\","
+            << "\"effective_key_image\":\""
+            << epee::string_tools::pod_to_hex(effectiveKeyImage) << "\","
+            << "\"output_key\":\"" << epee::string_tools::pod_to_hex(td.get_public_key()) << "\","
+            << "\"mask\":\"" << epee::string_tools::pod_to_hex(td.m_mask) << "\","
+            << "\"recovered_spend_pubkey\":\""
+            << epee::string_tools::pod_to_hex(td.m_recovered_spend_pubkey) << "\"";
+
+        const auto &return_spend_metadata =
+            m_wallet->get_account().get_return_spend_metadata_map_ref();
+        const auto metadata_it = return_spend_metadata.find(td.get_public_key());
+        if (metadata_it != return_spend_metadata.end()) {
+          const auto &metadata = metadata_it->second;
+          oss << ",\"return_metadata\":{"
+              << "\"complete\":"
+              << (carrot::is_return_spend_metadata_complete(metadata) ? "true" : "false") << ","
+              << "\"semantically_valid\":"
+              << (carrot::is_return_spend_metadata_semantically_valid(
+                      metadata, td.get_public_key(), nullptr)
+                      ? "true"
+                      : "false")
+              << ","
+              << "\"key_image\":\"" << epee::string_tools::pod_to_hex(metadata.key_image) << "\","
+              << "\"spend_pubkey\":\"" << epee::string_tools::pod_to_hex(metadata.K_spend_pubkey) << "\""
+              << "}";
+        }
+
+        if (td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
+            td.m_td_origin_idx < m_wallet->m_transfers.size()) {
+          const auto &origin_td = m_wallet->m_transfers[td.m_td_origin_idx];
+          oss << ",\"origin_transfer\":{"
+              << "\"txid\":\"" << epee::string_tools::pod_to_hex(origin_td.m_txid) << "\","
+              << "\"tx_type\":" << static_cast<int>(origin_td.m_tx.type) << ","
+              << "\"internal_output_index\":" << origin_td.m_internal_output_index << ","
+              << "\"output_key\":\""
+              << epee::string_tools::pod_to_hex(origin_td.get_public_key()) << "\","
+              << "\"recovered_spend_pubkey\":\""
+              << epee::string_tools::pod_to_hex(origin_td.m_recovered_spend_pubkey) << "\""
+              << "}";
+        }
+
+        oss << "}";
+      }
+
+      oss << "]";
+      oss << ",\"selected_count\":" << selected_count;
+      oss << "}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
+  std::string debug_sweep_transaction(const std::string &dest_address_str,
+                                      uint32_t mixin_count = 15,
+                                      uint32_t priority = 2) {
+    if (!m_initialized) {
+      return R"({"success":false,"error":"Wallet not initialized"})";
+    }
+    if (!m_wallet) {
+      return R"({"success":false,"error":"Wallet missing"})";
+    }
+
+    try {
+      cryptonote::address_parse_info info;
+      if (!cryptonote::get_account_address_from_str(info, m_wallet->nettype(),
+                                                    dest_address_str)) {
+        return R"({"success":false,"error":"Invalid destination address"})";
+      }
+
+      std::vector<uint8_t> extra;
+      if (info.has_payment_id) {
+        std::string extra_nonce;
+        cryptonote::set_encrypted_payment_id_to_tx_extra_nonce(extra_nonce,
+                                                               info.payment_id);
+        if (!cryptonote::add_extra_nonce_to_tx_extra(extra, extra_nonce)) {
+          return R"({"success":false,"error":"Failed to add payment ID to extra"})";
+        }
+      }
+
+      const bool is_carrot_hf = m_wallet->get_current_hard_fork() >= 10;
+      std::string asset_type = is_carrot_hf ? "SAL1" : "SAL";
+      if (m_wallet->unlocked_balance(0, asset_type, false) == 0) {
+        asset_type = (asset_type == "SAL1") ? "SAL" : "SAL1";
+      }
+
+      std::vector<tools::wallet2::pending_tx> ptx_vector =
+          m_wallet->create_transactions_all(
+              0,
+              cryptonote::transaction_type::TRANSFER,
+              asset_type,
+              info.address,
+              info.is_subaddress,
+              1,
+              mixin_count,
+              0,
+              priority,
+              extra,
+              0,
+              {});
+
+      std::ostringstream oss;
+      oss << "{\"success\":true";
+      oss << ",\"asset_type\":\"" << asset_type << "\"";
+      oss << ",\"transaction_count\":" << ptx_vector.size();
+      oss << ",\"transactions\":[";
+
+      bool first_tx = true;
+      for (const auto &ptx : ptx_vector) {
+        if (!first_tx) oss << ",";
+        first_tx = false;
+
+        oss << "{";
+        crypto::hash tx_hash;
+        cryptonote::get_transaction_hash(ptx.tx, tx_hash);
+        oss << "\"tx_hash\":\"" << epee::string_tools::pod_to_hex(tx_hash) << "\"";
+        std::unordered_set<std::string> vinKeyImagesHex;
+        for (const auto &vin : ptx.tx.vin) {
+          if (vin.type() != typeid(cryptonote::txin_to_key)) continue;
+          vinKeyImagesHex.insert(
+              epee::string_tools::pod_to_hex(
+                  boost::get<cryptonote::txin_to_key>(vin).k_image));
+        }
+        oss << ",\"selected_transfers\":[";
+
+        bool first_sel = true;
+        for (size_t i = 0; i < ptx.selected_transfers.size(); ++i) {
+          const size_t transfer_idx = ptx.selected_transfers[i];
+          if (transfer_idx >= m_wallet->m_transfers.size()) continue;
+          const auto &td = m_wallet->m_transfers[transfer_idx];
+          const crypto::key_image effectiveKeyImage =
+              tools::wallet::get_effective_transfer_key_image(td, *m_wallet);
+          const std::string storedKeyImageHex =
+              epee::string_tools::pod_to_hex(td.m_key_image);
+          const std::string effectiveKeyImageHex =
+              epee::string_tools::pod_to_hex(effectiveKeyImage);
+          if (!first_sel) oss << ",";
+          first_sel = false;
+          oss << "{"
+              << "\"transfer_idx\":" << transfer_idx << ","
+              << "\"txid\":\"" << epee::string_tools::pod_to_hex(td.m_txid) << "\","
+              << "\"tx_type\":" << static_cast<int>(td.m_tx.type) << ","
+              << "\"amount\":\"" << td.amount() << "\","
+              << "\"stored_key_image\":\"" << storedKeyImageHex << "\","
+              << "\"effective_key_image\":\"" << effectiveKeyImageHex << "\","
+              << "\"vin_uses_stored_key_image\":"
+              << (vinKeyImagesHex.count(storedKeyImageHex) ? "true" : "false") << ","
+              << "\"vin_uses_effective_key_image\":"
+              << (vinKeyImagesHex.count(effectiveKeyImageHex) ? "true" : "false") << ","
+              << "\"output_key\":\"" << epee::string_tools::pod_to_hex(td.get_public_key()) << "\","
+              << "\"mask\":\"" << epee::string_tools::pod_to_hex(td.m_mask) << "\","
+              << "\"recovered_spend_pubkey\":\"" << epee::string_tools::pod_to_hex(td.m_recovered_spend_pubkey) << "\","
+              << "\"origin_idx\":"
+              << (td.m_td_origin_idx == std::numeric_limits<uint64_t>::max()
+                      ? -1
+                      : static_cast<long long>(td.m_td_origin_idx));
+          const auto &return_spend_metadata =
+              m_wallet->get_account().get_return_spend_metadata_map_ref();
+          const auto metadata_it = return_spend_metadata.find(td.get_public_key());
+          if (metadata_it != return_spend_metadata.end()) {
+            const auto &metadata = metadata_it->second;
+            oss << ",\"return_metadata\":{"
+                << "\"complete\":"
+                << (carrot::is_return_spend_metadata_complete(metadata) ? "true" : "false") << ","
+                << "\"semantically_valid\":"
+                << (carrot::is_return_spend_metadata_semantically_valid(
+                        metadata, td.get_public_key(), nullptr)
+                        ? "true"
+                        : "false")
+                << ","
+                << "\"key_image\":\"" << epee::string_tools::pod_to_hex(metadata.key_image) << "\","
+                << "\"spend_pubkey\":\"" << epee::string_tools::pod_to_hex(metadata.K_spend_pubkey) << "\""
+                << "}";
+          }
+          oss << "}";
+        }
+        oss << "]";
+
+        oss << ",\"vin_key_images\":[";
+        bool first_vin = true;
+        for (const auto &vin : ptx.tx.vin) {
+          if (vin.type() != typeid(cryptonote::txin_to_key)) continue;
+          const auto &in = boost::get<cryptonote::txin_to_key>(vin);
+          if (!first_vin) oss << ",";
+          first_vin = false;
+          oss << "\"" << epee::string_tools::pod_to_hex(in.k_image) << "\"";
+        }
+        oss << "]";
+        oss << "}";
+      }
+
+      oss << "]}";
+      return oss.str();
+    } catch (const std::exception &e) {
+      return "{\"success\":false,\"error\":\"" + std::string(e.what()) + "\"}";
+    }
+  }
+
   // ========================================================================
   // DEBUG: Simulate exact input selection logic from tx_builder.cpp
   // This mirrors is_transfer_usable_for_input_selection EXACTLY
@@ -9648,7 +13139,10 @@ public:
         bool amt_ok =
             (td.amount() >= ignore_below && td.amount() <= ignore_above);
 
-        bool result = !is_spent && ki_known && !ki_partial && !frozen &&
+        bool has_amount = td.amount() > 0;
+        bool result = !is_spent && has_amount && ki_known && !ki_partial && !frozen &&
+                      td.m_tx.type != cryptonote::transaction_type::STAKE &&
+                      td.m_tx.type != cryptonote::transaction_type::AUDIT &&
                       height_unlocked && acct_match && subaddr_match &&
                       amt_ok && is_v10;
 
@@ -9658,6 +13152,8 @@ public:
           // Track rejection reason
           if (is_spent)
             rejected_spent++;
+          else if (!has_amount)
+            rejected_amt++;
           else if (!ki_known)
             rejected_no_ki++;
           else if (ki_partial)
@@ -11177,23 +14673,13 @@ bool inject_decoy_outputs_from_json(const std::string &json_data) {
     // Parse key (hex string -> crypto::public_key)
     if (out.HasMember("key") && out["key"].IsString()) {
       std::string key_hex = out["key"].GetString();
-      if (!epee::string_tools::hex_to_pod(key_hex, entry.key)) {
-        fprintf(stderr,
-                "[WASM WARN] inject_decoy_outputs_from_json: Failed to parse "
-                "key %zu\n",
-                i);
-      }
+      epee::string_tools::hex_to_pod(key_hex, entry.key);
     }
 
     // Parse mask (hex string -> rct::key)
     if (out.HasMember("mask") && out["mask"].IsString()) {
       std::string mask_hex = out["mask"].GetString();
-      if (!epee::string_tools::hex_to_pod(mask_hex, entry.mask)) {
-        fprintf(stderr,
-                "[WASM WARN] inject_decoy_outputs_from_json: Failed to parse "
-                "mask %zu\n",
-                i);
-      }
+      epee::string_tools::hex_to_pod(mask_hex, entry.mask);
     }
 
     // Parse unlocked
@@ -11242,27 +14728,6 @@ bool inject_decoy_outputs_from_json(const std::string &json_data) {
     // Value: includes output_id (global_output_index for wallet2 verification)
     if (cache_index > 0 ||
         (out.HasMember("index") || out.HasMember("global_index"))) {
-      // v5.40.9: Log ALL caching operations, especially missing output_ids
-      if (!has_output_id) {
-        fprintf(stderr,
-                "[WASM WARNING] Caching output %zu at cache_index %llu but "
-                "output_id IS MISSING! This will cause real output not found "
-                "errors!\n",
-                i, (unsigned long long)cache_index);
-      } else if (i < 5 || cache_index == 1929837 || cache_index == 1105498) {
-        // v5.40.20: Also log index 1105498 which has key_match=0 issue
-        const unsigned char *key_bytes =
-            reinterpret_cast<const unsigned char *>(&entry.key);
-        fprintf(stderr,
-                "[WASM] inject_decoy_outputs_from_json: Caching output %zu at "
-                "cache_index %llu (output_id=%llu)\n",
-                i, (unsigned long long)cache_index,
-                (unsigned long long)output_id);
-        fprintf(stderr, "[WASM]   Key[0:8]: %02x%02x%02x%02x%02x%02x%02x%02x\n",
-                key_bytes[0], key_bytes[1], key_bytes[2], key_bytes[3],
-                key_bytes[4], key_bytes[5], key_bytes[6], key_bytes[7]);
-      }
-
       // Get binary key/mask/txid for cache storage
       std::string key_bin(reinterpret_cast<const char *>(&entry.key),
                           sizeof(entry.key));
@@ -19637,16 +23102,11 @@ EMSCRIPTEN_BINDINGS(salvium_wallet) {
       // Balance
       .function("get_balance", &WasmWallet::get_balance)
       .function("get_unlocked_balance", &WasmWallet::get_unlocked_balance)
-      .function("get_balance_for_asset", &WasmWallet::get_balance_for_asset)
-      .function("get_unlocked_balance_for_asset",
-                &WasmWallet::get_unlocked_balance_for_asset)
-      .function("get_wallet_diagnostic", &WasmWallet::get_wallet_diagnostic)
-      .function("debug_transfer_vin", &WasmWallet::debug_transfer_vin)
-      .function("debug_input_candidates", &WasmWallet::debug_input_candidates)
-      .function("debug_tx_input_selection",
-                &WasmWallet::debug_tx_input_selection)
-      .function("debug_create_tx_path", &WasmWallet::debug_create_tx_path)
-      .function("debug_fee_params", &WasmWallet::debug_fee_params)
+      .function("get_wallet_state_snapshot",
+                &WasmWallet::get_wallet_state_snapshot)
+      .function("validate_outputs_for_send",
+                &WasmWallet::validate_outputs_for_send)
+      .function("get_stake_lifecycle", &WasmWallet::get_stake_lifecycle)
       // Daemon Connection
       .function("set_daemon", &WasmWallet::set_daemon)
       .function("get_daemon_address", &WasmWallet::get_daemon_address)
@@ -19740,11 +23200,12 @@ EMSCRIPTEN_BINDINGS(salvium_wallet) {
       // Scan a single transaction blob (hex) - useful fallback if sparse ingest
       // fails
       .function("scan_tx", &WasmWallet::scan_tx)
+      .function("get_runtime_full_tx_candidate_hashes",
+                &WasmWallet::get_runtime_full_tx_candidate_hashes)
+      .function("cache_runtime_full_txs_from_sparse",
+                &WasmWallet::cache_runtime_full_txs_from_sparse)
       // Get mempool transaction info (amount, fee, direction) after scan_tx
       .function("get_mempool_tx_info", &WasmWallet::get_mempool_tx_info)
-      // DEBUG: Trace a single transaction to understand why outputs aren't
-      // detected
-      .function("debug_scan_transaction", &WasmWallet::debug_scan_transaction)
       // DEBUG: Get locked coins info for protocol_tx troubleshooting
       .function("get_locked_coins_info", &WasmWallet::get_locked_coins_info)
       // ========================================================================
@@ -19811,9 +23272,6 @@ EMSCRIPTEN_BINDINGS(salvium_wallet) {
       // subaddress map
       .function("register_stake_return_info",
                 &WasmWallet::register_stake_return_info)
-      .function("get_wallet_diagnostic", &WasmWallet::get_wallet_diagnostic)
-      .function("debug_transfer_vin", &WasmWallet::debug_transfer_vin)
-      .function("debug_input_candidates", &WasmWallet::debug_input_candidates)
       // ========================================================================
       // MULTISIG FUNCTIONS - For 2-of-3 escrow bounty system
       // ========================================================================
@@ -19839,54 +23297,12 @@ EMSCRIPTEN_BINDINGS(salvium_wallet) {
   function("benchmark_key_derivation", &benchmark_key_derivation);
 
   // ========================================================================
-  // CRYPTO DIAGNOSTIC FUNCTIONS - For debugging donna64 integration
-  // ========================================================================
-  // Compare ref10 vs donna64 speed to diagnose if donna64 is actually being
-  // used
-  function("diagnose_crypto_speed", &diagnose_crypto_speed);
-  // Benchmark donna64 directly via C function (no C++ overhead)
-  function("donna64_direct_benchmark", &donna64_direct_benchmark);
-  // COMPREHENSIVE ref10 vs donna64 comparison with intermediate values
-  // Usage: compare_ref10_donna64(txPubHex, viewSecHex)
-  // Returns JSON with derivations, all intermediate values, and comparison
-  function("compare_ref10_donna64", &compare_ref10_donna64);
-  // FULL iteration-by-iteration debug with ALL 64 donna64 states
-  // Returns JSON with all iteration states for finding exact divergence point
-  function("debug_iteration_by_iteration", &debug_iteration_by_iteration);
-  // Compare scalar*P (without ??8 cofactor) between ref10 and donna64
-  // Helps isolate whether bug is in scalarmult or cofactor multiplication
-  function("compare_scalarmult_no_cofactor", &compare_scalarmult_no_cofactor);
-  // Compute n*P using ref10 for arbitrary n (decimal string)
-  // Usage: compute_nP_ref10("147") -> {n:147, result:"...", success:true}
-  function("compute_nP_ref10", &compute_nP_ref10);
-  // Verify donna64 iterations against ref10 computed values
-  // Usage: verify_donna64_iterations(10) -> compares first 10 iterations
-  function("verify_donna64_iterations", &verify_donna64_iterations);
-  // Debug iteration 3 with sub-step granularity to find exact bug location
-  function("debug_iter3_substeps", &debug_iter3_substeps);
-
-  // ========================================================================
   // VIEW TAG COMPUTATION - For JavaScript pre-filtering optimization
   // ========================================================================
   // Compute single view tag: returns JSON {view_tag: 0-255, success: true}
   function("compute_view_tag", &compute_view_tag);
   // Compute batch of view tags for one TX: more efficient (reuses derivation)
   function("compute_view_tags_batch", &compute_view_tags_batch);
-
-  // ========================================================================
-  // CARROT VIEW TAG DEBUG - Full trace of view tag computation
-  // ========================================================================
-  // Compute Carrot view tag with all intermediate values for debugging
-  // Usage: debug_carrot_view_tag(D_e_hex, K_o_hex, k_vi_hex, is_coinbase,
-  // block_height, first_key_image_hex) Returns: {inputs: {...}, steps: {ecdh,
-  // input_context, view_tag}, computed_view_tag: [b0, b1, b2]}
-  function("debug_carrot_view_tag", &debug_carrot_view_tag);
-
-  // Compute Carrot INTERNAL enote view tag (for change/selfsend outputs)
-  // Usage: debug_carrot_internal_view_tag(K_o_hex, s_view_balance_hex,
-  // first_key_image_hex) Returns: {inputs: {...}, computed_view_tag: [b0, b1,
-  // b2], computed_view_tag_hex: "..."}
-  function("debug_carrot_internal_view_tag", &debug_carrot_internal_view_tag);
 
   // ========================================================================
   // COMPACT SCAN PROTOCOL (CSP) - ZERO-COPY BINARY SCANNING
@@ -19935,38 +23351,6 @@ EMSCRIPTEN_BINDINGS(salvium_wallet) {
   // {spent:[{tx_idx,block_height,input_idx,key_image}],inputs_scanned,spent_found}
   function("scan_csp_key_images_only", &scan_csp_key_images_only);
 
-  // DEBUG: Find a specific transaction in CSP and compare view tags
-  // Usage: debug_csp_find_tx(ptr, size, txPubkeyHex, viewSecretKeyHex)
-  function("debug_csp_find_tx", &debug_csp_find_tx);
-
-  // DEBUG: Parse a transaction blob and extract hash/pubkey/view_tags
-  // Usage: debug_parse_tx_blob(ptr, size) -> {tx_hash, tx_pubkey, output_count,
-  // output_view_tags}
-  function("debug_parse_tx_blob", &debug_parse_tx_blob);
-
-  // DEBUG: Parse AUDIT tx using manual parser and show return_address
-  // Usage: debug_parse_audit_tx(ptr, size) -> {return_address, spend_pubkey,
-  // ...}
-  function("debug_parse_audit_tx", &debug_parse_audit_tx);
-
-  // DEBUG: Derive subaddress public key from tx_pub, view_sec, out_key,
-  // output_index This computes: derived_spend_key = out_key - H(derivation ||
-  // output_index) * G Usage: debug_derive_subaddress_public_key(txPubHex,
-  // viewSecHex, outKeyHex, outputIndex) Returns: {derivation,
-  // derived_spend_key, view_tag, success:true}
-  function("debug_derive_subaddress_public_key",
-           &debug_derive_subaddress_public_key);
-
-  // DEBUG: Compute derivation and view tag from pubkey + view_secret
-  // Usage: debug_derive_view_tag(pubkeyHex, viewSecretHex, outputIdx)
-  // Returns: {derivation, view_tag, view_tag_hex, derivation_ok}
-  function("debug_derive_view_tag", &debug_derive_view_tag);
-
-  // DEBUG: Derive spend key from output key using derivation
-  // Usage: debug_derive_spend_key(outputKeyHex, additionalPubkeyHex,
-  // viewSecretHex, outputIdx) Returns: {derived_spend_key, matches_main_spend,
-  // ...}
-  function("debug_derive_spend_key", &debug_derive_spend_key);
 
   // ========================================================================
   // SERVER-SIDE EPEE TO CSP CONVERSION
@@ -20028,11 +23412,9 @@ EMSCRIPTEN_BINDINGS(salvium_wallet) {
   // Sparse format: [TxCount:4] + [GlobalIndex:4][TxSize:4][TxBlob]...
   function("extract_sparse_txs", &extract_sparse_txs);
 
-  // Diagnostic test functions (for debugging epee parsing issues)
+  // Diagnostic test functions used during development of the CSP pipeline.
   function("test_epee_parse", &test_epee_parse);
   function("test_getblocks_parse", &test_getblocks_parse);
-  function("debug_inspect_tx_keys", &debug_inspect_tx_keys);
-  function("debug_probe_derivation", &debug_probe_derivation);
 
   // ========================================================================
   // STAKE CACHE BUILDING - Extract stake info from transaction blobs
