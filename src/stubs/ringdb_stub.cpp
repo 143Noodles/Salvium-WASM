@@ -1,4 +1,4 @@
-// ringdb_stub.cpp - Stub for wallet RingDB (spent key image tracking)
+
 #include "wallet/ringdb.h"
 #include <stdexcept>
 
@@ -7,22 +7,22 @@ namespace tools {
 ringdb::ringdb(std::string filename, const std::string &genesis):
   filename(filename)
 {
-  // No-op for WASM
+
 }
 
 ringdb::~ringdb()
 {
-  // No-op
+
 }
 
 void ringdb::close()
 {
-  // No-op
+
 }
 
 bool ringdb::add_rings(const crypto::chacha_key &chacha_key, const cryptonote::transaction_prefix &tx)
 {
-  return true; // Always succeed
+  return true;
 }
 
 bool ringdb::remove_rings(const crypto::chacha_key &chacha_key, const std::vector<crypto::key_image> &key_images)
@@ -38,7 +38,7 @@ bool ringdb::remove_rings(const crypto::chacha_key &chacha_key, const cryptonote
 bool ringdb::get_ring(const crypto::chacha_key &chacha_key, const crypto::key_image &key_image, std::vector<uint64_t> &outs)
 {
   outs.clear();
-  return false; // No rings stored
+  return false;
 }
 
 bool ringdb::get_rings(const crypto::chacha_key &chacha_key, const std::vector<crypto::key_image> &key_images, std::vector<std::vector<uint64_t>> &all_outs)
@@ -74,7 +74,7 @@ bool ringdb::unblackball(const std::pair<uint64_t, uint64_t> &output)
 
 bool ringdb::blackballed(const std::pair<uint64_t, uint64_t> &output)
 {
-  return false; // Nothing blackballed
+  return false;
 }
 
 bool ringdb::clear_blackballs()
@@ -87,4 +87,4 @@ bool ringdb::blackball_worker(const std::vector<std::pair<uint64_t, uint64_t>> &
   return true;
 }
 
-} // namespace tools
+}

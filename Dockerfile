@@ -32,7 +32,7 @@ RUN cd libsodium-stable \
     && cp -r libsodium-js*/include /opt/libsodium/
 
 # ============================================================================
-# OPENSSL 3.0.12 - WITH PTHREAD SUPPORT
+# OPENSSL 3.0.12 - NO THREAD ATOMICS
 # ============================================================================
 RUN wget -q https://www.openssl.org/source/openssl-3.0.12.tar.gz \
     && tar -xzf openssl-3.0.12.tar.gz && rm openssl-3.0.12.tar.gz
@@ -45,15 +45,18 @@ RUN cd openssl-3.0.12 \
         no-dso \
         no-engine \
         no-afalgeng \
+        no-threads \
         --prefix=/opt/openssl \
         CC="/emsdk/upstream/emscripten/emcc" \
         CXX="/emsdk/upstream/emscripten/em++" \
         AR="/emsdk/upstream/emscripten/emar" \
         RANLIB="/emsdk/upstream/emscripten/emranlib" \
-        CFLAGS="-mbulk-memory -O2" \
+        CFLAGS="-mbulk-memory -mno-atomics -O2" \
     && (make build_generated || make build_generated) \
     && make -j4 libcrypto.a libssl.a \
-    && make install_sw
+    && mkdir -p /opt/openssl/lib /opt/openssl/include \
+    && cp libcrypto.a libssl.a /opt/openssl/lib/ \
+    && cp -R include/openssl /opt/openssl/include/
 
 # ============================================================================
 # BOOST 1.83.0
@@ -137,9 +140,9 @@ ENV DEFINE_FLAGS="-DEMSCRIPTEN=1 -DNO_HW_DEVICE=1 -DDISABLE_TLS=1 \
     -DELPP_NO_DEFAULT_LOG_FILE=1 -DELPP_THREAD_SAFE=1 \
     -Dprivate=public -Dprotected=public"
 
-ENV COMPILE_FLAGS="-std=c++17 -Oz -fPIC -mbulk-memory -msimd128 -fexceptions -DNDEBUG -DBOOST_ASIO_DISABLE_THREADS"
-ENV C_COMPILE_FLAGS="-Oz -fPIC -mbulk-memory -msimd128 -DNDEBUG"
-ENV CRYPTO_COMPILE_FLAGS="-O3 -fPIC -mbulk-memory -msimd128 -DNDEBUG"
+ENV COMPILE_FLAGS="-std=c++17 -Oz -fPIC -mbulk-memory -msimd128 -mno-atomics -fexceptions -DNDEBUG -DBOOST_ASIO_DISABLE_THREADS"
+ENV C_COMPILE_FLAGS="-Oz -fPIC -mbulk-memory -msimd128 -mno-atomics -DNDEBUG"
+ENV CRYPTO_COMPILE_FLAGS="-O3 -fPIC -mbulk-memory -msimd128 -mno-atomics -DNDEBUG"
 
 # ============================================================================
 # PATCH: boost::mutex -> std::mutex (comprehensive)
@@ -496,7 +499,7 @@ RUN rm -f /workspace/build/carrot_scan_unsafe.o \
 # FROM DOCKERFILE.DEBUG: Link final WASM output
 # ============================================================================
 RUN echo "=== Linking final WASM binary ===" \
-    && em++ -O3 -fexceptions \
+    && em++ -O3 -mno-atomics -fexceptions \
        /workspace/build/*.o \
        -L/opt/boost/lib \
        -L/opt/libsodium/lib \

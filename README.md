@@ -1,130 +1,81 @@
 # Salvium Wallet WASM
 
-This repository contains the WebAssembly (WASM) build system for the Salvium Wallet core cryptography and logic. It compiles the C++ Salvium codebase into WASM modules usable in web and Javascript environments.
+The WebAssembly wallet core powering [Salvium Vault](https://vault.salvium.tools) — a full Salvium wallet (scanning, balances, staking, transaction construction) compiled from the upstream C++ codebase to run entirely in the browser. Keys never leave the client; the module is designed for **stateless operation** against untrusted infrastructure: all chain data is injected by the host application, and the wallet verifies everything locally.
 
-## Features
+## Highlights
 
-- **Core Cryptography**: Ed25519, scalar multiplication, hashing (Keccak, Blake2b, Groestl, etc.).
-- **Wallet Logic**: Address generation, transaction scanning, output selection, and ring signature generation.
-- **Multisig Support**: Subaddress and multisig wallet compatibility.
-- **Optimized**: Uses `donna64` for high-performance elliptic curve operations.
+- **Full wallet core in the browser**: restore from seed, scan, stake, sweep, and build transactions client-side — no server ever sees keys or amounts.
+- **Compact Scan Protocol (CSP)**: blocks are converted server-side into a compact scanning format; the wallet view-tag-scans them in parallel Web Workers and ingests only matched transactions sparsely. A full restore of a years-old wallet completes in minutes — benchmarked faster than the native CLI wallet on the same hardware.
+- **Chain-truth self-correction**: every scan can cross-check the wallet's local spent-state against the chain's complete public spent set, confirming real spends and releasing stale optimistic flags. The wallet converges to chain truth automatically.
+- **Exact balance history**: per-output birth/spend accounting (`get_native_balance_history`) yields the wallet's true balance at any block height — no reconstruction heuristics.
+- **Salvium protocol coverage**: staking with return/yield tracking, burns, converts, audits, protocol tokens, and Carrot addresses.
+- **Deterministic state round-trip**: the entire wallet state exports/imports as a portable cache blob (`export_wallet_cache_hex` / `import_wallet_cache_hex`), enabling instant reopen without rescanning.
+- **High-performance crypto**: `donna64` elliptic-curve fast paths, batched view-tag computation, and memoized derivation caches for hot scanning loops.
 
 ## Prerequisites
 
-- **Docker**: The build process is containerized to ensure a consistent environment (Emscripten, Boost, OpenSSL, Libsodium).
+- **Docker** — the build is fully containerized (Emscripten, Boost, OpenSSL, Libsodium pinned inside the image).
 
-## Build Instructions
-
-### Linux / macOS
+## Build
 
 ```bash
-./build.sh
+./build.sh          # Linux / macOS
+.\build.ps1         # Windows PowerShell
 ```
 
-### Windows (PowerShell)
+The build clones the upstream Salvium source, overlays the tracked wallet modifications (see `salvium-repo/` and `patches/`), compiles with Emscripten, and emits `SalviumWallet.js` + `SalviumWallet.wasm` into `output/`.
 
-```powershell
-.\build.ps1
-```
-
-The build script will:
-1.  Create a Docker image containing all dependencies (Emscripten, Boost, OpenSSL, Libsodium).
-2.  Compile the Salvium C++ source code and bindings.
-3.  Link the final `SalviumWallet.wasm` and `SalviumWallet.js`.
-4.  Extract the output files to the `output/` directory.
+> The `.js` glue and `.wasm` binary are a matched pair — always deploy both from the same build.
 
 ## Usage
-
-Include the generated `SalviumWallet.js` in your HTML or import it in your JavaScript project. The WASM module provides the `WasmWallet` class and several global utility functions.
 
 ```javascript
 const factory = require('./output/SalviumWallet.js');
 
 factory().then(module => {
-    console.log("Salvium WASM Module Loaded");
-    
-    // Create a new wallet instance
-    const wallet = new module.WasmWallet();
-    
-    // Initialize a random wallet
+    const wallet = new module.WasmWallet('mainnet');
     wallet.create_random("password", "English");
     console.log("Address:", wallet.get_address());
 });
 ```
 
-## API Reference
+In production the module runs inside a Web Worker; all I/O is injected by the host (see *Stateless operation* below).
 
-### WasmWallet Class
+## API Overview
 
-#### Wallet Management
-- `create_random(password, language)`: Create a new wallet with random seed.
-- `restore_from_seed(seed, password, restore_height)`: Restore wallet from mnemonic seed.
-- `restore_from_recovery_key_hex(recovery_key_hex, password, restore_height)`: Restore from raw recovery key.
-- `init_view_only(view_key, address, password, restore_height)`: Initialize watch-only wallet.
+The module exposes ~130 bindings. The full, authoritative surface is the `EMSCRIPTEN_BINDINGS` block at the bottom of `src/wasm_bindings.cpp`; the groups below are the map.
 
-#### Keys & Address
-- `get_address()`: Get primary address.
-- `get_seed()`: Get mnemonic seed.
-- `get_secret_view_key()`, `get_public_view_key()`: View keys.
-- `get_secret_spend_key()`, `get_public_spend_key()`: Spend keys.
-- `get_carrot_address()`: Get Carrot (privacy protocol) address.
-- `get_carrot_keys()`: Get various Carrot-specific keys (s_master, k_prove_spend, etc.).
+### Wallet lifecycle
+`create_random`, `restore_from_seed`, `restore_from_recovery_key_hex`, `init_view_only`, `export_wallet_cache_hex` / `import_wallet_cache_hex` (full state round-trip for instant reopen).
 
-#### Balance & Sync
-- `get_balance(asset_type)`: Get total balance.
-- `get_unlocked_balance(asset_type)`: Get spendable balance.
-- `get_blockchain_height()`: Get daemon chain height.
-- `get_wallet_height()`: Get wallet scanned height.
-- `process_blocks(blob)`: Process parsed block object.
-- `process_blocks_binary(ptr, size)`: Process binary block data.
-- `ingest_blocks_binary(ptr, size)`: Fast ingest of block data.
-- `scan_blocks_fast(ptr, size)`: Optimized block scanning (Worker support).
+### Keys & addresses
+Address/subaddress getters, seed and key export, `validate_address`, Carrot address + key derivation.
 
-#### Transfers & Transactions
-- `get_transfers_as_json()`: Get history as JSON string.
-- `create_transaction_json(dest_addr, amount, ...)`: Create standard transaction.
-- `create_stake_transaction_json(amount)`: Create staking transaction.
-- `estimate_fee_json(params)`: Estimate transaction fees.
-- `prepare_transaction_json(...)`: Phase 1 of split tx creation.
-- `complete_transaction_json(...)`: Phase 2 of split tx creation.
+### Scanning (CSP)
+`ingest_sparse_transactions` (sparse matched-tx ingest, with deferred-rebuild support for batch pipelines), `scan_tx`, view-tag batch computation, `get_key_images_csv`, server-side `convert_epee_to_csp*` converters and sparse extractors.
 
-#### CSP (Compact Scan Protocol)
-- `ingest_sparse_transactions(ptr, size)`: Ingest sparse transaction format.
-- `scan_tx(blob)`: Scan single transaction blob.
-- `get_key_images()`: Get known key images.
-- `get_key_images_csv()`: Export key images for remote checking.
+### Spent-state & chain truth
+`mark_spent_by_key_images`, `get_optimistic_spent_key_images_csv`, `release_unspent_key_images` (reverse audit against the chain's public spent set), `reconcile_unconfirmed_txs` (pending-transaction hygiene with expiry), `flush_derived_state`.
 
-### Global Utility Functions
+### Balances & history
+`get_balance` / `get_unlocked_balance` (per asset), `get_transfers_as_json` (CLI-parity transaction history incl. stakes, returns, change markers), `get_native_balance_history` (exact balance-by-height series from the transfer table, stake-lock aware).
 
-#### Crypto Utilities
-- `compute_view_tag(view_key, pubkey, index)`: Compute matching tag for output filtering.
-- `compute_view_tags_batch(...)`: Batch computation.
-- `validate_address(address, nettype)`: Validate Salvium address.
-- `get_version()`: Get WASM module version.
+### Transactions
+Probe/create/complete split transaction construction (`prepare_transaction_json` / `complete_transaction_json`), standard + stake + sweep transactions, fee estimation, deterministic decoy handling via injected output distributions.
 
-#### Server-Side & Parsing
-- `convert_epee_to_csp(ptr, size, height)`: Convert full blocks to Compact Scan format.
-- `convert_epee_to_csp_with_index(...)`: Convert with fast-lookup index.
-- `extract_sparse_txs(...)`: Extract specific TXs from block bundle.
-- `extract_stake_info(ptr, size)`: Extract staking metadata.
-- `extract_all_stakes(...)`: Extract all stakes from block bundle.
-- `inspect_epee_block(...)`: Debug block structure.
+### Stateless operation (host-injected I/O)
+`inject_json_rpc_response`, `inject_decoy_outputs*`, `inject_fee_estimate`, `inject_hardfork_info`, `inject_blocks_response` — the wallet performs no network I/O of its own; the host supplies daemon responses and the wallet validates them.
 
-#### Cache Injection (for Stateless Operation)
-- `inject_decoy_outputs(ptr, size)`: Inject decoys for ring signatures.
-- `inject_blocks_response(ptr, size)`: Inject block data for refresh.
-- `inject_fee_estimate(json)`: Inject current network fees.
-- `inject_hardfork_info(version)`: Set protocol version.
+### Diagnostics
+`get_wallet_diagnostic`, crypto benchmarks (`diagnose_crypto_speed`, `compare_ref10_donna64`), wallet health/integrity checks.
 
-#### Debugging
-- `diagnose_crypto_speed()`: Benchmark crypto primitives.
-- `compare_ref10_donna64()`: Verify optimization correctness.
-- `debug_iteration_by_iteration()`: Step-by-step crypto debug.
-- `get_wallet_diagnostic()`: Dump wallet internal state.
+## Repository structure
 
-## Structure
+- **`Dockerfile`** — pinned build environment and full compilation recipe.
+- **`src/`** — C++ embind bindings (`wasm_bindings.cpp`), `donna64` fast crypto, and platform stubs (HTTP/storage are stubbed; the host injects all I/O).
+- **`salvium-repo/`** — tracked overlay files for the upstream wallet (`wallet2`, `tx_builder`, crypto-ops); everything else is cloned fresh at build time.
+- **`patches/`** — the patch series applied to upstream during the build, with documentation.
 
-- **Dockerfile**: Defines the build environment and compilation steps.
-- **src/**: C++ bindings and stubs for the WASM interface.
-- **salvium-repo/**: Source code modifications and specific wallet logic.
-- **patches/**: Patches applied to the upstream Salvium repository during the build.
+## Upstream
+
+Tracks Salvium mainnet (currently synced with v1.1.0 wallet fixes). Consensus-critical code is unmodified upstream source; modifications are confined to wallet-layer scanning, accounting, and the WASM interface.
