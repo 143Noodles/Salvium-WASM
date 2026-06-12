@@ -10043,7 +10043,11 @@ public:
       bool has_block_version_field = false;
 
       const uint32_t MAX_SPARSE_TX_COUNT = 20000;
-      const uint16_t MAX_SPARSE_INDEX_COUNT = 4096;
+      // Full u16 range: idx_count is a 16-bit wire field, and real chain txs exceed
+      // arbitrary lower caps (a 20,563-index pool consolidation at height ~507000
+      // looped every scanning wallet against a 4096 cap). The wire format itself is
+      // the only honest bound; memory cost at 65535 indices is a few hundred KB.
+      const uint16_t MAX_SPARSE_INDEX_COUNT = 65535;
       const uint32_t MAX_SPARSE_TX_BLOB_SIZE = 2 * 1024 * 1024;
 
       auto sparse_error = [&](const std::string &msg, size_t fail_offset,
