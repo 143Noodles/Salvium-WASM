@@ -2399,6 +2399,13 @@ public:
         return false;
       }
 
+      // FAST OPEN: generate with a 1x1 lookahead (same trick as
+      // init_view_only_with_map). The standard 50x200 table is built by the
+      // queued expand_subaddress_table() op AFTER the wallet reports ready;
+      // the worker is sequential, so every scan/send waits behind it and
+      // coverage at scan time is identical.
+      m_wallet->set_subaddress_lookahead(1, 1);
+
       m_wallet->generate("", password, recovery_key, true, false, false);
 
       m_wallet->set_seed_language(language);
@@ -2413,10 +2420,8 @@ public:
         }
       }
 
-      const size_t SUBADDRESS_LOOKAHEAD_MAJOR = 50;
-      const size_t SUBADDRESS_LOOKAHEAD_MINOR = 200;
-      m_wallet->get_account().generate_subaddress_map(
-          {SUBADDRESS_LOOKAHEAD_MAJOR, SUBADDRESS_LOOKAHEAD_MINOR});
+      m_pending_expand_major = 50;
+      m_pending_expand_minor = 200;
 
       m_initialized = true;
       return true;
@@ -2690,7 +2695,7 @@ public:
     }
   }
 
-  std::string get_subaddress_spend_keys_csv() const {
+  std::string get_subaddress_spend_keys_csv() {
 
     if (!m_initialized || !m_wallet) {
       return "";
@@ -2698,6 +2703,9 @@ public:
 
     std::string csv;
     try {
+      // Deferred-expand backstop: this CSV IS the scan-worker ownership map;
+      // it must never be exported from the tiny restore-time table.
+      ensure_subaddress_table_expanded();
       const auto &ext_map = m_wallet->get_account().get_subaddress_map_ref();
       const auto &sub_map = m_wallet->m_subaddresses;
 
@@ -2758,12 +2766,13 @@ public:
     }
   }
 
-  int get_subaddress_spend_keys_csv_len() const {
+  int get_subaddress_spend_keys_csv_len() {
     if (!m_initialized || !m_wallet) {
       return 0;
     }
 
     try {
+      ensure_subaddress_table_expanded();
       const auto &ext_map = m_wallet->get_account().get_subaddress_map_ref();
       size_t ext_map_size = ext_map.size();
       size_t m_subaddr_size = m_wallet->m_subaddresses.size();
@@ -2778,12 +2787,13 @@ public:
     }
   }
 
-  std::string get_subaddress_spend_keys_csv_prefix(int max_chars) const {
+  std::string get_subaddress_spend_keys_csv_prefix(int max_chars) {
     if (!m_initialized || !m_wallet || max_chars <= 0) {
       return "";
     }
 
     try {
+      ensure_subaddress_table_expanded();
       const auto &ext_map = m_wallet->get_account().get_subaddress_map_ref();
       const auto &sub_map = m_wallet->m_subaddresses;
 
@@ -2841,7 +2851,7 @@ public:
     }
   }
 
-  int get_subaddress_spend_keys_csv_chunk_count(int chunk_size) const {
+  int get_subaddress_spend_keys_csv_chunk_count(int chunk_size) {
     if (!m_initialized || !m_wallet || chunk_size <= 0) {
       return 0;
     }
@@ -2858,7 +2868,7 @@ public:
   }
 
   std::string get_subaddress_spend_keys_csv_chunk(int chunk_index,
-                                                  int chunk_size) const {
+                                                  int chunk_size) {
     if (!m_initialized || !m_wallet || chunk_size <= 0 || chunk_index < 0) {
       return "";
     }
@@ -4975,6 +4985,9 @@ public:
     }
 
     try {
+
+      // Deferred-expand backstop: mempool ownership detection needs the full map.
+      ensure_subaddress_table_expanded();
 
       std::string tx_blob;
       if (!epee::string_tools::parse_hexstr_to_binbuff(tx_blob_hex, tx_blob)) {
@@ -10026,6 +10039,10 @@ public:
 
     try {
 
+      // Deferred-expand backstop: ownership detection below must see the full
+      // subaddress map. Throws into the ingest error path if expansion fails.
+      ensure_subaddress_table_expanded();
+
       auto trace_error = [&](const std::string &msg) -> std::string {
         std::ostringstream oss;
         oss << R"({"success":false,"error":")" << msg << R"(","trace_step":)"
@@ -11711,6 +11728,39 @@ public:
     return neutralized;
   }
 
+  size_t m_pending_expand_major = 0;
+  size_t m_pending_expand_minor = 0;
+
+  // Throwing core of the deferred expand: scans/ingest call this so ownership
+  // detection can NEVER run on the tiny restore-time map even if the queued JS
+  // expand op was lost or failed (its failure surfaces as the caller's error).
+  void ensure_subaddress_table_expanded() {
+    if (m_pending_expand_major == 0)
+      return;
+    const size_t major = m_pending_expand_major;
+    const size_t minor = m_pending_expand_minor;
+    m_wallet->set_subaddress_lookahead(major, minor);
+    m_wallet->expand_subaddresses(cryptonote::subaddress_index{0, 0});
+    m_wallet->get_account().generate_subaddress_map({major, minor});
+    m_pending_expand_major = 0;
+    m_pending_expand_minor = 0;
+  }
+
+  // Build the full subaddress table deferred from restore_from_seed (fast
+  // open). Idempotent: no-op unless a restore armed a pending expand.
+  std::string expand_subaddress_table() {
+    if (!m_wallet)
+      return R"({"success":false,"error":"no wallet"})";
+    try {
+      if (m_pending_expand_major == 0)
+        return R"({"success":true,"noop":true})";
+      ensure_subaddress_table_expanded();
+      return R"({"success":true})";
+    } catch (const std::exception &e) {
+      return std::string(R"({"success":false,"error":")") + e.what() + R"("})";
+    }
+  }
+
   std::string flush_derived_state() {
     size_t dup_repairs = 0;
     try { dup_repairs = repair_duplicate_output_entries(); } catch (...) {}
@@ -12944,7 +12994,10 @@ public:
 
         cryptonote::tx_source_entry::output_entry real_oe;
         real_oe.first = td.m_asset_type_output_index;
-        real_oe.second.dest = rct::pk2rct(td.get_public_key());
+        crypto::public_key dbg_pk;
+        if (!safe_output_pubkey(td, dbg_pk))
+          continue;
+        real_oe.second.dest = rct::pk2rct(dbg_pk);
         real_oe.second.mask = rct::commit(td.amount(), td.m_mask);
         src.outputs.push_back(real_oe);
         src.real_output = 0;
@@ -13062,7 +13115,7 @@ public:
               << "\"recovered_spend_pubkey\":\""
               << epee::string_tools::pod_to_hex(origin_td->m_recovered_spend_pubkey) << "\","
               << "\"output_key\":\""
-              << epee::string_tools::pod_to_hex(origin_td->get_public_key()) << "\""
+              << epee::string_tools::pod_to_hex(output_pubkey_or_null(*origin_td)) << "\""
               << "}";
         }
 
@@ -21151,6 +21204,8 @@ EMSCRIPTEN_BINDINGS(salvium_wallet) {
                 &WasmWallet::get_last_dup_repair_detail)
       .function("repair_duplicate_output_entries",
                 &WasmWallet::repair_duplicate_output_entries)
+      .function("expand_subaddress_table",
+                &WasmWallet::expand_subaddress_table)
       .function("flush_derived_state", &WasmWallet::flush_derived_state)
 
       .function("scan_tx", &WasmWallet::scan_tx)
