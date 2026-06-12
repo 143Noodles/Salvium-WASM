@@ -11561,7 +11561,14 @@ public:
   // revaluation, alternate-derivation scans on historical caches), this prunes all
   // but the authoritative entry and rebuilds the indices. Idempotent.
   std::string m_last_dup_repair_detail;
-  std::string get_last_dup_repair_detail() { return m_last_dup_repair_detail; }
+  std::string get_last_dup_repair_detail() {
+    // Get-and-clear: the repair runs on EVERY flush, and clearing at repair start
+    // meant a healthy second flush erased the first flush's findings before any
+    // reader saw them (a field wallet healed silently; the diagnostics were lost).
+    std::string out = m_last_dup_repair_detail;
+    m_last_dup_repair_detail.clear();
+    return out;
+  }
 
   size_t repair_duplicate_output_entries() {
     if (!m_wallet)
@@ -11571,7 +11578,7 @@ public:
     std::unordered_map<crypto::public_key, size_t> best;
     std::vector<bool> drop(m_wallet->m_transfers.size(), false);
     size_t dropped = 0;
-    m_last_dup_repair_detail.clear();
+    // detail ACCUMULATES across runs; cleared only by get_last_dup_repair_detail()
     for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx) {
       const auto &td = m_wallet->m_transfers[idx];
       const crypto::public_key pk = td.get_public_key();
