@@ -11554,7 +11554,86 @@ public:
     return oss.str();
   }
 
+  // WALLET-STATE SELF-REPAIR: multiple m_transfers entries for the SAME physical
+  // output (same txid + internal output index) double/triple-count balance and make
+  // spends of that output reconcile at N x value (field: a 6.00 send displayed as
+  // -30.01 after repeated duplication). Whatever creates them (placeholder
+  // revaluation, alternate-derivation scans on historical caches), this prunes all
+  // but the authoritative entry and rebuilds the indices. Idempotent.
+  std::string m_last_dup_repair_detail;
+  std::string get_last_dup_repair_detail() { return m_last_dup_repair_detail; }
+
+  size_t repair_duplicate_output_entries() {
+    if (!m_wallet)
+      return 0;
+    // Key by the output's PUBLIC KEY: the physical identity of an output. Duplicates
+    // can carry different txids (synthetic-hash parse paths), so txid keying misses.
+    std::unordered_map<crypto::public_key, size_t> best;
+    std::vector<bool> drop(m_wallet->m_transfers.size(), false);
+    size_t dropped = 0;
+    m_last_dup_repair_detail.clear();
+    for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx) {
+      const auto &td = m_wallet->m_transfers[idx];
+      const crypto::public_key pk = td.get_public_key();
+      auto it = best.find(pk);
+      if (it == best.end()) {
+        best[pk] = idx;
+        continue;
+      }
+      // Keep the better entry: prefer spent (authoritative history), then higher
+      // amount, then the later entry (most recently derived metadata).
+      const auto &keep_td = m_wallet->m_transfers[it->second];
+      // diagnostic shape: same-txid or cross-txid duplicate, amounts involved
+      {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "%s amt=%llu/%llu sametx=%d;",
+                 epee::string_tools::pod_to_hex(td.m_txid).substr(0, 8).c_str(),
+                 (unsigned long long)td.amount(), (unsigned long long)keep_td.amount(),
+                 td.m_txid == keep_td.m_txid ? 1 : 0);
+        if (m_last_dup_repair_detail.size() < 600)
+          m_last_dup_repair_detail += buf;
+      }
+      bool replace = false;
+      if (td.m_spent != keep_td.m_spent)
+        replace = td.m_spent;
+      else if (td.amount() != keep_td.amount())
+        replace = td.amount() > keep_td.amount();
+      else
+        replace = true;
+      if (replace) {
+        drop[it->second] = true;
+        best[pk] = idx;
+      } else {
+        drop[idx] = true;
+      }
+      ++dropped;
+    }
+    if (dropped == 0)
+      return 0;
+    // Compact m_transfers and rebuild every index that references positions.
+    std::vector<tools::wallet2::transfer_details> kept;
+    kept.reserve(m_wallet->m_transfers.size() - dropped);
+    for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx)
+      if (!drop[idx])
+        kept.push_back(m_wallet->m_transfers[idx]);
+    m_wallet->m_transfers.swap(kept);
+    m_wallet->m_key_images.clear();
+    m_wallet->m_pub_keys.clear();
+    m_wallet->m_transfers_indices.clear();
+    for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx) {
+      const auto &td = m_wallet->m_transfers[idx];
+      if (td.m_key_image_known)
+        m_wallet->m_key_images[td.m_key_image] = idx;
+      m_wallet->m_pub_keys[td.get_public_key()] = idx;
+      m_wallet->m_transfers_indices[td.asset_type].insert(idx);
+    }
+    wasm_log("[REPAIR] removed %zu duplicate output entr%s\n", dropped,
+             dropped == 1 ? "y" : "ies");
+    return dropped;
+  }
+
   std::string flush_derived_state() {
+    const size_t dup_repairs = repair_duplicate_output_entries();
     if (!m_initialized || !m_wallet) {
       return R"({"success":false,"error":"Wallet not initialized"})";
     }
@@ -20979,6 +21058,10 @@ EMSCRIPTEN_BINDINGS(salvium_wallet) {
                 &WasmWallet::release_unspent_key_images)
       .function("get_native_balance_history",
                 &WasmWallet::get_native_balance_history)
+      .function("get_last_dup_repair_detail",
+                &WasmWallet::get_last_dup_repair_detail)
+      .function("repair_duplicate_output_entries",
+                &WasmWallet::repair_duplicate_output_entries)
       .function("flush_derived_state", &WasmWallet::flush_derived_state)
 
       .function("scan_tx", &WasmWallet::scan_tx)
