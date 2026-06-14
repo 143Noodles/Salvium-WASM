@@ -1783,6 +1783,63 @@ private:
     }
 
     auto &account = m_wallet->get_account();
+
+    // === COLD-START ROI RECOVERY (stake-return spendability) ===
+    // If any owned PROTOCOL/RETURN output has NO return_output_info (ROI) entry, the
+    // wallet is in the deadlock state where stake-return yield is unspendable and no
+    // downstream pass can rebuild it (each needs pre-existing ROI/hint/origin). Recover
+    // by REPLAYING the production internal scan on the originating owned STAKE/AUDIT/
+    // CREATE_TOKEN FULL txs: view_incoming_scan_transaction re-runs
+    // try_scan_carrot_enote_internal_receiver, which re-registers ROI for the tx's
+    // return keys -- the exact registration the live scan should have done.
+    // SAFETY: self-verifying -- internal_receiver registers ROI ONLY when the internal
+    // view-tag matches a genuine owned change output, so wrong ROI can never be added;
+    // idempotent -- re-registering identical ROI on a healthy wallet is a no-op; gated
+    // so it only runs when a return output is actually missing its ROI.
+    try {
+      bool roi_missing_for_return = false;
+      const auto &roi_now = account.get_return_output_map_ref();
+      for (const auto &rtd : m_wallet->m_transfers) {
+        if (rtd.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
+            rtd.m_tx.type != cryptonote::transaction_type::RETURN)
+          continue;
+        if (rtd.m_internal_output_index >= rtd.m_tx.vout.size())
+          continue;
+        crypto::public_key rok = crypto::null_pkey;
+        if (!get_output_public_key(rtd.m_tx.vout[rtd.m_internal_output_index], rok) ||
+            rok == crypto::null_pkey)
+          continue;
+        if (roi_now.find(rok) == roi_now.end()) {
+          roi_missing_for_return = true;
+          break;
+        }
+      }
+      if (roi_missing_for_return) {
+        // ROI is registered by the live scan for EVERY tx with an owned internal
+        // change output (scan.cpp internal_receiver), not only stake-typed ones, so
+        // replay over ALL hydrated full txs. Each replay is the production
+        // view-incoming scan: it re-registers ROI for change-bearing txs and is a
+        // pure no-op for the rest (internal view-tag won't match). Bounded by the
+        // hydrated set; gated above on a return output actually missing its ROI.
+        for (const auto &rt_entry : m_wallet->m_runtime_full_txs) {
+          try {
+            (void)tools::wallet::view_incoming_scan_transaction(
+                rt_entry.second, m_wallet->get_account());
+          } catch (...) {}
+        }
+        // Propagate the re-registered ROI/hints/metadata to the wallet-side
+        // (persisted) maps ADDITIVELY -- per entry, never clearing first -- so a
+        // mid-copy throw cannot leave the persisted maps partially empty
+        // (sync_return_metadata_from_account clears-then-repopulates, which the
+        // outer catch could otherwise mask). Account maps are authoritative.
+        for (const auto &e : account.get_return_output_map_ref())
+          m_wallet->m_return_output_info[e.first] = e.second;
+        for (const auto &e : account.get_return_scan_hint_map_ref())
+          m_wallet->m_return_scan_hints[e.first] = e.second;
+        for (const auto &e : account.get_return_spend_metadata_map_ref())
+          m_wallet->m_return_spend_metadata[e.first] = e.second;
+      }
+    } catch (...) {}
     const auto derive_input_context_from_tx =
         [](const cryptonote::transaction_prefix &tx_prefix,
            carrot::input_context_t &input_context_out) -> bool {
