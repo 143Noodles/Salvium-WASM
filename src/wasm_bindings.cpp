@@ -7525,12 +7525,15 @@ public:
               }
             } else if (amount_in > 0) {
 
-              if (amount_in >= change) {
-                amount = amount_in - change;
-              } else {
-
-                amount = 0;
-              }
+              // Match the SAL branch: external sent excludes the fee. Without this
+              // a non-reconciled SAL1 out-leg showed amount_in - change (= sent +
+              // fee). The reconciled path (m_dests above) is authoritative and
+              // already fee-excluded; this is the fallback when reconcile has not
+              // yet run for this tx.
+              uint64_t fee_excl = (fee > 0 && amount_in >= change + fee)
+                                      ? (amount_in - change - fee)
+                                      : (amount_in >= change ? amount_in - change : 0);
+              amount = fee_excl;
             } else {
               amount = 0;
             }
