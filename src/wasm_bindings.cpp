@@ -395,6 +395,154 @@ private:
   // ingest_sparse_transactions call; reported as a stand-in for
   // balance_before/balance_after when defer_derived_rebuild=true.
   mutable uint64_t m_last_known_ingest_balance = 0;
+  mutable bool m_derived_state_clean = false;
+  mutable size_t m_derived_state_clean_transfer_count = 0;
+  mutable size_t m_derived_state_clean_key_image_count = 0;
+  mutable size_t m_derived_state_clean_pub_key_count = 0;
+  mutable size_t m_derived_state_clean_confirmed_tx_count = 0;
+  mutable size_t m_derived_state_clean_unconfirmed_tx_count = 0;
+  mutable size_t m_derived_state_clean_locked_coin_count = 0;
+  mutable size_t m_derived_state_clean_spent_transfer_count = 0;
+  mutable bool m_deferred_spent_repair_needed = false;
+
+  void mark_derived_state_dirty() {
+    m_derived_state_clean = false;
+  }
+
+  size_t count_spent_transfers() const {
+    if (!m_wallet)
+      return 0;
+    size_t spent = 0;
+    for (const auto &td : m_wallet->m_transfers) {
+      if (td.m_spent)
+        ++spent;
+    }
+    return spent;
+  }
+
+  size_t repair_spent_transfers_from_wallet_txs() {
+    if (!m_wallet)
+      return 0;
+
+    size_t post_marked_spent = 0;
+    const size_t transfer_count = m_wallet->m_transfers.size();
+
+    if (transfer_count > 1000000) {
+      DEBUG_LOG("[SPENT_DETECT] SKIP post-processing: transfer_count=%zu exceeds sanity limit\n", transfer_count);
+      return 0;
+    }
+
+    std::unordered_map<crypto::key_image, std::pair<size_t, uint64_t>>
+        spending_tx_map;
+
+    if (transfer_count < 100000) {
+      spending_tx_map.reserve(transfer_count * 2);
+    }
+
+    for (size_t j = 0; j < transfer_count; ++j) {
+      try {
+        const auto &other_td = m_wallet->m_transfers[j];
+        const uint64_t spend_height = other_td.m_block_height;
+
+        if (other_td.m_tx.vin.size() > 10000) continue;
+
+        for (const auto &in : other_td.m_tx.vin) {
+          if (in.empty()) continue;
+          if (in.type() != typeid(cryptonote::txin_to_key))
+            continue;
+          const auto *p_txin = boost::get<cryptonote::txin_to_key>(&in);
+          if (!p_txin) continue;
+          const auto &txin = *p_txin;
+
+          if (m_wallet->m_key_images.count(txin.k_image) == 0) {
+            continue;
+          }
+
+          auto it = spending_tx_map.find(txin.k_image);
+          if (it == spending_tx_map.end() ||
+              spend_height < it->second.second) {
+            spending_tx_map[txin.k_image] = {j, spend_height};
+          }
+        }
+      } catch (...) {
+        continue;
+      }
+    }
+
+    for (size_t i = 0; i < transfer_count; ++i) {
+      auto &td = m_wallet->m_transfers[i];
+      if (td.m_spent)
+        continue;
+      if (!td.m_key_image_known)
+        continue;
+
+      auto it = spending_tx_map.find(td.m_key_image);
+      if (it != spending_tx_map.end()) {
+        if (it->second.second > td.m_block_height) {
+          td.m_spent = true;
+          td.m_spent_height = it->second.second;
+          post_marked_spent++;
+        }
+      }
+    }
+
+    return post_marked_spent;
+  }
+
+  void mark_derived_state_clean() {
+    m_derived_state_clean = true;
+    if (!m_wallet) {
+      m_derived_state_clean_transfer_count = 0;
+      m_derived_state_clean_key_image_count = 0;
+      m_derived_state_clean_pub_key_count = 0;
+      m_derived_state_clean_confirmed_tx_count = 0;
+      m_derived_state_clean_unconfirmed_tx_count = 0;
+      m_derived_state_clean_locked_coin_count = 0;
+      m_derived_state_clean_spent_transfer_count = 0;
+      m_deferred_spent_repair_needed = false;
+      return;
+    }
+    m_derived_state_clean_transfer_count = m_wallet->m_transfers.size();
+    m_derived_state_clean_key_image_count = m_wallet->m_key_images.size();
+    m_derived_state_clean_pub_key_count = m_wallet->m_pub_keys.size();
+    m_derived_state_clean_confirmed_tx_count = m_wallet->m_confirmed_txs.size();
+    m_derived_state_clean_unconfirmed_tx_count = m_wallet->m_unconfirmed_txs.size();
+    m_derived_state_clean_locked_coin_count = m_wallet->m_locked_coins.size();
+    m_derived_state_clean_spent_transfer_count = count_spent_transfers();
+    m_deferred_spent_repair_needed = false;
+  }
+
+  bool is_derived_state_clean() const {
+    return m_wallet &&
+           !m_deferred_spent_repair_needed &&
+           m_derived_state_clean &&
+           m_derived_state_clean_transfer_count == m_wallet->m_transfers.size() &&
+           m_derived_state_clean_key_image_count == m_wallet->m_key_images.size() &&
+           m_derived_state_clean_pub_key_count == m_wallet->m_pub_keys.size() &&
+           m_derived_state_clean_confirmed_tx_count == m_wallet->m_confirmed_txs.size() &&
+           m_derived_state_clean_unconfirmed_tx_count == m_wallet->m_unconfirmed_txs.size() &&
+           m_derived_state_clean_locked_coin_count == m_wallet->m_locked_coins.size() &&
+           m_derived_state_clean_spent_transfer_count == count_spent_transfers();
+  }
+
+  void run_full_derived_state_passes() {
+    if (m_deferred_spent_repair_needed) {
+      repair_spent_transfers_from_wallet_txs();
+      m_deferred_spent_repair_needed = false;
+    }
+    restore_account_cached_maps();
+    rebuild_wallet_derived_state();
+    upgrade_return_metadata_maps_if_needed();
+    repair_return_output_metadata_from_transfers();
+    mark_derived_state_clean();
+  }
+
+  void ensure_derived_state_current() {
+    if (is_derived_state_clean()) {
+      return;
+    }
+    run_full_derived_state_passes();
+  }
 
   // CLI-parity item 3 (returned-transfer display rows): some already-spent return
   // outputs we own are processed out-of-order during the parallel scan and never
@@ -1821,11 +1969,68 @@ private:
         // view-incoming scan: it re-registers ROI for change-bearing txs and is a
         // pure no-op for the rest (internal view-tag won't match). Bounded by the
         // hydrated set; gated above on a return output actually missing its ROI.
-        for (const auto &rt_entry : m_wallet->m_runtime_full_txs) {
-          try {
-            (void)tools::wallet::view_incoming_scan_transaction(
-                rt_entry.second, m_wallet->get_account());
-          } catch (...) {}
+        // SCOPED replay: re-scan only the tx(s) that can register a MISSING return
+        // output's ROI -- its own PROTOCOL/RETURN tx and its originating stake/audit/
+        // create_token tx -- instead of ALL hydrated runtime txs. The full sweep was
+        // O(all txs) (~49s on large wallets) and, for genuinely-lost ROI, recovered
+        // nothing. view_incoming_scan_transaction is idempotent and self-verifying
+        // (registers ROI only on a real internal view-tag match), so scanning the
+        // missing output's source tx(s) recovers the SAME ROI the full sweep would for
+        // any output whose source tx is hydrated -- without re-scanning the other
+        // ~thousands of unrelated txs on every reopen.
+        std::unordered_set<crypto::hash> __roi_replay_txids;
+        bool __need_full_roi_sweep = false;
+        {
+          const auto &__roi_chk = m_wallet->get_account().get_return_output_map_ref();
+          for (const auto &__mtd : m_wallet->m_transfers) {
+            if (__mtd.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
+                __mtd.m_tx.type != cryptonote::transaction_type::RETURN)
+              continue;
+            if (__mtd.m_internal_output_index >= __mtd.m_tx.vout.size())
+              continue;
+            crypto::public_key __mk = crypto::null_pkey;
+            if (!get_output_public_key(__mtd.m_tx.vout[__mtd.m_internal_output_index], __mk) ||
+                __mk == crypto::null_pkey)
+              continue;
+            if (__roi_chk.find(__mk) != __roi_chk.end())
+              continue; // already has ROI
+            if (!__mtd.m_spent) {
+              // ANY unspent missing-ROI return output -> full hydrated sweep. We cannot
+              // reliably identify its ROI-minting (change-bearing) tx here: m_td_origin_idx
+              // may be unset OR stale/wrong, and this repair runs BEFORE origin-idx
+              // reconstruction. Trusting a set-but-stale origin would scope to the wrong
+              // tx and leave recoverable stake yield unspendable. Spendability correctness
+              // over the scoped speedup; the full sweep is the original proven behavior.
+              __need_full_roi_sweep = true;
+            } else {
+              // Spent outputs: ROI is irrelevant to spendability. Best-effort scoped
+              // recovery (own + origin tx) only; never force the expensive full sweep.
+              __roi_replay_txids.insert(__mtd.m_txid);
+              if (__mtd.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
+                  __mtd.m_td_origin_idx < m_wallet->m_transfers.size()) {
+                __roi_replay_txids.insert(
+                    m_wallet->m_transfers[__mtd.m_td_origin_idx].m_txid);
+              }
+            }
+          }
+        }
+        if (__need_full_roi_sweep) {
+          for (const auto &__rt_entry : m_wallet->m_runtime_full_txs) {
+            try {
+              (void)tools::wallet::view_incoming_scan_transaction(
+                  __rt_entry.second, m_wallet->get_account());
+            } catch (...) {}
+          }
+        } else {
+          for (const auto &__txid : __roi_replay_txids) {
+            auto __it = m_wallet->m_runtime_full_txs.find(__txid);
+            if (__it == m_wallet->m_runtime_full_txs.end())
+              continue;
+            try {
+              (void)tools::wallet::view_incoming_scan_transaction(
+                  __it->second, m_wallet->get_account());
+            } catch (...) {}
+          }
         }
         // Propagate the re-registered ROI/hints/metadata to the wallet-side
         // (persisted) maps ADDITIVELY -- per entry, never clearing first -- so a
@@ -5520,10 +5725,13 @@ public:
     }
 
     try {
-      restore_account_cached_maps();
-      rebuild_wallet_derived_state();
-      upgrade_return_metadata_maps_if_needed();
-      repair_return_output_metadata_from_transfers();
+      using _clk = std::chrono::steady_clock;
+      auto _t0 = _clk::now();
+      const bool derived_was_clean = is_derived_state_clean();
+      ensure_derived_state_current();
+      const long long derived_ms =
+          (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+              _clk::now() - _t0).count();
 
       std::vector<std::string> hashes;
       hashes.reserve(64);
@@ -5624,8 +5832,15 @@ public:
         }
       }
 
+      const long long total_ms =
+          (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+              _clk::now() - _t0).count();
+
       std::ostringstream oss;
-      oss << "{\"success\":true,\"count\":" << hashes.size() << ",\"hashes\":[";
+      oss << "{\"success\":true,\"count\":" << hashes.size()
+          << ",\"derived_rebuilt\":" << (derived_was_clean ? "false" : "true")
+          << ",\"timings\":{\"derived_state\":" << derived_ms
+          << ",\"total\":" << total_ms << "},\"hashes\":[";
       for (size_t i = 0; i < hashes.size(); ++i) {
         if (i > 0) {
           oss << ",";
@@ -5743,10 +5958,9 @@ public:
       // O(wallet) passes run once via flush_derived_state() (or any self-healing getter)
       // instead of per batch. Insertion above is a pure map insert (no derived reads).
       if (stored > 0 && !defer_derived_rebuild) {
-        restore_account_cached_maps();
-        rebuild_wallet_derived_state();
-        upgrade_return_metadata_maps_if_needed();
-        repair_return_output_metadata_from_transfers();
+        run_full_derived_state_passes();
+      } else if (stored > 0) {
+        mark_derived_state_dirty();
       }
 
       std::ostringstream oss;
@@ -7019,6 +7233,7 @@ public:
       rebuild_wallet_derived_state();
       upgrade_return_metadata_maps_if_needed();
       repair_return_output_metadata_from_transfers();
+      mark_derived_state_clean();
 
       uint64_t balance_after = m_wallet->balance(0, "SAL", false) +
                                m_wallet->balance(0, "SAL1", false);
@@ -7751,6 +7966,10 @@ public:
 
     try {
 
+      // Spend-side safety: guarantee the carrot subaddress_map is fully expanded
+      // before opening any input, so funds on a non-primary subaddress are spendable
+      // even if no scan triggered the deferred expand after reopen.
+      ensure_subaddress_table_expanded();
       uint64_t amount = std::stoull(amount_str);
       uint32_t mixin_count = static_cast<uint32_t>(mixin_count_d);
       uint32_t priority = static_cast<uint32_t>(priority_d);
@@ -8190,6 +8409,10 @@ public:
 
     try {
 
+      // Spend-side safety: guarantee the carrot subaddress_map is fully expanded
+      // before opening any input, so funds on a non-primary subaddress are spendable
+      // even if no scan triggered the deferred expand after reopen.
+      ensure_subaddress_table_expanded();
       uint64_t amount = std::stoull(amount_str);
       uint32_t mixin_count = static_cast<uint32_t>(mixin_count_d);
       uint32_t priority = static_cast<uint32_t>(priority_d);
@@ -8744,6 +8967,10 @@ public:
     }
 
     try {
+      // Spend-side safety: guarantee the carrot subaddress_map is fully expanded
+      // before opening any input, so funds on a non-primary subaddress are spendable
+      // even if no scan triggered the deferred expand after reopen.
+      ensure_subaddress_table_expanded();
       uint32_t mixin_count = static_cast<uint32_t>(mixin_count_d);
       uint32_t priority = static_cast<uint32_t>(priority_d);
 
@@ -9567,6 +9794,7 @@ public:
               "[WASM] import_outputs_hex: attempting import (%zu bytes)...\n",
               outputs_str.size());
 
+      ensure_subaddress_table_expanded();
       size_t num_imported = m_wallet->import_outputs_from_str(outputs_str);
 
       wasm_log( "[WASM] import_outputs_hex: imported %zu outputs\n",
@@ -9646,14 +9874,12 @@ public:
         return R"({"status":"error","error":"Empty wallet cache","transfers":0})";
       }
 
+
       std::string binary_data;
       if (!epee::string_tools::parse_hexstr_to_binbuff(cache_hex,
                                                        binary_data)) {
         return R"({"status":"error","error":"Invalid hex string"})";
       }
-
-      wasm_log( "[WASM] import_wallet_cache_hex: parsing %zu bytes...\n",
-              binary_data.size());
 
       tools::wallet2::cache_file_data cache_data;
       binary_archive<false> ar_parse{epee::strspan<std::uint8_t>(binary_data)};
@@ -9662,28 +9888,16 @@ public:
         return R"({"status":"error","error":"Failed to parse cache data structure"})";
       }
 
-      wasm_log(
-              "[WASM] import_wallet_cache_hex: decrypting cache (%zu bytes, iv "
-              "present)...\n",
-              cache_data.cache_data.size());
-
       std::string decrypted;
       decrypted.resize(cache_data.cache_data.size());
-
       crypto::chacha_key cache_key = m_wallet->get_cache_key();
-
       crypto::chacha20(cache_data.cache_data.data(),
                        cache_data.cache_data.size(), cache_key, cache_data.iv,
                        &decrypted[0]);
 
-      fprintf(
-          stderr,
-          "[WASM] import_wallet_cache_hex: deserializing wallet state...\n");
-
       binary_archive<false> ar{epee::strspan<std::uint8_t>(decrypted)};
       bool loaded = ::serialization::serialize(ar, *m_wallet);
       if (!loaded || !::serialization::check_stream_state(ar)) {
-
         binary_archive<false> ar2{epee::strspan<std::uint8_t>(decrypted)};
         ar2.enable_varint_bug_backward_compatibility();
         loaded = ::serialization::serialize(ar2, *m_wallet);
@@ -9694,19 +9908,52 @@ public:
 
       size_t num_transfers = m_wallet->get_num_transfer_details();
 
-      wasm_log(
-              "[WASM] import_wallet_cache_hex: restored %zu transfers\n",
-              num_transfers);
-
       const size_t repaired_transfer_asset_types =
           repair_transfer_asset_types_from_outputs();
-      wasm_log(
-              "[WASM] import_wallet_cache_hex: repaired %zu cached transfer asset types from output metadata\n",
-              repaired_transfer_asset_types);
 
       restore_account_cached_maps();
 
+      size_t imported_subaddress_map_size = 0;
+      size_t imported_ext_subaddress_map_size = 0;
+      size_t imported_cn_subaddress_map_size = 0;
+      bool subaddress_expand_cleared = false;
+      try {
+        imported_subaddress_map_size = m_wallet->m_subaddresses.size();
+        imported_ext_subaddress_map_size =
+            m_wallet->get_account().get_subaddress_map_ref().size();
+        imported_cn_subaddress_map_size =
+            m_wallet->get_account().get_subaddress_map_cn().size();
+
+        // Spend-side subaddress coverage. The carrot subaddress_map is what tx
+        // construction uses to OPEN (spend) an owned output; if an owned non-primary
+        // subaddress (e.g. (0,1)) is absent, its funds are unspendable even though they
+        // scan/show as balance. On cache reopen the imported map only carries the tiny
+        // restore-time coverage (primary + injected return addrs), and the deferred
+        // expand was only ever ARMED by a fresh seed restore -- never re-armed here --
+        // so reopened wallets left non-primary subaddress funds permanently unspendable.
+        // Fix: arm the deferred 50x200 expand whenever the imported maps fall short of
+        // the standard lookahead (a later scan/ingest/send runs ensure_subaddress_table_
+        // expanded() and regenerates full coverage); clear it only when already covered.
+        const size_t STD_LOOKAHEAD_MAJOR = 50;
+        const size_t STD_LOOKAHEAD_MINOR = 200;
+        const size_t std_required = STD_LOOKAHEAD_MAJOR * STD_LOOKAHEAD_MINOR;
+        const bool imported_maps_cover_std =
+            imported_subaddress_map_size >= std_required &&
+            imported_ext_subaddress_map_size >= std_required &&
+            imported_cn_subaddress_map_size >= std_required;
+        if (imported_maps_cover_std) {
+          m_pending_expand_major = 0;
+          m_pending_expand_minor = 0;
+          subaddress_expand_cleared = true;
+        } else {
+          m_pending_expand_major = STD_LOOKAHEAD_MAJOR;
+          m_pending_expand_minor = STD_LOOKAHEAD_MINOR;
+        }
+      } catch (...) {
+      }
+
       rebuild_wallet_derived_state();
+
       upgrade_return_metadata_maps_if_needed();
 
       repair_return_output_metadata_from_transfers();
@@ -9716,31 +9963,23 @@ public:
         const auto &td = m_wallet->get_transfer_details(i);
         subaddress_indices_needed.insert(td.m_subaddr_index.minor);
       }
-
       uint32_t max_index = 100;
       for (uint32_t idx : subaddress_indices_needed) {
         if (idx > max_index) max_index = idx;
       }
-
       uint32_t current_count = m_wallet->get_num_subaddresses(0);
       if (max_index >= current_count) {
         for (uint32_t i = current_count; i <= max_index + 10; ++i) {
           try {
             m_wallet->add_subaddress(0, "");
           } catch (...) {
-
           }
         }
       }
 
       const size_t repaired_stake_change_key_images =
           repair_cached_carrot_stake_change_key_images();
-
-      wasm_log(
-              "[WASM] import_wallet_cache_hex: rebuilt subaddress map (max_index=%u, subaddresses=%u, transfers_indices=%zu, key_images=%zu, locked_coins=%zu, repaired_stake_change_key_images=%zu)\n",
-              max_index, m_wallet->get_num_subaddresses(0),
-              m_wallet->m_transfers_indices.size(), m_wallet->m_key_images.size(),
-              m_wallet->m_locked_coins.size(), repaired_stake_change_key_images);
+      mark_derived_state_clean();
 
       std::ostringstream json;
       json << R"({"status":"success",)"
@@ -9748,12 +9987,21 @@ public:
            << R"("repaired_transfer_asset_types":)"
            << repaired_transfer_asset_types << ","
            << R"("repaired_stake_change_key_images":)"
-           << repaired_stake_change_key_images << "}";
+           << repaired_stake_change_key_images << ","
+           << R"("imported_subaddress_map_size":)"
+           << imported_subaddress_map_size << ","
+           << R"("imported_ext_subaddress_map_size":)"
+           << imported_ext_subaddress_map_size << ","
+           << R"("imported_cn_subaddress_map_size":)"
+           << imported_cn_subaddress_map_size << ","
+           << R"("subaddress_expand_cleared":)"
+           << (subaddress_expand_cleared ? "true" : "false")
+           << "}";
       return json.str();
 
     } catch (const std::exception &e) {
       m_last_error = e.what();
-      wasm_log( "[WASM] import_wallet_cache_hex failed: %s\n", e.what());
+      wasm_log("[WASM] import_wallet_cache_hex failed: %s\n", e.what());
       std::ostringstream err;
       err << R"({"status":"error","error":")" << e.what() << R"("})";
       return err.str();
@@ -10642,6 +10890,9 @@ public:
           0;
       uint32_t duplicate_transfer_repairs = 0;
       uint32_t repaired_transfer_asset_types = 0;
+      uint32_t audit_spend_key_additions = 0;
+      uint32_t audit_return_address_additions = 0;
+      uint32_t stake_return_address_additions = 0;
       std::string first_tx_hash_hex;
       std::string first_tx_pubkey_hex;
       uint32_t first_tx_outputs = 0;
@@ -10857,6 +11108,7 @@ public:
                 account.insert_subaddresses(
                     {{audit_spend_pubkey, subaddr_idx}});
                 added_audit_spend_key = true;
+                audit_spend_key_additions++;
 
                 static int audit_debug_count = 0;
                 if (audit_debug_count < 10) {
@@ -10880,6 +11132,7 @@ public:
                 account.insert_subaddresses(
                     {{audit_return_address, return_idx}});
                 added_audit_return_address = true;
+                audit_return_address_additions++;
 
                 static int return_debug_count = 0;
                 if (return_debug_count < 10) {
@@ -11158,6 +11411,7 @@ public:
               account.insert_subaddresses({{stake_return_address, return_idx}});
               m_wallet->m_subaddresses_extended[stake_return_address] = return_idx;
               added_stake_return_address = true;
+              stake_return_address_additions++;
 
               static int stake_return_debug_count = 0;
               if (stake_return_debug_count < 10) {
@@ -11243,76 +11497,22 @@ public:
       }
 
       trace_step = 900;
-      {
-        size_t post_marked_spent = 0;
-        const size_t transfer_count = m_wallet->m_transfers.size();
-        trace_step = 901;
-
-        if (transfer_count > 1000000) {
-          DEBUG_LOG("[SPENT_DETECT] SKIP post-processing: transfer_count=%zu exceeds sanity limit\n", transfer_count);
-        } else {
-          trace_step = 902;
-
-          std::unordered_map<crypto::key_image, std::pair<size_t, uint64_t>>
-              spending_tx_map;
-
-          if (transfer_count < 100000) {
-            spending_tx_map.reserve(transfer_count * 2);
-          }
-          trace_step = 903;
-
-          for (size_t j = 0; j < transfer_count; ++j) {
-            trace_step = 910 + static_cast<int>(j % 100);
-            try {
-              const auto &other_td = m_wallet->m_transfers[j];
-              const uint64_t spend_height = other_td.m_block_height;
-
-              if (other_td.m_tx.vin.size() > 10000) continue;
-
-              for (const auto &in : other_td.m_tx.vin) {
-                if (in.empty()) continue;
-                if (in.type() != typeid(cryptonote::txin_to_key))
-                  continue;
-                const auto *p_txin = boost::get<cryptonote::txin_to_key>(&in);
-                if (!p_txin) continue;
-                const auto &txin = *p_txin;
-
-                if (m_wallet->m_key_images.count(txin.k_image) == 0) {
-                  continue;
-                }
-
-                auto it = spending_tx_map.find(txin.k_image);
-                if (it == spending_tx_map.end() ||
-                    spend_height < it->second.second) {
-                  spending_tx_map[txin.k_image] = {j, spend_height};
-                }
-              }
-            } catch (...) {
-              continue;
-            }
-          }
-          trace_step = 920;
-
-          for (size_t i = 0; i < transfer_count; ++i) {
-            auto &td = m_wallet->m_transfers[i];
-            if (td.m_spent)
-              continue;
-            if (!td.m_key_image_known)
-              continue;
-
-            auto it = spending_tx_map.find(td.m_key_image);
-            if (it != spending_tx_map.end()) {
-              if (it->second.second > td.m_block_height) {
-                td.m_spent = true;
-                td.m_spent_height = it->second.second;
-                post_marked_spent++;
-              }
-            }
-          }
-          trace_step = 930;
-
-          outputs_marked_spent_total += post_marked_spent;
+      const bool deferred_state_changed =
+          txs_matched > 0 ||
+          txs_reprocessed > 0 ||
+          outputs_marked_spent_total > 0 ||
+          duplicate_transfer_repairs > 0 ||
+          audit_spend_key_additions > 0 ||
+          audit_return_address_additions > 0 ||
+          stake_return_address_additions > 0;
+      if (defer_derived_rebuild) {
+        if (txs_matched > 0 || txs_reprocessed > 0 ||
+            outputs_marked_spent_total > 0) {
+          m_deferred_spent_repair_needed = true;
         }
+      } else {
+        outputs_marked_spent_total +=
+            static_cast<uint32_t>(repair_spent_transfers_from_wallet_txs());
       }
       trace_step = 940;
 
@@ -11325,11 +11525,15 @@ public:
         rebuild_wallet_derived_state();
         upgrade_return_metadata_maps_if_needed();
         repair_return_output_metadata_from_transfers();
+        mark_derived_state_clean();
 
         balance_after = m_wallet->balance(0, "SAL", false) +
                         m_wallet->balance(0, "SAL1", false);
         m_last_known_ingest_balance = balance_after;
       } else {
+        if (deferred_state_changed) {
+          mark_derived_state_dirty();
+        }
         // Deferred mode: skip the heavy derived-state passes (the JS side
         // must call flush_derived_state() before any external read), but keep
         // the ONE insertion-critical contribution rebuild_wallet_derived_state
@@ -11338,25 +11542,27 @@ public:
         // that belong to one of our own confirmed (outgoing) txs. PROTOCOL/
         // RETURN ownership detection in a LATER ingest call looks the payout
         // output key up in m_salvium_txs, so this must stay fresh per call.
-        for (size_t seed_idx = wallet_tx_count;
-             seed_idx < m_wallet->m_transfers.size(); ++seed_idx) {
-          const auto &seed_td = m_wallet->m_transfers[seed_idx];
-          const auto seed_confirmed_it =
-              m_wallet->m_confirmed_txs.find(seed_td.m_txid);
-          if (seed_confirmed_it == m_wallet->m_confirmed_txs.end()) {
-            continue;
-          }
-          if (seed_td.m_subaddr_index.major ==
-              seed_confirmed_it->second.m_subaddr_account) {
-            {
-              crypto::public_key seed_pk;
-              if (safe_output_pubkey(seed_td, seed_pk))
-                m_wallet->m_salvium_txs[seed_pk] = seed_idx;
+        if (deferred_state_changed) {
+          for (size_t seed_idx = wallet_tx_count;
+               seed_idx < m_wallet->m_transfers.size(); ++seed_idx) {
+            const auto &seed_td = m_wallet->m_transfers[seed_idx];
+            const auto seed_confirmed_it =
+                m_wallet->m_confirmed_txs.find(seed_td.m_txid);
+            if (seed_confirmed_it == m_wallet->m_confirmed_txs.end()) {
+              continue;
+            }
+            if (seed_td.m_subaddr_index.major ==
+                seed_confirmed_it->second.m_subaddr_account) {
+              {
+                crypto::public_key seed_pk;
+                if (safe_output_pubkey(seed_td, seed_pk))
+                  m_wallet->m_salvium_txs[seed_pk] = seed_idx;
+              }
             }
           }
-        }
 
-        m_wallet->invalidate_effective_ki_cache();
+          m_wallet->invalidate_effective_ki_cache();
+        }
         balance_after = m_last_known_ingest_balance;
       }
 
@@ -11404,6 +11610,9 @@ public:
           << "\"txs_reprocessed\":" << txs_reprocessed << ","
           << "\"duplicate_transfer_repairs\":" << duplicate_transfer_repairs << ","
           << "\"repaired_transfer_asset_types\":" << repaired_transfer_asset_types << ","
+          << "\"audit_spend_key_additions\":" << audit_spend_key_additions << ","
+          << "\"audit_return_address_additions\":" << audit_return_address_additions << ","
+          << "\"stake_return_address_additions\":" << stake_return_address_additions << ","
           << "\"create_token_return_backfills\":"
           << create_token_return_backfills << ","
           << "\"create_token_return_addresses\":"
@@ -11426,6 +11635,10 @@ public:
                   : "-" + std::to_string(balance_before - balance_after))
           << "\","
           << (defer_derived_rebuild ? "\"deferred\":true," : "")
+          << (defer_derived_rebuild
+                  ? (std::string("\"deferred_state_changed\":") +
+                     (deferred_state_changed ? "true," : "false,"))
+                  : "")
           << "\"m_key_images_size\":" << m_wallet->m_key_images.size() << ","
           << "\"m_transfers_size\":" << m_wallet->m_transfers.size() << ","
           << "\"wallet_subaddr_map\":" << wallet_subaddr_map_size << ","
@@ -11832,6 +12045,11 @@ public:
       // Mirror the non-deferred cache_runtime/import tails: re-sync the
       // account's cached maps from the wallet-side maps BEFORE the derived
       // passes (byte-equivalence rig caveat fix).
+      size_t spent_repairs = 0;
+      if (m_deferred_spent_repair_needed) {
+        spent_repairs = repair_spent_transfers_from_wallet_txs();
+        m_deferred_spent_repair_needed = false;
+      }
       reconcile_unconfirmed_txs();
       restore_account_cached_maps();
       const size_t repaired_asset_types =
@@ -11839,6 +12057,7 @@ public:
       rebuild_wallet_derived_state();
       upgrade_return_metadata_maps_if_needed();
       repair_return_output_metadata_from_transfers();
+      mark_derived_state_clean();
 
       const uint64_t balance_total = m_wallet->balance(0, "SAL", false) +
                                      m_wallet->balance(0, "SAL1", false);
@@ -11846,6 +12065,7 @@ public:
 
       std::ostringstream oss;
       oss << "{\"success\":true,\"dup_repairs\":" << dup_repairs
+          << ",\"spent_repairs\":" << spent_repairs
           << ",\"repaired_asset_types\":" << repaired_asset_types
           << ",\"balance_total\":\"" << balance_total << "\""
           << ",\"m_transfers_size\":" << m_wallet->m_transfers.size()
