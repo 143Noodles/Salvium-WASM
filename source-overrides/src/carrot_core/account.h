@@ -1,0 +1,406 @@
+// Copyright (c) 2025, The Monero Project
+// 
+// All rights reserved.
+// 
+// Redistribution and use in source and binary forms, with or without modification, are
+// permitted provided that the following conditions are met:
+// 
+// 1. Redistributions of source code must retain the above copyright notice, this list of
+//    conditions and the following disclaimer.
+// 
+// 2. Redistributions in binary form must reproduce the above copyright notice, this list
+//    of conditions and the following disclaimer in the documentation and/or other
+//    materials provided with the distribution.
+// 
+// 3. Neither the name of the copyright holder nor the names of its contributors may be
+//    used to endorse or promote products derived from this software without specific
+//    prior written permission.
+// 
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY
+// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+// MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
+// THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+// STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
+// THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#pragma once
+
+#include <atomic>
+#include <mutex>
+#include "account_secrets.h"
+#include "address_utils.h"
+#include "destination.h"
+#include "device_ram_borrowed.h"
+#include "enote_utils.h"
+#include "carrot_impl/subaddress_index.h"
+#include "cryptonote_basic/account.h"
+#include "cryptonote_basic/subaddress_index.h"
+
+//----------------------------------------------------------------------------------------------------------------------
+static constexpr std::uint32_t MAX_SUBADDRESS_MAJOR_INDEX = 5;
+static constexpr std::uint32_t MAX_SUBADDRESS_MINOR_INDEX = 20;
+
+namespace carrot
+{
+    struct return_scan_hint_t {
+        input_context_t input_context;
+        crypto::public_key K_o; // original output onetime address
+        crypto::public_key K_r; // expected return onetime address
+        cryptonote::transaction_type origin_tx_type;
+        crypto::public_key origin_tx_pub_key;
+        uint64_t origin_output_index;
+
+        return_scan_hint_t()
+            : input_context(),
+              K_o(),
+              K_r(),
+              origin_tx_type(cryptonote::transaction_type::UNSET),
+              origin_tx_pub_key(),
+              origin_output_index(0) {}
+
+        return_scan_hint_t(
+            const input_context_t &input_context,
+            const crypto::public_key &K_o,
+            const crypto::public_key &K_r,
+            const cryptonote::transaction_type origin_tx_type,
+            const crypto::public_key &origin_tx_pub_key,
+            const uint64_t origin_output_index)
+            : input_context(input_context),
+              K_o(K_o),
+              K_r(K_r),
+              origin_tx_type(origin_tx_type),
+              origin_tx_pub_key(origin_tx_pub_key),
+              origin_output_index(origin_output_index) {}
+
+        BEGIN_SERIALIZE_OBJECT()
+            FIELD(input_context)
+            FIELD(K_o)
+            FIELD(K_r)
+            VARINT_FIELD(origin_tx_type)
+            FIELD(origin_tx_pub_key)
+            VARINT_FIELD(origin_output_index)
+        END_SERIALIZE()
+    };
+
+    struct return_spend_metadata_t {
+        crypto::public_key K_r; // returned output onetime address
+        crypto::public_key K_spend_pubkey; // canonical destination spend pubkey
+        crypto::key_image key_image;
+        crypto::secret_key sum_g;
+        crypto::secret_key sender_extension_t;
+
+        return_spend_metadata_t()
+            : K_r(), K_spend_pubkey(), key_image(), sum_g(), sender_extension_t() {}
+
+        return_spend_metadata_t(
+            const crypto::public_key &K_r,
+            const crypto::public_key &K_spend_pubkey,
+            const crypto::key_image &key_image,
+            const crypto::secret_key &sum_g,
+            const crypto::secret_key &sender_extension_t)
+            : K_r(K_r),
+              K_spend_pubkey(K_spend_pubkey),
+              key_image(key_image),
+              sum_g(sum_g),
+              sender_extension_t(sender_extension_t) {}
+
+        BEGIN_SERIALIZE_OBJECT()
+            FIELD(K_r)
+            FIELD(K_spend_pubkey)
+            FIELD(key_image)
+            FIELD(sum_g)
+            FIELD(sender_extension_t)
+        END_SERIALIZE()
+    };
+
+    struct return_output_info_t {
+        input_context_t input_context;
+        crypto::public_key K_o; // output onetime address
+        crypto::public_key K_change; // change output onetime address
+        crypto::public_key K_spend_pubkey; // change output spend pubkey
+        crypto::key_image key_image;
+        crypto::secret_key sum_g;
+        crypto::secret_key sender_extension_t;
+
+        return_output_info_t() {
+            // Default constructor for serialization
+            input_context = input_context_t();
+            K_o = crypto::public_key();
+            K_change = crypto::public_key();
+            K_spend_pubkey = crypto::public_key();
+            key_image = crypto::key_image();
+            sum_g = crypto::secret_key();
+            sender_extension_t = crypto::secret_key();
+        }
+
+        return_output_info_t(
+            const input_context_t &input_context,
+            const crypto::public_key &K_o,
+            const crypto::public_key &K_change,
+            const crypto::public_key &K_spend_pubkey,
+            const crypto::key_image &key_image,
+            const crypto::secret_key &sum_g,
+            const crypto::secret_key &sender_extension_t):
+            input_context(input_context),
+            K_o(K_o),
+            K_change(K_change),
+            K_spend_pubkey(K_spend_pubkey),
+            key_image(key_image),
+            sum_g(sum_g),
+            sender_extension_t(sender_extension_t) {}
+
+        BEGIN_SERIALIZE_OBJECT()
+            FIELD(input_context)
+            FIELD(K_o)
+            FIELD(K_change)
+            FIELD(K_spend_pubkey)
+            FIELD(key_image)
+            FIELD(sum_g)
+            FIELD(sender_extension_t)
+        END_SERIALIZE()
+    };
+
+    inline bool is_return_spend_metadata_complete(const return_output_info_t &roi) {
+        return roi.K_spend_pubkey != crypto::null_pkey &&
+               roi.sum_g != crypto::null_skey &&
+               roi.sender_extension_t != crypto::null_skey;
+    }
+
+    inline bool is_return_spend_metadata_complete(
+        const return_spend_metadata_t &metadata) {
+        return metadata.K_spend_pubkey != crypto::null_pkey &&
+               metadata.sum_g != crypto::null_skey &&
+               metadata.sender_extension_t != crypto::null_skey;
+    }
+
+    inline bool is_return_spend_metadata_semantically_valid(
+        const return_spend_metadata_t &metadata,
+        const crypto::public_key &return_key,
+        const return_scan_hint_t *scan_hint = nullptr) {
+        return is_return_spend_metadata_complete(metadata) &&
+               metadata.K_spend_pubkey != return_key &&
+               (!scan_hint || metadata.K_spend_pubkey != scan_hint->K_o);
+    }
+
+    inline bool is_return_output_placeholder_hint(const return_output_info_t &roi) {
+        return !is_return_spend_metadata_complete(roi) &&
+               roi.K_o != crypto::null_pkey &&
+               roi.K_change == roi.K_o;
+    }
+
+    // Old return_output_info_t format (for deserializing version 2 wallet caches)
+    struct return_output_info_retired_t {
+        input_context_t input_context;
+        crypto::public_key K_o;
+        crypto::public_key K_change;
+        crypto::key_image key_image;
+        crypto::secret_key x;
+        crypto::secret_key y;
+
+        return_output_info_retired_t() {
+            input_context = input_context_t();
+            K_o = crypto::public_key();
+            K_change = crypto::public_key();
+            key_image = crypto::key_image();
+            x = crypto::secret_key();
+            y = crypto::secret_key();
+        }
+
+        BEGIN_SERIALIZE_OBJECT()
+            FIELD(input_context)
+            FIELD(K_o)
+            FIELD(K_change)
+            FIELD(key_image)
+            FIELD(x)
+            FIELD(y)
+        END_SERIALIZE()
+    };
+
+
+  class carrot_and_legacy_account : public cryptonote::account_base
+  {
+    public:
+    view_incoming_key_ram_borrowed_device k_view_incoming_dev;
+    view_balance_secret_ram_borrowed_device s_view_balance_dev;
+    generate_address_secret_ram_borrowed_device s_generate_address_dev;
+
+    AddressDeriveType default_derive_type;
+
+    carrot_and_legacy_account(): k_view_incoming_dev(get_keys().k_view_incoming),
+        s_view_balance_dev(get_keys().s_view_balance),
+        s_generate_address_dev(get_keys().s_generate_address)
+    {}
+
+    void set_keys(const cryptonote::account_keys& keys, bool copy_spend_secret_keys);
+
+    carrot_and_legacy_account(const carrot_and_legacy_account &k) = delete;
+    carrot_and_legacy_account(carrot_and_legacy_account&&) = delete;
+
+    carrot_and_legacy_account& operator=(const carrot_and_legacy_account&) = delete;
+    carrot_and_legacy_account& operator=(carrot_and_legacy_account&&) = delete;
+
+    CarrotDestinationV1 cryptonote_address(const payment_id_t payment_id = null_payment_id,
+        const AddressDeriveType derive_type = AddressDeriveType::Auto) const;
+
+    CarrotDestinationV1 subaddress(const subaddress_index_extended &subaddress_index) const;
+
+    const std::unordered_map<crypto::public_key, cryptonote::subaddress_index>& get_subaddress_map_cn() const;
+    const std::unordered_map<crypto::public_key, subaddress_index_extended>& get_subaddress_map_ref() const;
+    const std::unordered_map<crypto::public_key, return_output_info_t>& get_return_output_map_ref() const;
+    const std::unordered_map<crypto::public_key, return_scan_hint_t>& get_return_scan_hint_map_ref() const;
+    const std::unordered_map<crypto::public_key, return_spend_metadata_t>& get_return_spend_metadata_map_ref() const;
+
+    // brief: opening_for_subaddress - return (k^g_a, k^t_a) for j s.t. K^j_s = (k^g_a * G + k^t_a * T)
+    void opening_for_subaddress(const subaddress_index_extended &subaddress_index,
+        crypto::secret_key &address_privkey_g_out,
+        crypto::secret_key &address_privkey_t_out,
+        crypto::public_key &address_spend_pubkey_out) const;
+
+    bool try_searching_for_opening_for_subaddress(const crypto::public_key &address_spend_pubkey,
+        crypto::secret_key &address_privkey_g_out,
+        crypto::secret_key &address_privkey_t_out) const;
+
+    bool try_searching_for_opening_for_onetime_address(const crypto::public_key &address_spend_pubkey,
+        const crypto::secret_key &sender_extension_g,
+        const crypto::secret_key &sender_extension_t,
+        crypto::secret_key &x_out,
+        crypto::secret_key &y_out) const;
+
+    bool can_open_fcmp_onetime_address(const crypto::public_key &address_spend_pubkey,
+        const crypto::secret_key &sender_extension_g,
+        const crypto::secret_key &sender_extension_t,
+        const crypto::public_key &onetime_address) const;
+
+    crypto::key_image derive_key_image(const crypto::public_key &address_spend_pubkey,
+        const crypto::secret_key &sender_extension_g,
+        const crypto::secret_key &sender_extension_t,
+        const crypto::public_key &onetime_address) const;
+
+    crypto::key_image derive_key_image_view_only(const crypto::public_key &address_spend_pubkey,
+        const crypto::secret_key &sender_extension_g,
+        const crypto::secret_key &sender_extension_t,
+        const crypto::public_key &onetime_address) const;
+
+    void generate_subaddress_map(const std::pair<size_t, size_t>& lookahead_size);
+
+    crypto::secret_key generate(
+        const crypto::secret_key& recovery_key = crypto::secret_key(),
+        bool recover = false,
+        bool two_random = false,
+        const AddressDeriveType default_derive_type = AddressDeriveType::Carrot
+    );
+
+    void create_from_svb_key(const cryptonote::account_public_address& address, const crypto::secret_key& svb_key);
+    void set_carrot_keys(const AddressDeriveType default_derive_type = AddressDeriveType::Carrot);
+    void insert_subaddresses(const std::unordered_map<crypto::public_key, subaddress_index_extended>& subaddress_map);
+    void insert_return_output_info(
+        const std::unordered_map<crypto::public_key, return_output_info_t>& input_context_map
+    );
+    void insert_return_scan_hints(
+        const std::unordered_map<crypto::public_key, return_scan_hint_t>& scan_hint_map
+    );
+    void insert_return_spend_metadata(
+        const std::unordered_map<crypto::public_key, return_spend_metadata_t>& spend_metadata_map
+    );
+
+    AddressDeriveType resolve_derive_type(const AddressDeriveType derive_type) const;
+
+    private:
+        std::unordered_map<crypto::public_key, subaddress_index_extended> subaddress_map;
+        // memoized cn view, mutex guards the build since the scan path threads a shared account
+        mutable std::unordered_map<crypto::public_key, cryptonote::subaddress_index> subaddress_map_cn_cache;
+        mutable std::atomic<bool> subaddress_map_cn_dirty{true};
+        mutable std::mutex subaddress_map_cn_mutex;
+        // Kr -> return_output_info
+        std::unordered_map<crypto::public_key, return_output_info_t> return_output_map;
+        std::unordered_map<crypto::public_key, return_scan_hint_t> return_scan_hint_map;
+        std::unordered_map<crypto::public_key, return_spend_metadata_t> return_spend_metadata_map;
+  };
+}
+
+namespace boost
+{
+    namespace serialization
+    {
+        template <class Archive>
+        inline typename std::enable_if<!Archive::is_loading::value, void>::type initialize_transfer_details(Archive &a, carrot::return_scan_hint_t &x, const boost::serialization::version_type ver)
+        {
+        }
+        template <class Archive>
+        inline typename std::enable_if<Archive::is_loading::value, void>::type initialize_transfer_details(Archive &a, carrot::return_scan_hint_t &x, const boost::serialization::version_type ver)
+        {
+            x.input_context = carrot::input_context_t();
+            x.K_o = crypto::public_key();
+            x.K_r = crypto::public_key();
+            x.origin_tx_type = cryptonote::transaction_type::UNSET;
+            x.origin_tx_pub_key = crypto::public_key();
+            x.origin_output_index = 0;
+        }
+
+        template <class Archive>
+        inline void serialize(Archive &a, carrot::return_scan_hint_t &x, const boost::serialization::version_type ver)
+        {
+            a & x.input_context;
+            a & x.K_o;
+            a & x.K_r;
+            a & x.origin_tx_type;
+            a & x.origin_tx_pub_key;
+            a & x.origin_output_index;
+        }
+
+        template <class Archive>
+        inline typename std::enable_if<!Archive::is_loading::value, void>::type initialize_transfer_details(Archive &a, carrot::return_spend_metadata_t &x, const boost::serialization::version_type ver)
+        {
+        }
+        template <class Archive>
+        inline typename std::enable_if<Archive::is_loading::value, void>::type initialize_transfer_details(Archive &a, carrot::return_spend_metadata_t &x, const boost::serialization::version_type ver)
+        {
+            x.K_r = crypto::public_key();
+            x.K_spend_pubkey = crypto::public_key();
+            x.key_image = crypto::key_image();
+            x.sum_g = crypto::secret_key();
+            x.sender_extension_t = crypto::secret_key();
+        }
+
+        template <class Archive>
+        inline void serialize(Archive &a, carrot::return_spend_metadata_t &x, const boost::serialization::version_type ver)
+        {
+            a & x.K_r;
+            a & x.K_spend_pubkey;
+            a & x.key_image;
+            a & x.sum_g;
+            a & x.sender_extension_t;
+        }
+
+        template <class Archive>
+        inline typename std::enable_if<!Archive::is_loading::value, void>::type initialize_transfer_details(Archive &a, carrot::return_output_info_t &x, const boost::serialization::version_type ver)
+        {
+        }
+        template <class Archive>
+        inline typename std::enable_if<Archive::is_loading::value, void>::type initialize_transfer_details(Archive &a, carrot::return_output_info_t &x, const boost::serialization::version_type ver)
+        {
+            x.input_context = carrot::input_context_t();
+            x.K_o = crypto::public_key();
+            x.K_change = crypto::public_key();
+            x.K_spend_pubkey = crypto::public_key();
+            x.key_image = crypto::key_image();
+            x.sum_g = crypto::secret_key();
+            x.sender_extension_t = crypto::secret_key();
+        }
+
+        template <class Archive>
+        inline void serialize(Archive &a, carrot::return_output_info_t &x, const boost::serialization::version_type ver)
+        {
+            a & x.input_context;
+            a & x.K_o;
+            a & x.K_change;
+            a & x.K_spend_pubkey;
+            a & x.key_image;
+            a & x.sum_g;
+            a & x.sender_extension_t;
+        }
+    }
+}

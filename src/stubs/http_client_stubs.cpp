@@ -2,6 +2,7 @@
 #include "net/http.h"
 #include "net/http_client.h"
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -103,8 +104,27 @@ static std::string parse_epee_string_field(const std::string &body,
 }
 
 static std::string normalize_distribution_asset_type(std::string asset_type) {
-  if (asset_type.empty())
+  asset_type.erase(
+      std::remove_if(asset_type.begin(), asset_type.end(),
+                     [](unsigned char ch) { return ch == '\0'; }),
+      asset_type.end());
+  while (!asset_type.empty() &&
+         std::isspace(static_cast<unsigned char>(asset_type.front())))
+    asset_type.erase(asset_type.begin());
+  while (!asset_type.empty() &&
+         std::isspace(static_cast<unsigned char>(asset_type.back())))
+    asset_type.pop_back();
+
+  std::string upper;
+  upper.reserve(asset_type.size());
+  for (char ch : asset_type)
+    upper.push_back(
+        static_cast<char>(std::toupper(static_cast<unsigned char>(ch))));
+
+  if (upper.empty())
     return "SAL1";
+  if (upper == "SAL" || upper == "SAL1")
+    return upper;
   return asset_type;
 }
 
@@ -121,7 +141,7 @@ struct WasmHttpResponseCache {
 
   static std::string make_output_key(const std::string &asset_type,
                                      uint64_t index) {
-    return asset_type + ":" + std::to_string(index);
+    return normalize_distribution_asset_type(asset_type) + ":" + std::to_string(index);
   }
 
   std::vector<std::string> pending_get_outs_requests;
@@ -305,10 +325,6 @@ public:
       if (requested_asset_type == "SAL1" || requested_asset_type == "SAL") {
         auto base_it =
             cache.output_distribution_binary_responses.find(requested_asset_type);
-        if (base_it == cache.output_distribution_binary_responses.end()) {
-          base_it = cache.output_distribution_binary_responses.find(
-              requested_asset_type == "SAL1" ? "SAL" : "SAL1");
-        }
         if (base_it != cache.output_distribution_binary_responses.end()) {
           fprintf(stderr,
                   "[WASM HTTP] CACHE HIT (output distribution asset=%s): '%s'\n",
@@ -507,7 +523,8 @@ public:
                 "(found %zu/%zu)...\n",
                 found_count, requested_indices.size());
 
-        cryptonote::COMMAND_RPC_GET_OUTPUTS_BIN::response resp;
+        cryptonote::COMMAND_RPC_GET_OUTPUTS_BIN::response resp =
+            AUTO_VAL_INIT(resp);
         resp.status = "OK";
         resp.untrusted = false;
 
@@ -515,7 +532,8 @@ public:
           std::string cache_key =
               WasmHttpResponseCache::make_output_key(asset_type, idx);
           const auto &cached = cache.output_cache[cache_key];
-          cryptonote::COMMAND_RPC_GET_OUTPUTS_BIN::outkey out;
+          cryptonote::COMMAND_RPC_GET_OUTPUTS_BIN::outkey out =
+              AUTO_VAL_INIT(out);
 
           if (cached.key.size() == 32)
             memcpy(&out.key, cached.key.data(), 32);
@@ -527,6 +545,7 @@ public:
             memcpy(&out.txid, cached.txid.data(), 32);
 
           out.output_id = cached.output_id;
+          out.key_provided = false;
 
           resp.outs.push_back(out);
         }
@@ -601,7 +620,8 @@ public:
                   "with cached outputs (have %zu cached)\n",
                   missing_indices.size(), cache.output_cache.size());
 
-          cryptonote::COMMAND_RPC_GET_OUTPUTS_BIN::response resp;
+          cryptonote::COMMAND_RPC_GET_OUTPUTS_BIN::response resp =
+              AUTO_VAL_INIT(resp);
           resp.status = "OK";
           resp.untrusted = false;
 
@@ -629,7 +649,8 @@ public:
               }
             }
 
-            cryptonote::COMMAND_RPC_GET_OUTPUTS_BIN::outkey out;
+            cryptonote::COMMAND_RPC_GET_OUTPUTS_BIN::outkey out =
+                AUTO_VAL_INIT(out);
             if (entry_data.key.size() == 32)
               memcpy(&out.key, entry_data.key.data(), 32);
             if (entry_data.mask.size() == 32)
@@ -638,6 +659,8 @@ public:
             out.height = entry_data.height;
             if (entry_data.txid.size() == 32)
               memcpy(&out.txid, entry_data.txid.data(), 32);
+            out.output_id = entry_data.output_id;
+            out.key_provided = false;
 
             resp.outs.push_back(out);
           }
@@ -825,7 +848,6 @@ void wasm_http_inject_binary_response(const char *path, const char *data,
     cache.output_distribution_binary_response = response;
     cache.has_output_distribution_binary_response = true;
     cache.output_distribution_binary_responses["SAL1"] = response;
-    cache.output_distribution_binary_responses["SAL"] = response;
     ++s_output_distribution_epoch;
     fprintf(stderr,
             "[WASM HTTP] Cached base output distribution binary response "
@@ -849,9 +871,8 @@ void wasm_http_inject_output_distribution_response(const char *asset_type,
   std::string response(data, data_len);
   cache.output_distribution_binary_responses[normalized] = response;
   ++s_output_distribution_epoch;
-  if (normalized == "SAL1" || normalized == "SAL") {
+  if (normalized == "SAL1") {
     cache.output_distribution_binary_responses["SAL1"] = response;
-    cache.output_distribution_binary_responses["SAL"] = response;
     cache.output_distribution_binary_response = response;
     cache.has_output_distribution_binary_response = true;
   }
@@ -976,10 +997,16 @@ void wasm_http_add_output_to_cache(const char *asset_type, uint64_t cache_index,
   entry.output_id =
       output_id;
 
+  const std::string raw_asset_type = asset_type ? asset_type : "SAL1";
   std::string composite_key =
       epee::net_utils::http::WasmHttpResponseCache::make_output_key(
-          asset_type ? asset_type : "SAL1", cache_index);
+          raw_asset_type, cache_index);
   cache.output_cache[composite_key] = entry;
+
+  const std::string normalized_asset_type =
+      epee::net_utils::http::normalize_distribution_asset_type(raw_asset_type);
+  cache.output_cache[normalized_asset_type + ":" + std::to_string(cache_index)] =
+      entry;
 }
 
 size_t wasm_http_get_cached_output_count() {

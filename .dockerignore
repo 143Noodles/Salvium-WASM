@@ -1,8 +1,26 @@
 temp_check/
 output/
+output-*/
 *.txt
 *.json
 *.cjs
 *.ps1
 build_*.txt
 *.log
+
+# Local upstream source dumps never belong in the build context. The reviewed
+# production files under source-overrides/ remain included.
+salvium-repo/
+
+# Local diagnostics and iterative build helpers.
+WASM_FIX_BRIEF.md
+build-allassets.sh
+build-getoutsfix*.sh
+build-iter.sh
+build-poison.sh
+build-tokenpoison.sh
+clean_scoped.py
+daemon_getouts_raw.cpp
+patch_*.py
+strip_phase.py
+*.before-*

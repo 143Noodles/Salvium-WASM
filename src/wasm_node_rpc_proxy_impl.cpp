@@ -286,9 +286,7 @@ void NodeRPCProxy::inject_hard_forks(
 
   // Also populate the earliest_height array
   for (const auto &hf : hard_forks) {
-    if (hf.first < 256) {
-      m_earliest_height[hf.first] = hf.second;
-    }
+    m_earliest_height[hf.first] = hf.second;
   }
 }
 
@@ -336,9 +334,7 @@ void NodeRPCProxy::set_cached_fee_estimate(uint64_t fee,
 void NodeRPCProxy::set_cached_hardfork_info(uint8_t version,
                                             uint64_t earliest_height) {
   std::lock_guard<std::recursive_mutex> lock(m_daemon_rpc_mutex);
-  if (version < 256) {
-    m_earliest_height[version] = earliest_height;
-  }
+  m_earliest_height[version] = earliest_height;
   // Also add to daemon_hard_forks list
   bool found = false;
   for (auto &hf : m_daemon_hard_forks) {

@@ -1,14 +1,14 @@
 # ============================================================================
 # Dockerfile - SALVIUM WALLET WASM BUILD (Consolidated)
 # ============================================================================
-# This is a consolidated version of the layered build:
-#   Dockerfile.base-deps -> Dockerfile.base -> Dockerfile.debug
-#
 # Build: docker build -t salvium-wasm .
 # Extract: docker cp $(docker create salvium-wasm):/workspace/build/SalviumWallet.js .
 # ============================================================================
 
-FROM emscripten/emsdk:3.1.50
+FROM emscripten/emsdk:3.1.50@sha256:b6ea0e55fdc95be36427df6df7892d5e5e27f0440cfcf442a55f784aba09a4fa
+
+ARG SALVIUM_SOURCE_COMMIT=162347f3def9317aab4a61bc8cbaae16623069fd
+ARG WASM_FEATURE_FLAGS="-mbulk-memory -msimd128"
 
 LABEL maintainer="Salvium Wallet WASM Port"
 LABEL description="Consolidated WASM build"
@@ -22,6 +22,7 @@ WORKDIR /workspace
 # LIBSODIUM 1.0.19
 # ============================================================================
 RUN wget -q https://download.libsodium.org/libsodium/releases/libsodium-1.0.19-stable.tar.gz \
+    && echo "8f67bc4ed5401e8924203e3ce13f03e5a9faa591f026c41c3ed0dadc196f033e  libsodium-1.0.19-stable.tar.gz" | sha256sum -c - \
     && tar -xzf libsodium-1.0.19-stable.tar.gz && rm libsodium-1.0.19-stable.tar.gz
 
 RUN cd libsodium-stable \
@@ -35,6 +36,7 @@ RUN cd libsodium-stable \
 # OPENSSL 3.0.12 - NO THREAD ATOMICS
 # ============================================================================
 RUN wget -q https://www.openssl.org/source/openssl-3.0.12.tar.gz \
+    && echo "f93c9e8edde5e9166119de31755fc87b4aa34863662f67ddfcba14d0b6b69b61  openssl-3.0.12.tar.gz" | sha256sum -c - \
     && tar -xzf openssl-3.0.12.tar.gz && rm openssl-3.0.12.tar.gz
 
 RUN cd openssl-3.0.12 \
@@ -51,7 +53,7 @@ RUN cd openssl-3.0.12 \
         CXX="/emsdk/upstream/emscripten/em++" \
         AR="/emsdk/upstream/emscripten/emar" \
         RANLIB="/emsdk/upstream/emscripten/emranlib" \
-        CFLAGS="-mbulk-memory -mno-atomics -O2" \
+        CFLAGS="${WASM_FEATURE_FLAGS} -mno-atomics -O2" \
     && (make build_generated || make build_generated) \
     && make -j4 libcrypto.a libssl.a \
     && mkdir -p /opt/openssl/lib /opt/openssl/include \
@@ -63,6 +65,7 @@ RUN cd openssl-3.0.12 \
 # ============================================================================
 RUN (wget -q https://archives.boost.io/release/1.83.0/source/boost_1_83_0.tar.gz \
         || wget -q https://sourceforge.net/projects/boost/files/boost/1.83.0/boost_1_83_0.tar.gz/download -O boost_1_83_0.tar.gz) \
+    && echo "c0685b68dd44cc46574cce86c4e17c0f611b15e195be9848dfd0769a0a207628  boost_1_83_0.tar.gz" | sha256sum -c - \
     && tar -xzf boost_1_83_0.tar.gz && rm boost_1_83_0.tar.gz
 
 RUN cd boost_1_83_0 \
@@ -83,14 +86,15 @@ RUN cd boost_1_83_0 \
         -j4 install
 
 # ============================================================================
-# CLONE SALVIUM SOURCE
+# CLONE PINNED SALVIUM SOURCE
 # ============================================================================
-COPY patches/ /workspace/patches/
-RUN git clone --depth 1 --recurse-submodules https://github.com/salvium/salvium.git /workspace/salvium \
+RUN git init /workspace/salvium \
     && cd /workspace/salvium \
-    && check_patch() { if [ -f "$1" ]; then git apply "$1" || echo "Failed to apply $1"; else echo "Patch $1 not found"; fi; } \
-    && echo "Applying v5.41.0 fix..." \
-    && check_patch /workspace/patches/v5.41.0-fix-get-sources-index-oob.patch
+    && git remote add origin https://github.com/salvium/salvium.git \
+    && git fetch --depth 1 origin "${SALVIUM_SOURCE_COMMIT}" \
+    && git checkout --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "${SALVIUM_SOURCE_COMMIT}" \
+    && git submodule update --init --recursive --depth 1
 
 # ============================================================================
 # PATCH: Fix abstract_http_client.h
@@ -105,14 +109,14 @@ RUN echo "=== Patching abstract_http_client.h for typeinfo emission ===" \
 COPY src/ /workspace/src/
 
 # ============================================================================
-# COPY LOCAL SALVIUM-REPO FILES (full 1.1 source + local patches)
+# APPLY REVIEWED DOWNSTREAM SOURCE OVERRIDES
 # ============================================================================
-COPY salvium-repo/src/ /workspace/salvium/src/
+COPY source-overrides/src/ /workspace/salvium/src/
 
 # ============================================================================
-# PATCH: Replace threadpool.h with shadow header (no boost::thread)
+# PATCH: Replace threadpool with its WASM-safe implementation
 # ============================================================================
-RUN echo "=== Replacing threadpool.h with shadow header ===" \
+RUN echo "=== Replacing threadpool implementation ===" \
     && cp /workspace/src/shadow_headers/common/threadpool.h /workspace/salvium/src/common/threadpool.h
 
 # ============================================================================
@@ -134,15 +138,17 @@ ENV INCLUDE_FLAGS="-I/workspace/src/shadow_headers \
     -I/opt/openssl/include"
 
 ENV DEFINE_FLAGS="-DEMSCRIPTEN=1 -DNO_HW_DEVICE=1 -DDISABLE_TLS=1 \
+    -DDONNA64_PRODUCTION=1 \
     -DBOOST_ASIO_DISABLE_EPOLL=1 -DBOOST_ASIO_DISABLE_EVENTFD=1 \
     -DBOOST_ASIO_DISABLE_TIMERFD=1 -DBOOST_ASIO_DISABLE_KQUEUE=1 \
     -DBOOST_ASIO_DISABLE_DEV_POLL=1 -DAUTO_INITIALIZE_EASYLOGGINGPP \
-    -DELPP_NO_DEFAULT_LOG_FILE=1 -DELPP_THREAD_SAFE=1 \
+    -DELPP_NO_DEFAULT_LOG_FILE=1 \
     -Dprivate=public -Dprotected=public"
 
-ENV COMPILE_FLAGS="-std=c++17 -Oz -fPIC -mbulk-memory -msimd128 -mno-atomics -fexceptions -DNDEBUG -DBOOST_ASIO_DISABLE_THREADS"
-ENV C_COMPILE_FLAGS="-Oz -fPIC -mbulk-memory -msimd128 -mno-atomics -DNDEBUG"
-ENV CRYPTO_COMPILE_FLAGS="-O3 -fPIC -mbulk-memory -msimd128 -mno-atomics -DNDEBUG"
+ENV WASM_FEATURE_FLAGS="${WASM_FEATURE_FLAGS}"
+ENV COMPILE_FLAGS="-std=c++17 -Oz -fPIC ${WASM_FEATURE_FLAGS} -mno-atomics -fexceptions -DNDEBUG -DBOOST_ASIO_DISABLE_THREADS"
+ENV C_COMPILE_FLAGS="-Oz -fPIC ${WASM_FEATURE_FLAGS} -mno-atomics -DNDEBUG"
+ENV CRYPTO_COMPILE_FLAGS="-O3 -fPIC ${WASM_FEATURE_FLAGS} -mno-atomics -DNDEBUG"
 
 # ============================================================================
 # PATCH: boost::mutex -> std::mutex (comprehensive)
@@ -304,6 +310,8 @@ RUN echo "=== Compiling Salvium C++ source files ===" \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/ringct/bulletproofs_plus.cc -o /workspace/build/bulletproofs_plus.o \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/common/base58.cpp -o /workspace/build/base58.o \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/src/stubs/util_stub.cpp -o /workspace/build/util.o \
+    && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/src/stubs/notify_stub.cpp -o /workspace/build/notify.o \
+    && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/common/combinator.cpp -o /workspace/build/combinator.o \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/device/device.cpp -o /workspace/build/device.o \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/device/device_default.cpp -o /workspace/build/device_default.o \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/mnemonics/electrum-words.cpp -o /workspace/build/electrum_words.o
@@ -351,6 +359,8 @@ RUN echo "=== Compiling epee additional ===" \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/contrib/epee/src/file_io_utils.cpp -o /workspace/build/file_io_utils.o \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/contrib/epee/src/parserse_base_utils.cpp -o /workspace/build/parserse_base_utils.o \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/contrib/epee/src/http_base.cpp -o /workspace/build/http_base.o \
+    && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/contrib/epee/src/net_parse_helpers.cpp -o /workspace/build/net_parse_helpers.o \
+    && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/contrib/epee/src/abstract_http_client.cpp -o /workspace/build/abstract_http_client.o \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/common/perf_timer.cpp -o /workspace/build/perf_timer.o \
     && echo "=== Compiling threadpool STUB (synchronous, no pthreads) ===" \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/src/stubs/threadpool_stub.cpp -o /workspace/build/threadpool.o \
@@ -369,25 +379,21 @@ RUN echo "=== Compiling C crypto files (ref10) ===" \
     && emcc ${C_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/crypto/groestl.c -o /workspace/build/groestl.o \
     && emcc ${C_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/crypto/jh.c -o /workspace/build/jh.o \
     && emcc ${C_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/crypto/skein.c -o /workspace/build/skein.o \
+    && emcc ${C_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/crypto/hash-extra-blake.c -o /workspace/build/hash_extra_blake.o \
+    && emcc ${C_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/crypto/hash-extra-groestl.c -o /workspace/build/hash_extra_groestl.o \
+    && emcc ${C_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/crypto/hash-extra-jh.c -o /workspace/build/hash_extra_jh.o \
+    && emcc ${C_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/crypto/hash-extra-skein.c -o /workspace/build/hash_extra_skein.o \
     && emcc ${CRYPTO_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/crypto/chacha.c -o /workspace/build/chacha.o \
     && emcc ${C_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/crypto/hmac-keccak.c -o /workspace/build/hmac_keccak.o \
     && emcc ${CRYPTO_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/ringct/rctCryptoOps.c -o /workspace/build/rctCryptoOps.o
 
 RUN echo "=== Compiling misc C++ ===" \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/crypto/generators.cpp -o /workspace/build/generators.o \
-    && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/ringct/bulletproofs.cc -o /workspace/build/bulletproofs.o 2>/dev/null || true \
-    && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/ringct/multiexp.cc -o /workspace/build/multiexp.o 2>/dev/null || true
+    && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/ringct/bulletproofs.cc -o /workspace/build/bulletproofs.o \
+    && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} -c /workspace/salvium/src/ringct/multiexp.cc -o /workspace/build/multiexp.o
 
 # ============================================================================
-# FROM DOCKERFILE.DEBUG: Patch wallet2.cpp for asset_type_output_index
-# ============================================================================
-RUN echo "=== Patching wallet2.cpp for asset_type_output_index fix ===" \
-    && sed -i 's/daemon_resp.outs\[i\].output_id) == td.m_global_output_index)/daemon_resp.outs[i].output_id) == (use_global_outs ? td.m_global_output_index : td.m_asset_type_output_index))/g' \
-       /workspace/salvium/src/wallet/wallet2.cpp \
-    && echo "wallet2.cpp patched"
-
-# ============================================================================
-# FROM DOCKERFILE.DEBUG: Patch random.c for RNG state functions
+# PATCH RANDOM STATE EXPORTS
 # ============================================================================
 RUN echo "=== Patching random.c for RNG state functions ===" \
     && if ! grep -q "crypto_get_random_state" /workspace/salvium/src/crypto/random.c; then \
@@ -416,7 +422,7 @@ RUN echo "=== Patching random.c for RNG state functions ===" \
     && echo "random.c recompiled"
 
 # ============================================================================
-# FROM DOCKERFILE.DEBUG: Compile donna64
+# COMPILE DONNA64
 # ============================================================================
 RUN echo "=== Compiling donna64 optimized crypto ===" \
     && emcc ${CRYPTO_COMPILE_FLAGS} -I/workspace/src/donna64 \
@@ -425,12 +431,10 @@ RUN echo "=== Compiling donna64 optimized crypto ===" \
        -c /workspace/src/donna64/donna64_ge.c -o /workspace/build/donna64_ge.o \
     && emcc ${CRYPTO_COMPILE_FLAGS} -I/workspace/src/donna64 \
        -c /workspace/src/donna64/donna64_crypto_hook.c -o /workspace/build/donna64_crypto_hook.o \
-    && em++ ${COMPILE_FLAGS} -I/workspace/src/donna64 \
-       -c /workspace/src/donna64/donna64_embind.cpp -o /workspace/build/donna64_embind.o \
     && echo "donna64 compilation complete"
 
 # ============================================================================
-# FROM DOCKERFILE.DEBUG: Compile WASM bindings
+# COMPILE WASM BINDINGS
 # ============================================================================
 RUN echo "=== Compiling WASM bindings ===" \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
@@ -439,30 +443,30 @@ RUN echo "=== Compiling WASM bindings ===" \
        -I/workspace/src/donna64 \
        -c /workspace/src/wasm_bindings.cpp -o /workspace/build/wasm_bindings.o \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
-       -I/workspace/src/donna64 \
-       -c /workspace/src/wasm_bridge.cpp -o /workspace/build/wasm_bridge.o \
-    && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
        -c /workspace/src/stubs/http_client_stubs.cpp -o /workspace/build/http_client_stubs.o \
-    && emcc ${C_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
-       -c /workspace/src/stubs/cn_slow_hash_stub.c -o /workspace/build/cn_slow_hash_stub.o \
+    && emcc ${CRYPTO_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
+       -DFORCE_USE_HEAP \
+       -c /workspace/salvium/src/crypto/slow-hash.c -o /workspace/build/slow_hash.o \
+    && emcc ${CRYPTO_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
+       -c /workspace/salvium/src/crypto/aesb.c -o /workspace/build/aesb.o \
+    && emcc ${CRYPTO_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
+       -c /workspace/salvium/src/crypto/oaes_lib.c -o /workspace/build/oaes_lib.o \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
        -c /workspace/src/stubs/wallet2_stubs.cpp -o /workspace/build/wallet2_stubs.o \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
+       -c /workspace/salvium/src/hardforks/hardforks.cpp -o /workspace/build/hardforks.o \
+    && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
        -c /workspace/src/stubs/miner_stub.cpp -o /workspace/build/miner_stub.o \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
-       -c /workspace/src/missing_symbol_stubs.cpp -o /workspace/build/missing_symbol_stubs.o \
+       -c /workspace/salvium/src/cryptonote_core/tx_sanity_check.cpp -o /workspace/build/tx_sanity_check.o \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
-       -c /workspace/salvium/src/wallet/wallet_rpc_payments.cpp -o /workspace/build/wallet_rpc_payments.o \
+       -c /workspace/src/stubs/wallet_rpc_payments_stub.cpp -o /workspace/build/wallet_rpc_payments.o \
     && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
        -c /workspace/salvium/src/rpc/rpc_payment_signature.cpp -o /workspace/build/rpc_payment_signature.o \
-    && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
-       -c /workspace/salvium/src/wallet/wallet2.cpp -o /workspace/build/wallet2.o \
-    && em++ ${COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
-       -c /workspace/salvium/src/wallet/tx_builder.cpp -o /workspace/build/tx_builder.o \
     && echo "WASM bindings compiled"
 
 # ============================================================================
-# FROM DOCKERFILE.DEBUG: Compile mx25519
+# COMPILE MX25519
 # ============================================================================
 RUN echo "=== Compiling mx25519 ===" \
     && emcc ${C_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
@@ -480,7 +484,7 @@ RUN echo "=== Compiling mx25519 ===" \
     && echo "mx25519 compiled"
 
 # ============================================================================
-# FROM DOCKERFILE.DEBUG: Compile aligned.c
+# COMPILE ALIGNED ALLOCATION SUPPORT
 # ============================================================================
 RUN echo "=== Compiling common/aligned.c ===" \
     && emcc ${C_COMPILE_FLAGS} ${INCLUDE_FLAGS} ${DEFINE_FLAGS} \
@@ -488,7 +492,7 @@ RUN echo "=== Compiling common/aligned.c ===" \
     && echo "aligned.c compiled"
 
 # ============================================================================
-# FROM DOCKERFILE.DEBUG: Cleanup stale objects
+# REMOVE OBJECTS THAT ARE NOT PART OF THE PRODUCTION LINK
 # ============================================================================
 RUN rm -f /workspace/build/carrot_scan_unsafe.o \
           /workspace/build/scanning_tools.o \
@@ -496,10 +500,10 @@ RUN rm -f /workspace/build/carrot_scan_unsafe.o \
     && echo "Removed stale .o files"
 
 # ============================================================================
-# FROM DOCKERFILE.DEBUG: Link final WASM output
+# LINK FINAL WASM OUTPUT
 # ============================================================================
 RUN echo "=== Linking final WASM binary ===" \
-    && em++ -O3 -mno-atomics -fexceptions \
+    && em++ -O3 ${WASM_FEATURE_FLAGS} -mno-atomics -fexceptions \
        /workspace/build/*.o \
        -L/opt/boost/lib \
        -L/opt/libsodium/lib \
@@ -520,15 +524,17 @@ RUN echo "=== Linking final WASM binary ===" \
        -s ALLOW_MEMORY_GROWTH=1 \
        -s INITIAL_MEMORY=268435456 \
        -s PROXY_TO_PTHREAD=0 \
+       -s DYNAMIC_EXECUTION=0 \
        -s MODULARIZE=1 \
        -s EXPORT_NAME="SalviumWallet" \
        -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","FS","getValue","setValue"]' \
        -s EXPORTED_FUNCTIONS='["_fast_generate_key_derivation","_fast_batch_key_derivations","_donna64_get_version","_malloc","_free"]' \
-       -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
+       -s ERROR_ON_UNDEFINED_SYMBOLS=1 \
        -s DISABLE_EXCEPTION_CATCHING=0 \
        -s ENVIRONMENT='web,worker,node' \
        -s ASSERTIONS=0 \
        -o /workspace/build/SalviumWallet.js \
+    && ! grep -Eq 'new Function|(^|[^[:alnum:]_])eval\(' /workspace/build/SalviumWallet.js \
     && echo "=== WASM build complete ==="
 
 # Verify output

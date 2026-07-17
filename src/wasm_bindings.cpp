@@ -134,22 +134,13 @@ int fast_batch_key_derivations(unsigned char *derivations_out,
                                const unsigned char *tx_pubs_in,
                                const unsigned char *view_sec_in, int count);
 
+#if !DONNA64_PRODUCTION
 int donna64_benchmark(int iterations);
+#endif
 
 int donna64_get_version(void);
 
-#undef DEBUG_LOG
-#define DEBUG_LOG(fmt, ...) printf(fmt, ##__VA_ARGS__)
-
-static std::string key_to_hex_debug(const unsigned char *key) {
-  std::ostringstream oss;
-  oss << std::hex << std::setfill('0');
-  for (size_t i = 0; i < 32; ++i) {
-    oss << std::setw(2) << (int)key[i];
-  }
-  return oss.str();
-}
-
+#if !DONNA64_PRODUCTION
 int donna64_debug_full_trace(void);
 
 int donna64_debug_get_scalar_e(int index);
@@ -176,6 +167,7 @@ int donna64_debug_get_dbl_2P(int index);
 int donna64_debug_get_dbl_4P(int index);
 int donna64_debug_get_dbl_8P(int index);
 int donna64_debug_get_dbl_16P(int index);
+#endif
 
 int donna64_ge_scalarmult(unsigned char *r, const unsigned char *p,
                           const unsigned char *scalar);
@@ -184,7 +176,7 @@ int donna64_ge_scalarmult(unsigned char *r, const unsigned char *p,
 using namespace emscripten;
 
 static const char *WASM_VERSION =
-  "5.54.10-hf14-v113c-outputproof7-encodingdispatch-20260716";
+  "5.54.11-hf14-v113c";
 
 #define WASM_DEBUG_LOGGING 0
 #if WASM_DEBUG_LOGGING
@@ -10893,7 +10885,7 @@ public:
   }
 
   inline static constexpr const char *SPARSE_GUARDRAILS_BUILD =
-      "BUILD_2026_05_30_CREATE_TOKEN_NATIVE_CACHE_REPAIR";
+      "WASM_5_54_11_V113C";
 
   std::string ingest_sparse_transactions(uintptr_t ptr, size_t size,
                                          double height_d, bool skip_prefilter,
@@ -16645,6 +16637,7 @@ std::string benchmark_key_derivation(int iterations) {
   }
 }
 
+#if !DONNA64_PRODUCTION
 std::string debug_iteration_by_iteration() {
   std::ostringstream oss;
   oss << "{";
@@ -16773,6 +16766,7 @@ std::string debug_iteration_by_iteration() {
 
   return oss.str();
 }
+#endif
 
 std::string diagnose_crypto_speed(int iterations) {
   using namespace std::chrono;
@@ -16865,6 +16859,7 @@ std::string diagnose_crypto_speed(int iterations) {
   return oss.str();
 }
 
+#if !DONNA64_PRODUCTION
 std::string donna64_direct_benchmark(int iterations) {
   using namespace std::chrono;
 
@@ -16890,6 +16885,7 @@ std::string donna64_direct_benchmark(int iterations) {
 
   return oss.str();
 }
+#endif
 
 std::string compute_view_tag(const std::string &tx_pub_key_hex,
                              int output_index,
@@ -20904,6 +20900,7 @@ std::string extract_sparse_txs(uintptr_t ptr, size_t epee_size,
   }
 }
 
+#if !DONNA64_PRODUCTION
 std::string compare_scalarmult_no_cofactor() {
   std::ostringstream oss;
   oss << "{";
@@ -21433,6 +21430,7 @@ std::string debug_iter3_substeps() {
 
   return oss.str();
 }
+#endif
 
 std::string compute_view_tag_for_output(const std::string &pubkey_hex,
                                         const std::string &view_key_hex,

@@ -1,76 +1,76 @@
-#!/bin/bash
-# ============================================================================
-# Salvium Wallet WASM Build Script (Linux/macOS)
-# ============================================================================
-# Usage:
-#   ./build.sh          - Build and extract WASM files
-#   ./build.sh --clean  - Remove existing image and rebuild from scratch
-# ============================================================================
+#!/usr/bin/env bash
 
-set -e
+set -euo pipefail
 
-IMAGE_NAME="salvium-wasm"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="$SCRIPT_DIR/output"
+IMAGE_PREFIX="salvium-wasm"
 
-# Parse arguments
-CLEAN_BUILD=false
-if [ "$1" == "--clean" ]; then
-    CLEAN_BUILD=true
+if [[ ${1:-} == "--clean" ]]; then
+    docker image rm -f \
+        "${IMAGE_PREFIX}-simd" \
+        "${IMAGE_PREFIX}-baseline" \
+        >/dev/null 2>&1 || true
+elif [[ $# -gt 0 ]]; then
+    echo "Usage: $0 [--clean]" >&2
+    exit 2
 fi
 
-echo "============================================"
-echo "Salvium Wallet WASM Production Build"
-echo "============================================"
-
-# Clean build if requested
-if [ "$CLEAN_BUILD" = true ]; then
-    echo "Cleaning previous build..."
-    docker rmi -f $IMAGE_NAME 2>/dev/null || true
-fi
-
-# Build the Docker image
-echo ""
-echo "Building Docker image (this may take 10-15 minutes on first run)..."
-echo ""
-
-docker build -t $IMAGE_NAME .
-
-if [ $? -ne 0 ]; then
-    echo ""
-    echo "ERROR: Docker build failed!"
-    exit 1
-fi
-
-# Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Extract WASM files from the image
-echo ""
-echo "Extracting WASM files to: $OUTPUT_DIR"
+build_variant() {
+    local variant="$1"
+    local feature_flags="$2"
+    local js_name="$3"
+    local wasm_name="$4"
+    local image="${IMAGE_PREFIX}-${variant}"
+    local container_id
 
-CONTAINER_ID=$(docker create $IMAGE_NAME)
-echo "Created container: $CONTAINER_ID"
+    echo "Building ${variant} wallet runtime..."
+    docker build \
+        --build-arg "WASM_FEATURE_FLAGS=${feature_flags}" \
+        --tag "$image" \
+        "$SCRIPT_DIR"
 
-docker cp "$CONTAINER_ID:/workspace/build/SalviumWallet.js" "$OUTPUT_DIR/"
-docker cp "$CONTAINER_ID:/workspace/build/SalviumWallet.wasm" "$OUTPUT_DIR/"
-docker rm $CONTAINER_ID > /dev/null
+    container_id="$(docker create "$image")"
+    trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' RETURN
+    docker cp "$container_id:/workspace/build/SalviumWallet.js" "$OUTPUT_DIR/$js_name"
+    docker cp "$container_id:/workspace/build/SalviumWallet.wasm" "$OUTPUT_DIR/$wasm_name"
+    docker rm "$container_id" >/dev/null
+    trap - RETURN
 
-# Verify files exist
-if [ ! -f "$OUTPUT_DIR/SalviumWallet.js" ] || [ ! -f "$OUTPUT_DIR/SalviumWallet.wasm" ]; then
-    echo ""
-    echo "ERROR: Failed to extract WASM files!"
-    exit 1
-fi
+    if grep -Eq 'new Function|(^|[^[:alnum:]_])eval\(' "$OUTPUT_DIR/$js_name"; then
+        echo "ERROR: $js_name contains dynamic JavaScript execution." >&2
+        exit 1
+    fi
+}
 
-# Show results
-echo ""
-echo "============================================"
-echo "BUILD COMPLETE"
-echo "============================================"
-echo ""
-echo "Output files:"
-ls -lh "$OUTPUT_DIR"/SalviumWallet.*
-echo ""
-echo "Files are in: $OUTPUT_DIR"
-echo "============================================"
+build_variant \
+    simd \
+    "-mbulk-memory -msimd128" \
+    "SalviumWallet.js" \
+    "SalviumWallet.wasm"
+
+build_variant \
+    baseline \
+    "-mno-bulk-memory -mno-simd128" \
+    "SalviumWalletBaseline.js" \
+    "SalviumWalletBaseline.wasm"
+
+(
+    cd "$OUTPUT_DIR"
+    sha256sum \
+        SalviumWallet.js \
+        SalviumWallet.wasm \
+        SalviumWalletBaseline.js \
+        SalviumWalletBaseline.wasm \
+        > SHA256SUMS
+)
+
+echo "Build complete:"
+ls -lh \
+    "$OUTPUT_DIR/SalviumWallet.js" \
+    "$OUTPUT_DIR/SalviumWallet.wasm" \
+    "$OUTPUT_DIR/SalviumWalletBaseline.js" \
+    "$OUTPUT_DIR/SalviumWalletBaseline.wasm" \
+    "$OUTPUT_DIR/SHA256SUMS"

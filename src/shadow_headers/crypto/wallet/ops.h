@@ -57,7 +57,7 @@ donna64_generate_subaddress_public_key(unsigned char *out,
  * Note: We cast char* to unsigned char* since crypto types use char[32]
  * internally.
  */
-// ENABLE global override per user demand
+// Route wallet derivation through the optimized WASM implementation.
 #define monero_crypto_generate_key_derivation(out, pub, sec)                   \
   donna64_generate_key_derivation((unsigned char *)(out),                      \
                                   (const unsigned char *)(pub),                \
