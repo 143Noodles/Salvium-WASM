@@ -1412,6 +1412,7 @@ private:
     // Zero-copy const access to the wallet-global transfer container. Indices
     // are identical to get_transfers("") (which is a straight full copy).
     const transfer_container& get_transfers_ref() const { return m_transfers; }
+    const serializable_unordered_map<crypto::key_image, size_t>& get_key_images_ref() const { return m_key_images; }
     void get_transfers_indices(std::set<size_t>& indices, const std::string& asset_type = "SAL1") const;
     void get_payments(const crypto::hash& payment_id, std::list<wallet2::payment_details>& payments, uint64_t min_height = 0, const boost::optional<uint32_t>& subaddr_account = boost::none, const std::set<uint32_t>& subaddr_indices = {}) const;
     void get_payments(std::list<std::pair<crypto::hash,wallet2::payment_details>>& payments, uint64_t min_height, uint64_t max_height = (uint64_t)-1, const boost::optional<uint32_t>& subaddr_account = boost::none, const std::set<uint32_t>& subaddr_indices = {}) const;

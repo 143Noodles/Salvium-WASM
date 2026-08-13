@@ -31,6 +31,7 @@ struct NullStream {
 #include <functional>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -102,12 +103,88 @@ static inline bool safe_output_pubkey(const tools::wallet2::transfer_details &td
   }
 }
 
+static inline bool safe_output_pubkey(
+    const tools::wallet2::transfer_details &td,
+    const tools::wallet2 &wallet,
+    crypto::public_key &out) {
+  try {
+    const cryptonote::transaction_prefix *effective_tx =
+        tools::wallet::get_effective_transfer_tx(td, wallet);
+    if (!effective_tx || td.m_internal_output_index >= effective_tx->vout.size())
+      return false;
+    return cryptonote::get_output_public_key(
+               effective_tx->vout[td.m_internal_output_index], out) &&
+           out != crypto::null_pkey;
+  } catch (...) {
+    return false;
+  }
+}
+
 // Convenience for lookups/diagnostics: null key on failure (misses maps, prints null).
 static inline crypto::public_key output_pubkey_or_null(
     const tools::wallet2::transfer_details &td) {
   crypto::public_key pk = crypto::null_pkey;
   try { pk = td.get_public_key(); } catch (...) { pk = crypto::null_pkey; }
   return pk;
+}
+
+static inline crypto::public_key output_pubkey_or_null(
+    const tools::wallet2::transfer_details &td,
+    const tools::wallet2 &wallet) {
+  crypto::public_key pk = crypto::null_pkey;
+  safe_output_pubkey(td, wallet, pk);
+  return pk;
+}
+
+// Resolve a daemon input key image against the canonical transfer view.  The
+// persisted m_key_images map is a derived cache and can temporarily contain a
+// pre-repair/raw key image while return metadata is being hydrated.  Verify the
+// mapped transfer's effective image before trusting the cache, then fall back to
+// a bounded transfer walk so callers remain correct during that repair window.
+// This helper intentionally does not mutate wallet state; normalization owns all
+// map writes and collision handling.
+static bool find_transfer_index_by_effective_key_image(
+    const tools::wallet2 &wallet,
+    const crypto::key_image &key_image,
+    size_t &transfer_index_out,
+    bool require_spend_authority = false) {
+  transfer_index_out = 0;
+  if (key_image == crypto::key_image{})
+    return false;
+
+  const auto accepts = [&](const size_t index) -> bool {
+    if (index >= wallet.m_transfers.size())
+      return false;
+    const auto &td = wallet.m_transfers[index];
+    try {
+      // A non-zero serialized value is not itself evidence that the key image
+      // is complete.  Unknown and partial images must never participate in
+      // ownership/spent matching; validated return metadata is the only
+      // alternate authority accepted by has_transfer_key_image().
+      if (!tools::wallet::has_transfer_key_image(td, wallet))
+        return false;
+      if (tools::wallet::get_effective_transfer_key_image(td, wallet) !=
+          key_image)
+        return false;
+      if (require_spend_authority &&
+          !tools::wallet::has_transfer_spend_authority(td, wallet))
+        return false;
+    } catch (...) {
+      return false;
+    }
+    transfer_index_out = index;
+    return true;
+  };
+
+  const auto map_it = wallet.m_key_images.find(key_image);
+  if (map_it != wallet.m_key_images.end() && accepts(map_it->second))
+    return true;
+
+  for (size_t index = 0; index < wallet.m_transfers.size(); ++index) {
+    if (accepts(index))
+      return true;
+  }
+  return false;
 }
 
 uint64_t effective_wallet_height_for_unlock(tools::wallet2 &wallet) {
@@ -401,6 +478,133 @@ private:
     m_derived_state_clean = false;
   }
 
+  // Reconcile the persisted key-image cache with the canonical effective
+  // transfer view after return metadata and runtime transaction hydration have
+  // settled.  Historical return outputs may carry a stale/raw transfer key
+  // image while the validated metadata supplies the spendable image.  Only a
+  // complete, non-watch-only authority is eligible for promotion; multisig
+  // partial/watch-only entries remain untouched so their tracking semantics are
+  // preserved.  A collision is fail-closed and never overwrites another output.
+  size_t normalize_effective_key_images() {
+    if (!m_wallet || m_wallet->watch_only())
+      return 0;
+
+    size_t normalized = 0;
+    for (size_t index = 0; index < m_wallet->m_transfers.size(); ++index) {
+      auto &td = m_wallet->m_transfers[index];
+      if (td.m_key_image_partial)
+        continue;
+
+      crypto::key_image effective_key_image{};
+      try {
+        if (!tools::wallet::has_transfer_spend_authority(td, *m_wallet))
+          continue;
+        effective_key_image =
+            tools::wallet::get_effective_transfer_key_image(td, *m_wallet);
+        if (effective_key_image == crypto::key_image{})
+          continue;
+
+        // Structural authority is not enough for a repaired return image:
+        // validate the effective transaction/output/opening (or legacy
+        // derivation) before persisting it into the wallet's authoritative map.
+        if (!tools::wallet::validate_transfer_spend_authority(td, *m_wallet))
+          continue;
+      } catch (...) {
+        continue;
+      }
+
+      const auto existing = m_wallet->m_key_images.find(effective_key_image);
+      if (existing != m_wallet->m_key_images.end() &&
+          existing->second != index) {
+        // Never retarget an existing key image.  A collision is an unresolved
+        // authority ambiguity; fail the derived-state pass instead of marking
+        // the wallet clean while selectors could still spend either output.
+        throw std::runtime_error(
+            "effective key-image collision between transfer " +
+            std::to_string(existing->second) + " and " +
+            std::to_string(index));
+      }
+
+      const crypto::key_image prior_key_image = td.m_key_image;
+      if (prior_key_image != crypto::key_image{} &&
+          prior_key_image != effective_key_image) {
+        const auto prior = m_wallet->m_key_images.find(prior_key_image);
+        // Remove a stale entry only when it still points at this transfer.  A
+        // different owner may have legitimately claimed that image already.
+        if (prior != m_wallet->m_key_images.end() &&
+            prior->second == index)
+          m_wallet->m_key_images.erase(prior);
+      }
+
+      const bool changed = !td.m_key_image_known ||
+                           td.m_key_image != effective_key_image ||
+                           m_wallet->m_key_images.find(effective_key_image) ==
+                               m_wallet->m_key_images.end();
+      td.m_key_image = effective_key_image;
+      td.m_key_image_known = true;
+      // td.m_key_image_partial is already false above; leave partial state
+      // untouched for all skipped entries.
+      m_wallet->m_key_images[effective_key_image] = index;
+      if (changed)
+        ++normalized;
+    }
+
+    if (normalized > 0)
+      m_wallet->invalidate_effective_ki_cache();
+    return normalized;
+  }
+
+  bool get_exportable_transfer_key_image(
+      const tools::wallet2::transfer_details &td,
+      crypto::key_image &key_image_out) const {
+    key_image_out = crypto::key_image{};
+    if (!m_wallet)
+      return false;
+    try {
+      // CSV key-image exports are chain-spent tracking data, so view-only
+      // wallets may export their known raw/tracking image.  Metadata-derived
+      // images are accepted only when the metadata validator has established
+      // the complete effective image; multisig partial images remain hidden.
+      if (td.m_key_image_partial ||
+          (!td.m_key_image_known &&
+           !tools::wallet::has_validated_transfer_spend_authority(td,
+                                                                  *m_wallet)))
+        return false;
+      key_image_out =
+          tools::wallet::get_effective_transfer_key_image(td, *m_wallet);
+      return key_image_out != crypto::key_image{};
+    } catch (...) {
+      key_image_out = crypto::key_image{};
+      return false;
+    }
+  }
+
+  bool get_authoritative_transfer_key_image(
+      const tools::wallet2::transfer_details &td,
+      crypto::key_image &key_image_out) const {
+    key_image_out = crypto::key_image{};
+    if (!m_wallet)
+      return false;
+    try {
+      if (!tools::wallet::has_transfer_spend_authority(td, *m_wallet))
+        return false;
+      key_image_out =
+          tools::wallet::get_effective_transfer_key_image(td, *m_wallet);
+      return key_image_out != crypto::key_image{};
+    } catch (...) {
+      key_image_out = crypto::key_image{};
+      return false;
+    }
+  }
+
+  bool find_effective_transfer_index(const crypto::key_image &key_image,
+                                     size_t &transfer_index_out,
+                                     bool require_spend_authority = false) const {
+    return m_wallet && find_transfer_index_by_effective_key_image(
+                           *m_wallet, key_image, transfer_index_out,
+                           require_spend_authority);
+  }
+
   size_t count_spent_transfers() const {
     if (!m_wallet)
       return 0;
@@ -431,14 +635,27 @@ private:
       spending_tx_map.reserve(transfer_count * 2);
     }
 
+    std::unordered_set<crypto::key_image> wallet_effective_key_images;
+    wallet_effective_key_images.reserve(transfer_count);
+    for (const auto &td : m_wallet->m_transfers) {
+      if (!tools::wallet::has_transfer_spend_authority(td, *m_wallet))
+        continue;
+      const crypto::key_image key_image =
+          tools::wallet::get_effective_transfer_key_image(td, *m_wallet);
+      if (key_image != crypto::key_image{})
+        wallet_effective_key_images.insert(key_image);
+    }
+
     for (size_t j = 0; j < transfer_count; ++j) {
       try {
         const auto &other_td = m_wallet->m_transfers[j];
         const uint64_t spend_height = other_td.m_block_height;
+        const cryptonote::transaction_prefix *other_tx =
+            tools::wallet::get_effective_transfer_tx(other_td, *m_wallet);
 
-        if (other_td.m_tx.vin.size() > 10000) continue;
+        if (!other_tx || other_tx->vin.size() > 10000) continue;
 
-        for (const auto &in : other_td.m_tx.vin) {
+        for (const auto &in : other_tx->vin) {
           if (in.empty()) continue;
           if (in.type() != typeid(cryptonote::txin_to_key))
             continue;
@@ -446,7 +663,7 @@ private:
           if (!p_txin) continue;
           const auto &txin = *p_txin;
 
-          if (m_wallet->m_key_images.count(txin.k_image) == 0) {
+          if (wallet_effective_key_images.count(txin.k_image) == 0) {
             continue;
           }
 
@@ -465,10 +682,12 @@ private:
       auto &td = m_wallet->m_transfers[i];
       if (td.m_spent)
         continue;
-      if (!td.m_key_image_known)
+      if (!tools::wallet::has_transfer_spend_authority(td, *m_wallet))
         continue;
 
-      auto it = spending_tx_map.find(td.m_key_image);
+      const crypto::key_image effective_key_image =
+          tools::wallet::get_effective_transfer_key_image(td, *m_wallet);
+      auto it = spending_tx_map.find(effective_key_image);
       if (it != spending_tx_map.end()) {
         if (it->second.second > td.m_block_height) {
           td.m_spent = true;
@@ -518,14 +737,19 @@ private:
   }
 
   void run_full_derived_state_passes() {
-    if (m_deferred_spent_repair_needed) {
-      repair_spent_transfers_from_wallet_txs();
-      m_deferred_spent_repair_needed = false;
-    }
+    const bool deferred_spent_repair = m_deferred_spent_repair_needed;
+    m_deferred_spent_repair_needed = false;
     restore_account_cached_maps();
     rebuild_wallet_derived_state();
     upgrade_return_metadata_maps_if_needed();
     repair_return_output_metadata_from_transfers();
+    // Return metadata repair can replace a stale persisted key image.  Publish
+    // the effective image/map only after that repair and before any spent or
+    // outgoing consumer walks the derived maps.
+    normalize_effective_key_images();
+    reconcile_unconfirmed_txs();
+    if (deferred_spent_repair)
+      repair_spent_transfers_from_wallet_txs();
     mark_derived_state_clean();
   }
 
@@ -629,7 +853,9 @@ private:
       return asset_type;
     };
 
-    const auto &tx = td.m_tx;
+    const cryptonote::transaction_prefix *effective_tx =
+        tools::wallet::get_effective_transfer_tx(td, *m_wallet);
+    const auto &tx = *effective_tx;
     std::string output_asset_type;
     if (td.m_internal_output_index < tx.vout.size() &&
         cryptonote::get_output_asset_type(
@@ -754,6 +980,10 @@ private:
     }
 
     auto &account = m_wallet->get_account();
+    // Canonicalize asset ownership from the effective transaction/output view
+    // before rebuilding the index that all balance and selection paths consume.
+    // This keeps sparse restored prefixes from seeding stale/empty buckets.
+    (void)repair_transfer_asset_types_from_outputs();
     m_wallet->m_transfers_indices.clear();
     m_wallet->m_locked_coins.clear();
     m_wallet->m_salvium_txs.clear();
@@ -770,7 +1000,7 @@ private:
         transfer_return_hint_candidates;
 
     for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx) {
-      const auto &td = m_wallet->m_transfers[idx];
+      auto &td = m_wallet->m_transfers[idx];
       if (!td.asset_type.empty()) {
         m_wallet->m_transfers_indices[td.asset_type].insert(idx);
       }
@@ -782,7 +1012,7 @@ private:
       if (td.m_subaddr_index.major == confirmed_it->second.m_subaddr_account) {
         {
           crypto::public_key sx_pk;
-          if (safe_output_pubkey(td, sx_pk))
+          if (safe_output_pubkey(td, *m_wallet, sx_pk))
             m_wallet->m_salvium_txs[sx_pk] = idx;
         }
       }
@@ -790,7 +1020,13 @@ private:
 
     for (const auto &confirmed_entry : m_wallet->m_confirmed_txs) {
       const auto &ctd = confirmed_entry.second;
-      const auto &tx = ctd.m_tx;
+      const cryptonote::transaction_prefix *effective_confirmed_tx =
+          &ctd.m_tx;
+      const auto runtime_full_it =
+          m_wallet->m_runtime_full_txs.find(confirmed_entry.first);
+      if (runtime_full_it != m_wallet->m_runtime_full_txs.end())
+        effective_confirmed_tx = &runtime_full_it->second;
+      const auto &tx = *effective_confirmed_tx;
       if (tx.type != cryptonote::transaction_type::TRANSFER ||
           !carrot::is_carrot_transaction_v1(tx) || tx.vout.empty()) {
         continue;
@@ -884,7 +1120,9 @@ private:
           continue;
         }
         const auto &change_td = m_wallet->m_transfers[change_it->second];
-        if (change_td.m_tx.type != cryptonote::transaction_type::TRANSFER) {
+        const auto *change_tx = tools::wallet::get_effective_transfer_tx(
+            change_td, *m_wallet);
+        if (!change_tx || change_tx->type != cryptonote::transaction_type::TRANSFER) {
           continue;
         }
 
@@ -902,8 +1140,8 @@ private:
         candidate.K_o = K_o;
         candidate.change_transfer_idx = change_it->second;
         candidate.scan_hint = carrot::return_scan_hint_t(
-            input_context, K_o, K_r, change_td.m_tx.type,
-            cryptonote::get_tx_pub_key_from_extra(change_td.m_tx,
+            input_context, K_o, K_r, change_tx->type,
+            cryptonote::get_tx_pub_key_from_extra(*change_tx,
                                                   change_td.m_pk_index),
             change_td.m_internal_output_index);
         transfer_return_hint_candidates[K_r] = candidate;
@@ -917,14 +1155,18 @@ private:
     std::unordered_map<size_t, size_t> payout_index_by_origin;
     for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx) {
       const auto &td = m_wallet->m_transfers[idx];
-      const auto &tx = td.m_tx;
+      const cryptonote::transaction_prefix *effective_tx =
+          tools::wallet::get_effective_transfer_tx(td, *m_wallet);
+      const auto &tx = *effective_tx;
       if ((tx.type == cryptonote::transaction_type::PROTOCOL ||
            tx.type == cryptonote::transaction_type::RETURN) &&
           td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
           td.m_td_origin_idx < m_wallet->m_transfers.size()) {
         const auto &origin_td = m_wallet->m_transfers[td.m_td_origin_idx];
-        if (origin_td.m_tx.type == cryptonote::transaction_type::STAKE ||
-            origin_td.m_tx.type == cryptonote::transaction_type::AUDIT) {
+        const auto *origin_tx = tools::wallet::get_effective_transfer_tx(
+            origin_td, *m_wallet);
+        if (origin_tx->type == cryptonote::transaction_type::STAKE ||
+            origin_tx->type == cryptonote::transaction_type::AUDIT) {
           payout_index_by_origin[td.m_td_origin_idx] = idx;
         }
       }
@@ -937,8 +1179,11 @@ private:
       }
 
       const auto &stake_td = m_wallet->m_transfers[transfer_idx];
-      if (stake_td.m_tx.type != cryptonote::transaction_type::STAKE &&
-          stake_td.m_tx.type != cryptonote::transaction_type::AUDIT) {
+      const auto *stake_tx = tools::wallet::get_effective_transfer_tx(
+          stake_td, *m_wallet);
+      if (!stake_tx ||
+          (stake_tx->type != cryptonote::transaction_type::STAKE &&
+           stake_tx->type != cryptonote::transaction_type::AUDIT)) {
         return false;
       }
 
@@ -954,7 +1199,9 @@ private:
 
     for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx) {
       auto &td = m_wallet->m_transfers[idx];
-      const auto &tx = td.m_tx;
+      const cryptonote::transaction_prefix *effective_tx =
+          tools::wallet::get_effective_transfer_tx(td, *m_wallet);
+      const auto &tx = *effective_tx;
 
       if (tx.type == cryptonote::transaction_type::CREATE_TOKEN) {
         crypto::public_key return_address_to_track = crypto::null_pkey;
@@ -1005,7 +1252,7 @@ private:
       if ((tx.type == cryptonote::transaction_type::PROTOCOL ||
            tx.type == cryptonote::transaction_type::RETURN)) {
         crypto::public_key output_key;
-        if (!safe_output_pubkey(td, output_key))
+        if (!safe_output_pubkey(td, *m_wallet, output_key))
           continue;
         const auto transfer_candidate_it =
             transfer_return_hint_candidates.find(output_key);
@@ -1024,8 +1271,10 @@ private:
                 return;
               }
               const auto &ko_td = m_wallet->m_transfers[ko_it->second];
-              if (ko_td.m_tx.type == cryptonote::transaction_type::AUDIT ||
-                  ko_td.m_tx.type == cryptonote::transaction_type::STAKE) {
+              const auto *ko_tx = tools::wallet::get_effective_transfer_tx(
+                  ko_td, *m_wallet);
+              if (ko_tx->type == cryptonote::transaction_type::AUDIT ||
+                  ko_tx->type == cryptonote::transaction_type::STAKE) {
                 m_wallet->m_locked_coins.erase(ko);
               }
             };
@@ -1051,6 +1300,8 @@ private:
               }
 
               const auto &origin_td = m_wallet->m_transfers[origin_idx];
+              const auto *origin_tx = tools::wallet::get_effective_transfer_tx(
+                  origin_td, *m_wallet);
               td.m_td_origin_idx = origin_idx;
 
               auto scan_hint_it = m_wallet->m_return_scan_hints.find(output_key);
@@ -1059,8 +1310,8 @@ private:
                     scan_hint_it->second.input_context,
                     scan_hint_it->second.K_o,
                     scan_hint_it->second.K_r,
-                    origin_td.m_tx.type,
-                    cryptonote::get_tx_pub_key_from_extra(origin_td.m_tx,
+                    origin_tx->type,
+                    cryptonote::get_tx_pub_key_from_extra(*origin_tx,
                                                           origin_td.m_pk_index),
                     origin_td.m_internal_output_index);
                 account.insert_return_scan_hints({{output_key, scan_hint_it->second}});
@@ -1076,7 +1327,9 @@ private:
 
               const auto &change_td =
                   m_wallet->m_transfers[candidate.change_transfer_idx];
-              if (change_td.m_tx.type !=
+              const auto *change_tx = tools::wallet::get_effective_transfer_tx(
+                  change_td, *m_wallet);
+              if (!change_tx || change_tx->type !=
                   cryptonote::transaction_type::TRANSFER) {
                 return false;
               }
@@ -1095,7 +1348,7 @@ private:
                                    carrot::return_output_info_t>
                     repaired_roi;
                 crypto::public_key change_td_pk;
-                if (!safe_output_pubkey(change_td, change_td_pk))
+                if (!safe_output_pubkey(change_td, *m_wallet, change_td_pk))
                   return false;
                 repaired_roi[output_key] = carrot::return_output_info_t(
                     roi_it->second.input_context,
@@ -1121,7 +1374,9 @@ private:
               change_it->second < m_wallet->m_transfers.size() &&
               change_it->second != idx) {
             const auto &change_td = m_wallet->m_transfers[change_it->second];
-            if (change_td.m_tx.type == cryptonote::transaction_type::TRANSFER) {
+            const auto *change_tx = tools::wallet::get_effective_transfer_tx(
+                change_td, *m_wallet);
+            if (change_tx && change_tx->type == cryptonote::transaction_type::TRANSFER) {
               if (transfer_candidate_it !=
                       transfer_return_hint_candidates.end() &&
                   apply_transfer_candidate_override(
@@ -1157,7 +1412,9 @@ private:
                   continue;
                 }
                 const auto &candidate_td = m_wallet->m_transfers[candidate_idx];
-                if (candidate_td.m_tx.type !=
+                const auto *candidate_tx = tools::wallet::get_effective_transfer_tx(
+                    candidate_td, *m_wallet);
+                if (!candidate_tx || candidate_tx->type !=
                     cryptonote::transaction_type::TRANSFER) {
                   continue;
                 }
@@ -1175,8 +1432,10 @@ private:
 
               const auto &spend_origin_td =
                   m_wallet->m_transfers[spend_origin_idx];
+              const auto *spend_origin_tx = tools::wallet::get_effective_transfer_tx(
+                  spend_origin_td, *m_wallet);
               crypto::public_key repaired_change_key;
-              if (!safe_output_pubkey(spend_origin_td, repaired_change_key)) {
+              if (!safe_output_pubkey(spend_origin_td, *m_wallet, repaired_change_key)) {
                 return false;
               }
 
@@ -1206,9 +1465,9 @@ private:
                     scan_hint_it->second.input_context,
                     repaired_ko,
                     output_key,
-                    spend_origin_td.m_tx.type,
+                    spend_origin_tx->type,
                     cryptonote::get_tx_pub_key_from_extra(
-                        spend_origin_td.m_tx, spend_origin_td.m_pk_index),
+                        *spend_origin_tx, spend_origin_td.m_pk_index),
                     spend_origin_td.m_internal_output_index);
                 m_wallet->m_return_scan_hints[output_key] =
                     repaired_scan_hint;
@@ -1220,9 +1479,9 @@ private:
                     roi.input_context,
                     repaired_ko,
                     output_key,
-                    spend_origin_td.m_tx.type,
+                    spend_origin_tx->type,
                     cryptonote::get_tx_pub_key_from_extra(
-                        spend_origin_td.m_tx, spend_origin_td.m_pk_index),
+                        *spend_origin_tx, spend_origin_td.m_pk_index),
                     spend_origin_td.m_internal_output_index);
                 m_wallet->m_return_scan_hints[output_key] =
                     repaired_scan_hint;
@@ -1272,11 +1531,20 @@ private:
               ko_it->second < m_wallet->m_transfers.size() &&
               ko_it->second != idx) {
             const auto &ko_origin_td = m_wallet->m_transfers[ko_it->second];
+            const auto *ko_origin_tx = tools::wallet::get_effective_transfer_tx(
+                ko_origin_td, *m_wallet);
+            const auto *current_origin_tx =
+                (td.m_td_origin_idx < m_wallet->m_transfers.size())
+                    ? tools::wallet::get_effective_transfer_tx(
+                          m_wallet->m_transfers[td.m_td_origin_idx], *m_wallet)
+                    : nullptr;
             const bool should_prefer_ko_origin =
-                ko_origin_td.m_tx.type == cryptonote::transaction_type::TRANSFER &&
+                ko_origin_tx &&
+                ko_origin_tx->type == cryptonote::transaction_type::TRANSFER &&
                 (td.m_td_origin_idx == std::numeric_limits<uint64_t>::max() ||
                  td.m_td_origin_idx >= m_wallet->m_transfers.size() ||
-                 m_wallet->m_transfers[td.m_td_origin_idx].m_tx.type !=
+                 !current_origin_tx ||
+                 current_origin_tx->type !=
                      cryptonote::transaction_type::TRANSFER ||
                  scan_hint_it->second.origin_tx_type !=
                      cryptonote::transaction_type::TRANSFER);
@@ -1297,12 +1565,20 @@ private:
             origin_it->second < m_wallet->m_transfers.size() &&
             origin_it->second != idx) {
           const auto &mapped_origin_td = m_wallet->m_transfers[origin_it->second];
+          const auto *mapped_origin_tx = tools::wallet::get_effective_transfer_tx(
+              mapped_origin_td, *m_wallet);
+          const auto *current_origin_tx =
+              (td.m_td_origin_idx < m_wallet->m_transfers.size())
+                  ? tools::wallet::get_effective_transfer_tx(
+                        m_wallet->m_transfers[td.m_td_origin_idx], *m_wallet)
+                  : nullptr;
           const bool should_prefer_mapped_origin =
               td.m_td_origin_idx == std::numeric_limits<uint64_t>::max() ||
-              (mapped_origin_td.m_tx.type == cryptonote::transaction_type::TRANSFER &&
+              (mapped_origin_tx &&
+               mapped_origin_tx->type == cryptonote::transaction_type::TRANSFER &&
                td.m_td_origin_idx < m_wallet->m_transfers.size() &&
-               m_wallet->m_transfers[td.m_td_origin_idx].m_tx.type !=
-                   cryptonote::transaction_type::TRANSFER);
+               (!current_origin_tx || current_origin_tx->type !=
+                   cryptonote::transaction_type::TRANSFER));
           if (should_prefer_mapped_origin) {
             apply_origin_override(origin_it->second);
           }
@@ -1332,8 +1608,10 @@ private:
           td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
           td.m_td_origin_idx < m_wallet->m_transfers.size()) {
         const auto &origin_td = m_wallet->m_transfers[td.m_td_origin_idx];
-        if (origin_td.m_tx.type != cryptonote::transaction_type::AUDIT &&
-            origin_td.m_tx.type != cryptonote::transaction_type::STAKE) {
+        const auto *origin_tx = tools::wallet::get_effective_transfer_tx(
+            origin_td, *m_wallet);
+        if (origin_tx->type != cryptonote::transaction_type::AUDIT &&
+            origin_tx->type != cryptonote::transaction_type::STAKE) {
           continue;
         }
 
@@ -1342,9 +1620,9 @@ private:
         }
 
         crypto::public_key locked_output_key = crypto::null_pkey;
-        if (origin_td.m_internal_output_index < origin_td.m_tx.vout.size() &&
+        if (origin_td.m_internal_output_index < origin_tx->vout.size() &&
             get_output_public_key(
-                origin_td.m_tx.vout[origin_td.m_internal_output_index],
+                origin_tx->vout[origin_td.m_internal_output_index],
                 locked_output_key)) {
           m_wallet->m_locked_coins.erase(locked_output_key);
         }
@@ -1362,8 +1640,10 @@ private:
       }
 
       const auto &source_td = m_wallet->m_transfers[source_it->second];
-      if (source_td.m_tx.type != cryptonote::transaction_type::STAKE &&
-          source_td.m_tx.type != cryptonote::transaction_type::AUDIT) {
+      const auto *source_tx = tools::wallet::get_effective_transfer_tx(
+          source_td, *m_wallet);
+      if (source_tx->type != cryptonote::transaction_type::STAKE &&
+          source_tx->type != cryptonote::transaction_type::AUDIT) {
         continue;
       }
 
@@ -1477,9 +1757,11 @@ private:
       if (transfer_it != m_wallet->m_pub_keys.end() &&
           transfer_it->second < m_wallet->m_transfers.size()) {
         const auto &origin_td = m_wallet->m_transfers[transfer_it->second];
-        origin_tx_type = origin_td.m_tx.type;
+        const auto *origin_tx = tools::wallet::get_effective_transfer_tx(
+            origin_td, *m_wallet);
+        origin_tx_type = origin_tx->type;
         origin_tx_pub_key = cryptonote::get_tx_pub_key_from_extra(
-            origin_td.m_tx, origin_td.m_pk_index);
+            *origin_tx, origin_td.m_pk_index);
         origin_output_index = origin_td.m_internal_output_index;
       }
 
@@ -1512,17 +1794,20 @@ private:
     }
 
     for (const auto &td : m_wallet->m_transfers) {
-      if (td.m_tx.type != scan_hint.origin_tx_type) {
+      const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+          td, *m_wallet);
+      if (!effective_tx || effective_tx->type != scan_hint.origin_tx_type) {
         continue;
       }
-      if (td.m_internal_output_index != scan_hint.origin_output_index) {
+      if (td.m_internal_output_index >= effective_tx->vout.size() ||
+          td.m_internal_output_index != scan_hint.origin_output_index) {
         continue;
       }
 
       const crypto::public_key candidate_tx_pub_key =
-          cryptonote::get_tx_pub_key_from_extra(td.m_tx, td.m_pk_index);
+          cryptonote::get_tx_pub_key_from_extra(*effective_tx, td.m_pk_index);
       const crypto::public_key candidate_tx_pub_key_default =
-          cryptonote::get_tx_pub_key_from_extra(td.m_tx);
+          cryptonote::get_tx_pub_key_from_extra(*effective_tx);
       if (candidate_tx_pub_key == scan_hint.origin_tx_pub_key ||
           candidate_tx_pub_key_default == scan_hint.origin_tx_pub_key) {
         return &td;
@@ -1558,18 +1843,21 @@ private:
 
     for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx) {
       auto &td = m_wallet->m_transfers[idx];
+      const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+          td, *m_wallet);
       if (td.m_key_image_known && !td.m_key_image_partial) {
         continue;
       }
-      if (td.m_tx.type != cryptonote::transaction_type::STAKE ||
-          td.amount() == 0 || td.m_tx.amount_burnt == 0 ||
-          !carrot::is_carrot_transaction_v1(td.m_tx) ||
-          td.m_internal_output_index >= td.m_tx.vout.size()) {
+      if (!effective_tx ||
+          effective_tx->type != cryptonote::transaction_type::STAKE ||
+          td.amount() == 0 || effective_tx->amount_burnt == 0 ||
+          !carrot::is_carrot_transaction_v1(*effective_tx) ||
+          td.m_internal_output_index >= effective_tx->vout.size()) {
         continue;
       }
 
       crypto::public_key output_key = crypto::null_pkey;
-      if (!get_output_public_key(td.m_tx.vout[td.m_internal_output_index],
+      if (!get_output_public_key(effective_tx->vout[td.m_internal_output_index],
                                  output_key) ||
           output_key == crypto::null_pkey) {
         continue;
@@ -1583,7 +1871,7 @@ private:
 
       std::vector<mx25519_pubkey> enote_ephemeral_pubkeys;
       std::optional<carrot::encrypted_payment_id_t> encrypted_payment_id;
-      if (!carrot::try_load_carrot_extra_v1(td.m_tx.extra,
+      if (!carrot::try_load_carrot_extra_v1(effective_tx->extra,
                                             enote_ephemeral_pubkeys,
                                             encrypted_payment_id) ||
           enote_ephemeral_pubkeys.empty()) {
@@ -1598,7 +1886,7 @@ private:
       }
 
       carrot::input_context_t input_context = carrot::gen_input_context();
-      if (!derive_carrot_input_context_from_tx(td.m_tx, input_context)) {
+      if (!derive_carrot_input_context_from_tx(*effective_tx, input_context)) {
         continue;
       }
 
@@ -1719,13 +2007,15 @@ private:
     sender_extension_g_out = crypto::null_skey;
     sender_extension_t_out = crypto::null_skey;
 
-    if (!carrot::is_carrot_transaction_v1(td.m_tx)) {
+    const cryptonote::transaction_prefix *effective_tx =
+        tools::wallet::get_effective_transfer_tx(td, *m_wallet);
+    if (!effective_tx || !carrot::is_carrot_transaction_v1(*effective_tx)) {
       return false;
     }
 
     std::vector<mx25519_pubkey> enote_ephemeral_pubkeys;
     std::optional<carrot::encrypted_payment_id_t> encrypted_payment_id;
-    if (!carrot::try_load_carrot_extra_v1(td.m_tx.extra,
+    if (!carrot::try_load_carrot_extra_v1(effective_tx->extra,
                                           enote_ephemeral_pubkeys,
                                           encrypted_payment_id) ||
         enote_ephemeral_pubkeys.empty()) {
@@ -1760,7 +2050,7 @@ private:
 
     carrot::input_context_t return_input_context = carrot::gen_input_context();
     const bool have_return_input_context =
-        derive_input_context_from_tx(td.m_tx, return_input_context);
+        derive_input_context_from_tx(*effective_tx, return_input_context);
 
     crypto::secret_key k_return = crypto::null_skey;
     account.s_view_balance_dev.make_internal_return_privkey(
@@ -1944,13 +2234,17 @@ private:
       bool roi_missing_for_return = false;
       const auto &roi_now = account.get_return_output_map_ref();
       for (const auto &rtd : m_wallet->m_transfers) {
-        if (rtd.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
-            rtd.m_tx.type != cryptonote::transaction_type::RETURN)
+        const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+            rtd, *m_wallet);
+        if (!effective_tx ||
+            (effective_tx->type != cryptonote::transaction_type::PROTOCOL &&
+             effective_tx->type != cryptonote::transaction_type::RETURN))
           continue;
-        if (rtd.m_internal_output_index >= rtd.m_tx.vout.size())
+        if (rtd.m_internal_output_index >= effective_tx->vout.size())
           continue;
         crypto::public_key rok = crypto::null_pkey;
-        if (!get_output_public_key(rtd.m_tx.vout[rtd.m_internal_output_index], rok) ||
+        if (!get_output_public_key(
+                effective_tx->vout[rtd.m_internal_output_index], rok) ||
             rok == crypto::null_pkey)
           continue;
         if (roi_now.find(rok) == roi_now.end()) {
@@ -1979,13 +2273,17 @@ private:
         {
           const auto &__roi_chk = m_wallet->get_account().get_return_output_map_ref();
           for (const auto &__mtd : m_wallet->m_transfers) {
-            if (__mtd.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
-                __mtd.m_tx.type != cryptonote::transaction_type::RETURN)
+            const auto *__effective_tx = tools::wallet::get_effective_transfer_tx(
+                __mtd, *m_wallet);
+            if (!__effective_tx ||
+                (__effective_tx->type != cryptonote::transaction_type::PROTOCOL &&
+                 __effective_tx->type != cryptonote::transaction_type::RETURN))
               continue;
-            if (__mtd.m_internal_output_index >= __mtd.m_tx.vout.size())
+            if (__mtd.m_internal_output_index >= __effective_tx->vout.size())
               continue;
             crypto::public_key __mk = crypto::null_pkey;
-            if (!get_output_public_key(__mtd.m_tx.vout[__mtd.m_internal_output_index], __mk) ||
+            if (!get_output_public_key(
+                    __effective_tx->vout[__mtd.m_internal_output_index], __mk) ||
                 __mk == crypto::null_pkey)
               continue;
             if (__roi_chk.find(__mk) != __roi_chk.end())
@@ -2072,16 +2370,20 @@ private:
         synthesized_roi;
 
     for (const auto &td : m_wallet->m_transfers) {
-      if (td.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
-          td.m_tx.type != cryptonote::transaction_type::RETURN) {
+      const auto *effective_td_tx = tools::wallet::get_effective_transfer_tx(
+          td, *m_wallet);
+      if (!effective_td_tx ||
+          (effective_td_tx->type != cryptonote::transaction_type::PROTOCOL &&
+           effective_td_tx->type != cryptonote::transaction_type::RETURN)) {
         continue;
       }
-      if (td.m_internal_output_index >= td.m_tx.vout.size()) {
+      if (td.m_internal_output_index >= effective_td_tx->vout.size()) {
         continue;
       }
 
       crypto::public_key output_key = crypto::null_pkey;
-      if (!get_output_public_key(td.m_tx.vout[td.m_internal_output_index],
+      if (!get_output_public_key(
+              effective_td_tx->vout[td.m_internal_output_index],
                                  output_key) ||
           output_key == crypto::null_pkey) {
         continue;
@@ -2098,10 +2400,12 @@ private:
       }
 
       const auto &origin_td = m_wallet->m_transfers[td.m_td_origin_idx];
+      const auto *origin_td_tx = tools::wallet::get_effective_transfer_tx(
+          origin_td, *m_wallet);
       const bool supported_return_origin =
-          origin_td.m_tx.type == cryptonote::transaction_type::STAKE ||
-          origin_td.m_tx.type == cryptonote::transaction_type::AUDIT ||
-          origin_td.m_tx.type == cryptonote::transaction_type::CREATE_TOKEN;
+          origin_td_tx->type == cryptonote::transaction_type::STAKE ||
+          origin_td_tx->type == cryptonote::transaction_type::AUDIT ||
+          origin_td_tx->type == cryptonote::transaction_type::CREATE_TOKEN;
       if (!supported_return_origin) {
         continue;
       }
@@ -2132,7 +2436,7 @@ private:
       }
 
       const cryptonote::transaction_prefix *origin_tx_for_repair =
-          &origin_td.m_tx;
+          origin_td_tx;
       const auto runtime_origin_tx_it =
           m_wallet->m_runtime_full_txs.find(origin_td.m_txid);
       if (runtime_origin_tx_it != m_wallet->m_runtime_full_txs.end()) {
@@ -2163,7 +2467,7 @@ private:
       }
 
       const auto synthesized_scan_hint = carrot::return_scan_hint_t(
-          input_context, K_o, output_key, origin_td.m_tx.type,
+          input_context, K_o, output_key, origin_td_tx->type,
           cryptonote::get_tx_pub_key_from_extra(*origin_tx_for_repair,
                                                 origin_td.m_pk_index),
           origin_td.m_internal_output_index);
@@ -2212,16 +2516,20 @@ private:
     }
 
     for (auto &td : m_wallet->m_transfers) {
-      if (td.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
-          td.m_tx.type != cryptonote::transaction_type::RETURN) {
+      const auto *effective_td_tx = tools::wallet::get_effective_transfer_tx(
+          td, *m_wallet);
+      if (!effective_td_tx ||
+          (effective_td_tx->type != cryptonote::transaction_type::PROTOCOL &&
+           effective_td_tx->type != cryptonote::transaction_type::RETURN)) {
         continue;
       }
 
-      if (td.m_internal_output_index >= td.m_tx.vout.size()) {
+      if (td.m_internal_output_index >= effective_td_tx->vout.size()) {
         continue;
       }
       crypto::public_key output_key = crypto::null_pkey;
-      if (!get_output_public_key(td.m_tx.vout[td.m_internal_output_index],
+      if (!get_output_public_key(
+              effective_td_tx->vout[td.m_internal_output_index],
                                  output_key)) {
         continue;
       }
@@ -2247,13 +2555,15 @@ private:
       const tools::wallet2::transfer_details *origin_td =
           find_origin_transfer_from_scan_hint(scan_hint);
       if ((!origin_td ||
-           origin_td->m_tx.type != cryptonote::transaction_type::TRANSFER ||
+           tools::wallet::get_effective_transfer_type(*origin_td, *m_wallet) !=
+               cryptonote::transaction_type::TRANSFER ||
            placeholder_roi) &&
           transfer_candidate &&
           std::get<1>(*transfer_candidate) < m_wallet->m_transfers.size()) {
         const auto &candidate_td =
             m_wallet->m_transfers[std::get<1>(*transfer_candidate)];
-        if (candidate_td.m_tx.type == cryptonote::transaction_type::TRANSFER) {
+        if (tools::wallet::get_effective_transfer_type(candidate_td, *m_wallet) ==
+            cryptonote::transaction_type::TRANSFER) {
           origin_td = &candidate_td;
         }
       }
@@ -2261,7 +2571,7 @@ private:
       crypto::public_key change_output_key = scan_hint.K_o;
       if (origin_td) {
         crypto::public_key origin_pk;
-        if (safe_output_pubkey(*origin_td, origin_pk))
+        if (safe_output_pubkey(*origin_td, *m_wallet, origin_pk))
           change_output_key = origin_pk;
       }
       std::vector<crypto::public_key> spend_pubkey_candidates;
@@ -2339,15 +2649,18 @@ private:
       }
 
       if (origin_td &&
-          (origin_td->m_tx.type == cryptonote::transaction_type::TRANSFER ||
-           origin_td->m_tx.type ==
+          (tools::wallet::get_effective_transfer_type(*origin_td, *m_wallet) ==
+               cryptonote::transaction_type::TRANSFER ||
+           tools::wallet::get_effective_transfer_type(*origin_td, *m_wallet) ==
                cryptonote::transaction_type::CREATE_TOKEN)) {
+        const auto *origin_tx = tools::wallet::get_effective_transfer_tx(
+            *origin_td, *m_wallet);
         const auto repaired_scan_hint = carrot::return_scan_hint_t(
             scan_hint.input_context,
             scan_hint.K_o,
             output_key,
-            origin_td->m_tx.type,
-            cryptonote::get_tx_pub_key_from_extra(origin_td->m_tx,
+            origin_tx->type,
+            cryptonote::get_tx_pub_key_from_extra(*origin_tx,
                                                   origin_td->m_pk_index),
             origin_td->m_internal_output_index);
         account.insert_return_scan_hints({{output_key, repaired_scan_hint}});
@@ -2364,7 +2677,9 @@ private:
           scan_hint.K_o,
           change_output_key,
           canonical_spend_pubkey,
-          repaired_key_image != crypto::key_image{} ? repaired_key_image : td.m_key_image,
+          repaired_key_image != crypto::key_image{}
+              ? repaired_key_image
+              : tools::wallet::get_effective_transfer_key_image(td, *m_wallet),
           sender_extension_g,
           sender_extension_t);
       account.insert_return_output_info(repaired_roi);
@@ -2420,9 +2735,11 @@ private:
       if (change_it != m_wallet->m_pub_keys.end() &&
           change_it->second < m_wallet->m_transfers.size()) {
         const auto &origin_td = m_wallet->m_transfers[change_it->second];
-        if (origin_td.m_tx.type == cryptonote::transaction_type::TRANSFER) {
+        const auto *origin_tx = tools::wallet::get_effective_transfer_tx(
+            origin_td, *m_wallet);
+        if (origin_tx->type == cryptonote::transaction_type::TRANSFER) {
           return std::make_tuple(roi_it->second.K_change, change_it->second,
-                                 static_cast<int>(origin_td.m_tx.type));
+                                 static_cast<int>(origin_tx->type));
         }
       }
     }
@@ -2440,26 +2757,34 @@ private:
       for (size_t candidate_idx = 0; candidate_idx < m_wallet->m_transfers.size();
            ++candidate_idx) {
         const auto &origin_td = m_wallet->m_transfers[candidate_idx];
-        if (origin_td.m_tx.type != cryptonote::transaction_type::TRANSFER) {
+        const auto *origin_tx = tools::wallet::get_effective_transfer_tx(
+            origin_td, *m_wallet);
+        if (origin_tx->type != cryptonote::transaction_type::TRANSFER) {
           continue;
         }
         if (origin_td.m_recovered_spend_pubkey != canonical_spend_pubkey) {
           continue;
         }
-        if (origin_td.m_tx.type == cryptonote::transaction_type::TRANSFER) {
+        if (origin_tx->type == cryptonote::transaction_type::TRANSFER) {
           crypto::public_key origin_pk;
-          if (!safe_output_pubkey(origin_td, origin_pk))
+          if (!safe_output_pubkey(origin_td, *m_wallet, origin_pk))
             continue;
           return std::make_tuple(origin_pk,
                                  candidate_idx,
-                                 static_cast<int>(origin_td.m_tx.type));
+                                 static_cast<int>(origin_tx->type));
         }
       }
     }
 
     for (const auto &confirmed_entry : m_wallet->m_confirmed_txs) {
       const auto &ctd = confirmed_entry.second;
-      const auto &tx = ctd.m_tx;
+      const cryptonote::transaction_prefix *effective_confirmed_tx =
+          &ctd.m_tx;
+      const auto runtime_full_it =
+          m_wallet->m_runtime_full_txs.find(confirmed_entry.first);
+      if (runtime_full_it != m_wallet->m_runtime_full_txs.end())
+        effective_confirmed_tx = &runtime_full_it->second;
+      const auto &tx = *effective_confirmed_tx;
       if (tx.type != cryptonote::transaction_type::TRANSFER ||
           !carrot::is_carrot_transaction_v1(tx) || tx.vout.empty() ||
           tx.vin.empty() ||
@@ -2552,7 +2877,9 @@ private:
         }
 
         const auto &change_td = m_wallet->m_transfers[change_it->second];
-        if (change_td.m_tx.type != cryptonote::transaction_type::TRANSFER) {
+        const auto *change_tx = tools::wallet::get_effective_transfer_tx(
+            change_td, *m_wallet);
+        if (!change_tx || change_tx->type != cryptonote::transaction_type::TRANSFER) {
           continue;
         }
 
@@ -2567,7 +2894,7 @@ private:
             rct::addKeys(rct::pk2rct(K_return), rct::pk2rct(K_o)));
         if (candidate_K_r == return_key) {
           return std::make_tuple(K_o, change_it->second,
-                                 static_cast<int>(change_td.m_tx.type));
+                                 static_cast<int>(change_tx->type));
         }
       }
     }
@@ -3379,9 +3706,11 @@ public:
         if (transfer_it != m_wallet->m_pub_keys.end() &&
             transfer_it->second < m_wallet->m_transfers.size()) {
           const auto &origin_td = m_wallet->m_transfers[transfer_it->second];
-          origin_tx_type = origin_td.m_tx.type;
+          const auto *origin_tx = tools::wallet::get_effective_transfer_tx(
+              origin_td, *m_wallet);
+          origin_tx_type = origin_tx->type;
           origin_tx_pub_key =
-              cryptonote::get_tx_pub_key_from_extra(origin_td.m_tx,
+              cryptonote::get_tx_pub_key_from_extra(*origin_tx,
                                                     origin_td.m_pk_index);
           origin_output_index = origin_td.m_internal_output_index;
         }
@@ -3903,19 +4232,23 @@ public:
       }
 
       for (const auto &td : m_wallet->m_transfers) {
-        if (td.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
-            td.m_tx.type != cryptonote::transaction_type::RETURN) {
+        const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+            td, *m_wallet);
+        if (!effective_tx ||
+            (effective_tx->type != cryptonote::transaction_type::PROTOCOL &&
+             effective_tx->type != cryptonote::transaction_type::RETURN)) {
           continue;
         }
         if (td.m_spent) {
           continue;
         }
-        if (td.m_internal_output_index >= td.m_tx.vout.size()) {
+        if (td.m_internal_output_index >= effective_tx->vout.size()) {
           continue;
         }
 
         crypto::public_key output_key = crypto::null_pkey;
-        if (!get_output_public_key(td.m_tx.vout[td.m_internal_output_index],
+        if (!get_output_public_key(
+                effective_tx->vout[td.m_internal_output_index],
                                    output_key)) {
           continue;
         }
@@ -3956,8 +4289,11 @@ public:
 
         bool payout_seen = false;
         for (const auto &td : m_wallet->m_transfers) {
-          if (td.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
-              td.m_tx.type != cryptonote::transaction_type::RETURN) {
+          const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+              td, *m_wallet);
+          if (!effective_tx ||
+              (effective_tx->type != cryptonote::transaction_type::PROTOCOL &&
+               effective_tx->type != cryptonote::transaction_type::RETURN)) {
             continue;
           }
           if (td.m_td_origin_idx == origin_it->second) {
@@ -4035,7 +4371,7 @@ public:
         ++m_output_ownership_revalidation_candidate_outputs;
         crypto::public_key output_key = crypto::null_pkey;
         if (td.m_txid == crypto::null_hash ||
-            !safe_output_pubkey(td, output_key) ||
+            !safe_output_pubkey(td, *m_wallet, output_key) ||
             output_key == crypto::null_pkey) {
           ++invalid_candidates;
           continue;
@@ -4150,8 +4486,10 @@ public:
         bool ownership_check_complete = false;
         bool eligible_for_neutralization = false;
         const bool is_return_output =
-            td.m_tx.type == cryptonote::transaction_type::PROTOCOL ||
-            td.m_tx.type == cryptonote::transaction_type::RETURN;
+            tools::wallet::get_effective_transfer_type(td, *m_wallet) ==
+                cryptonote::transaction_type::PROTOCOL ||
+            tools::wallet::get_effective_transfer_type(td, *m_wallet) ==
+                cryptonote::transaction_type::RETURN;
         bool return_scan_hint_available = false;
         bool return_decrypted_proof = false;
         bool return_opening_proof = false;
@@ -4160,7 +4498,7 @@ public:
         crypto::public_key cached_output_key = crypto::null_pkey;
 
         const bool cached_output_key_valid =
-            safe_output_pubkey(td, cached_output_key) &&
+            safe_output_pubkey(td, *m_wallet, cached_output_key) &&
             cached_output_key != crypto::null_pkey;
         if (canonical_height_matches && runtime_cached &&
             cached_output_key_valid) {
@@ -4397,7 +4735,8 @@ public:
              << epee::string_tools::pod_to_hex(td.m_txid) << "\","
              << "\"height\":" << td.m_block_height << ","
              << "\"amount_before\":\"" << old_amount << "\","
-             << "\"tx_type\":" << static_cast<int>(td.m_tx.type) << ","
+             << "\"tx_type\":" << static_cast<int>(
+                    tools::wallet::get_effective_transfer_type(td, *m_wallet)) << ","
              << "\"ownership_mode\":\""
              << (is_return_output ? "return" : "ordinary") << "\","
              << "\"canonical_height_matches\":"
@@ -4567,20 +4906,39 @@ public:
         if (!asset_index_hit) {
           continue;
         }
+
+        // A transfer_details prefix can be sparse (including an UNSET type or
+        // no vout) while the complete transaction is available in the runtime
+        // hydration cache.  All preflight decisions and diagnostics must use
+        // that one effective transaction view.
+        const auto *effective_tx =
+            tools::wallet::get_effective_transfer_tx(td, *m_wallet);
+        const cryptonote::transaction_type effective_type =
+            effective_tx->type;
+        crypto::public_key effective_output_key = crypto::null_pkey;
+        const bool effective_output_valid =
+            effective_tx &&
+            td.m_internal_output_index < effective_tx->vout.size() &&
+            get_output_public_key(
+                effective_tx->vout[td.m_internal_output_index],
+                effective_output_key) &&
+            effective_output_key != crypto::null_pkey;
         size_t blocks_locked_for = CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE;
-        if (td.m_tx.type == cryptonote::transaction_type::MINER ||
-            td.m_tx.type == cryptonote::transaction_type::PROTOCOL) {
+        if (effective_type == cryptonote::transaction_type::MINER ||
+            effective_type == cryptonote::transaction_type::PROTOCOL) {
           blocks_locked_for = CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW;
         }
         const bool height_unlocked =
             top_block_index + 1 >= td.m_block_height + blocks_locked_for;
         const bool is_locked_audit_anchor =
-            td.m_tx.type == cryptonote::transaction_type::AUDIT &&
-            m_wallet->m_locked_coins.find(output_pubkey_or_null(td)) !=
+            effective_type == cryptonote::transaction_type::AUDIT &&
+            effective_output_valid &&
+            m_wallet->m_locked_coins.find(effective_output_key) !=
                 m_wallet->m_locked_coins.end();
         const bool matches_send_selection =
             !is_locked_audit_anchor && !td.m_spent && td.amount() > 0 &&
-            td.m_key_image_known && !td.m_key_image_partial && !td.m_frozen &&
+            tools::wallet::has_transfer_spend_authority(td, *m_wallet) &&
+            !td.m_frozen &&
             height_unlocked && td.amount() >= ignore_below &&
             td.amount() <= ignore_above;
         if (!matches_send_selection) {
@@ -4588,61 +4946,18 @@ public:
         }
 
         ++checked_outputs;
-        // Hoisted: unreadable pruned candidates must be skipped BEFORE any
-        // throwing accessor (is_carrot() has the same vout-size guard as
-        // get_public_key()) — validation iterates candidates, not selections.
-        crypto::public_key validate_pk;
-        if (!safe_output_pubkey(td, validate_pk))
+        // Unreadable candidates are skipped before validation; importantly,
+        // this checks the effective/runtime vout rather than the sparse
+        // transfer prefix.
+        if (!effective_output_valid)
           continue;
-        cryptonote::tx_source_entry src;
-        src.amount = td.amount();
-        src.rct = td.is_rct();
-        src.carrot = td.is_carrot();
-        src.coinbase = !td.m_tx.vin.empty() &&
-                       td.m_tx.vin[0].type() == typeid(cryptonote::txin_gen);
-        src.block_index = td.m_block_height;
-        src.asset_type = td.asset_type;
-        src.mask = td.m_mask;
-        src.address_spend_pubkey = td.m_recovered_spend_pubkey;
-
-        if (td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
-            td.m_td_origin_idx < m_wallet->m_transfers.size()) {
-          const auto &td_origin = m_wallet->m_transfers[td.m_td_origin_idx];
-          src.origin_tx_data.tx_type = td_origin.m_tx.type;
-          src.origin_tx_data.tx_pub_key =
-              cryptonote::get_tx_pub_key_from_extra(td_origin.m_tx,
-                                                    td_origin.m_pk_index);
-          src.origin_tx_data.output_index = td_origin.m_internal_output_index;
-        }
-
-        cryptonote::tx_source_entry::output_entry real_oe;
-        real_oe.first = td.m_asset_type_output_index;
-        real_oe.second.dest = rct::pk2rct(validate_pk);
-        real_oe.second.mask = rct::commit(td.amount(), td.m_mask);
-        src.outputs.push_back(real_oe);
-        src.real_output = 0;
-        src.real_output_in_tx_index = td.m_internal_output_index;
-        src.real_out_tx_key =
-            cryptonote::get_tx_pub_key_from_extra(td.m_tx, td.m_pk_index);
-        src.real_out_additional_tx_keys =
-            cryptonote::get_additional_tx_pub_keys_from_extra(td.m_tx);
-        if (!td.m_tx.vin.empty() &&
-            td.m_tx.vin[0].type() == typeid(cryptonote::txin_to_key)) {
-          src.first_rct_key_image =
-              boost::get<cryptonote::txin_to_key>(td.m_tx.vin[0]).k_image;
-        }
-
-        crypto::secret_key x_out = crypto::null_skey;
-        crypto::secret_key y_out = crypto::null_skey;
-        std::string path;
-        const auto confirmed_it = m_wallet->m_confirmed_txs.find(td.m_txid);
+        // Spend-authority validation must use the same derivation as signing.
+        // In particular, legacy (pre-Carrot) outputs use the normal key-image
+        // helper, while Carrot outputs use the opening resolver.  The helper
+        // also prefers a complete confirmed/runtime transaction over a sparse
+        // transfer prefix and fails closed when metadata is unavailable.
         const bool ok =
-            (confirmed_it != m_wallet->m_confirmed_txs.end())
-                ? tools::wallet::try_get_address_openings_x_y(
-                      confirmed_it->second.m_tx, src, *m_wallet, x_out, y_out,
-                      &path)
-                : tools::wallet::try_get_address_openings_x_y(
-                      td.m_tx, src, *m_wallet, x_out, y_out, &path);
+            tools::wallet::validate_transfer_spend_authority(td, *m_wallet);
         if (ok) {
           continue;
         }
@@ -4653,7 +4968,7 @@ public:
           failures << ",";
         }
         first_failed = false;
-        const crypto::public_key output_key = output_pubkey_or_null(td);
+        const crypto::public_key output_key = effective_output_key;
         const auto &return_scan_hints =
             m_wallet->get_account().get_return_scan_hint_map_ref();
         const auto &return_output_map =
@@ -4673,7 +4988,8 @@ public:
               ko_it->second < m_wallet->m_transfers.size()) {
             ko_origin_idx = ko_it->second;
             ko_origin_tx_type =
-                static_cast<int>(m_wallet->m_transfers[ko_it->second].m_tx.type);
+                static_cast<int>(tools::wallet::get_effective_transfer_type(
+                    m_wallet->m_transfers[ko_it->second], *m_wallet));
           }
         }
         int transfer_candidate_origin_idx = -1;
@@ -4692,6 +5008,7 @@ public:
         const bool runtime_full_tx_cached =
             m_wallet->m_runtime_full_txs.find(td.m_txid) !=
             m_wallet->m_runtime_full_txs.end();
+        const std::string path = "spend_authority_invalid";
         const auto persisted_it = m_wallet->m_return_output_info.find(output_key);
         const bool persisted_map_hit =
             persisted_it != m_wallet->m_return_output_info.end();
@@ -4756,12 +5073,14 @@ public:
                  << "\"txid\":\"" << epee::string_tools::pod_to_hex(td.m_txid)
                  << "\","
                  << "\"path\":\"" << path << "\","
-                 << "\"tx_type\":" << static_cast<int>(td.m_tx.type) << ","
+                 << "\"tx_type\":" << static_cast<int>(effective_type) << ","
                  << "\"origin_tx_type\":"
                  << ((td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
                       td.m_td_origin_idx < m_wallet->m_transfers.size())
                          ? static_cast<int>(
-                               m_wallet->m_transfers[td.m_td_origin_idx].m_tx.type)
+                               tools::wallet::get_effective_transfer_type(
+                                   m_wallet->m_transfers[td.m_td_origin_idx],
+                                   *m_wallet))
                          : -1)
                  << ","
                  << "\"scan_hint_origin_tx_type\":"
@@ -4850,8 +5169,10 @@ public:
       std::unordered_map<size_t, size_t> payout_index_by_origin;
       for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx) {
         const auto &td = m_wallet->m_transfers[idx];
-        if ((td.m_tx.type == cryptonote::transaction_type::PROTOCOL ||
-             td.m_tx.type == cryptonote::transaction_type::RETURN) &&
+        const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+            td, *m_wallet);
+        if ((effective_tx->type == cryptonote::transaction_type::PROTOCOL ||
+             effective_tx->type == cryptonote::transaction_type::RETURN) &&
             td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
             td.m_td_origin_idx < m_wallet->m_transfers.size()) {
           payout_index_by_origin[td.m_td_origin_idx] = idx;
@@ -4879,18 +5200,20 @@ public:
       bool first = true;
       for (size_t idx = 0; idx < m_wallet->m_transfers.size(); ++idx) {
         const auto &td = m_wallet->m_transfers[idx];
-        if (td.m_tx.type != cryptonote::transaction_type::STAKE) {
+        const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+            td, *m_wallet);
+        if (effective_tx->type != cryptonote::transaction_type::STAKE) {
           continue;
         }
 
-        crypto::public_key return_address = td.m_tx.return_address;
+        crypto::public_key return_address = effective_tx->return_address;
         if (return_address == crypto::null_pkey) {
-          return_address = td.m_tx.protocol_tx_data.return_address;
+          return_address = effective_tx->protocol_tx_data.return_address;
         }
 
         crypto::public_key stake_output_key = crypto::null_pkey;
-        if (td.m_internal_output_index < td.m_tx.vout.size()) {
-          get_output_public_key(td.m_tx.vout[td.m_internal_output_index],
+        if (td.m_internal_output_index < effective_tx->vout.size()) {
+          get_output_public_key(effective_tx->vout[td.m_internal_output_index],
                                 stake_output_key);
         }
 
@@ -5238,12 +5561,13 @@ public:
       const auto &transfers = m_wallet->m_transfers;
       for (size_t i = 0; i < transfers.size(); ++i) {
         const auto &td = transfers[i];
-
-        if (td.m_key_image_known && !td.m_spent) {
+        crypto::key_image effective_key_image{};
+        if (!td.m_spent &&
+            get_exportable_transfer_key_image(td, effective_key_image)) {
           if (!first)
             oss << ",";
           first = false;
-          oss << epee::string_tools::pod_to_hex(td.m_key_image);
+          oss << epee::string_tools::pod_to_hex(effective_key_image);
         }
       }
 
@@ -5264,7 +5588,9 @@ public:
       size_t count = 0;
       for (size_t i = 0; i < transfers.size(); ++i) {
         const auto &td = transfers[i];
-        if (td.m_key_image_known && !td.m_spent) {
+        crypto::key_image effective_key_image{};
+        if (!td.m_spent &&
+            get_exportable_transfer_key_image(td, effective_key_image)) {
           count++;
         }
       }
@@ -5299,13 +5625,15 @@ public:
       int added = 0;
       for (size_t i = 0; i < transfers.size() && added < 5; ++i) {
         const auto &td = transfers[i];
-        if (!(td.m_key_image_known && !td.m_spent)) {
+        crypto::key_image effective_key_image{};
+        if (td.m_spent ||
+            !get_exportable_transfer_key_image(td, effective_key_image)) {
           continue;
         }
 
         if (added > 0)
           out += ',';
-        out += epee::string_tools::pod_to_hex(td.m_key_image);
+        out += epee::string_tools::pod_to_hex(effective_key_image);
         added++;
 
         if (static_cast<int>(out.size()) >= max_chars) {
@@ -5392,12 +5720,13 @@ public:
 
       for (size_t i = 0; i < transfers.size(); ++i) {
         const auto &td = transfers[i];
-
-        if (!(td.m_key_image_known && !td.m_spent)) {
+        crypto::key_image effective_key_image{};
+        if (td.m_spent ||
+            !get_exportable_transfer_key_image(td, effective_key_image)) {
           continue;
         }
 
-        emit_entry(epee::string_tools::pod_to_hex(td.m_key_image));
+        emit_entry(epee::string_tools::pod_to_hex(effective_key_image));
 
         if (pos >= end) {
           break;
@@ -5422,8 +5751,9 @@ public:
       const auto &transfers = m_wallet->m_transfers;
       for (size_t i = 0; i < transfers.size(); ++i) {
         const auto &td = transfers[i];
-
-        if (!(td.m_key_image_known && td.m_spent)) {
+        crypto::key_image effective_key_image{};
+        if (!td.m_spent ||
+            !get_exportable_transfer_key_image(td, effective_key_image)) {
           continue;
         }
 
@@ -5431,7 +5761,7 @@ public:
           oss << ",";
         first = false;
 
-        oss << epee::string_tools::pod_to_hex(td.m_key_image) << ":"
+        oss << epee::string_tools::pod_to_hex(effective_key_image) << ":"
             << td.m_spent_height;
       }
 
@@ -5452,7 +5782,9 @@ public:
       size_t count = 0;
       for (size_t i = 0; i < transfers.size(); ++i) {
         const auto &td = transfers[i];
-        if (td.m_key_image_known && td.m_spent) {
+        crypto::key_image effective_key_image{};
+        if (td.m_spent &&
+            get_exportable_transfer_key_image(td, effective_key_image)) {
           count++;
         }
       }
@@ -5543,13 +5875,14 @@ public:
 
       for (size_t i = 0; i < transfers.size(); ++i) {
         const auto &td = transfers[i];
-
-        if (!(td.m_key_image_known && td.m_spent)) {
+        crypto::key_image effective_key_image{};
+        if (!td.m_spent ||
+            !get_exportable_transfer_key_image(td, effective_key_image)) {
           continue;
         }
 
         const std::string entry =
-            epee::string_tools::pod_to_hex(td.m_key_image) + ":" +
+            epee::string_tools::pod_to_hex(effective_key_image) + ":" +
             std::to_string(td.m_spent_height);
         emit_entry(entry);
 
@@ -5631,10 +5964,10 @@ public:
         const cryptonote::txin_to_key &in_to_key =
             boost::get<cryptonote::txin_to_key>(in);
 
-        auto it = m_wallet->m_key_images.find(in_to_key.k_image);
-        if (it != m_wallet->m_key_images.end()) {
+        size_t transfer_index = 0;
+        if (find_effective_transfer_index(in_to_key.k_image, transfer_index)) {
 
-          const auto &td = m_wallet->m_transfers[it->second];
+          const auto &td = m_wallet->m_transfers[transfer_index];
 
           if (!first)
             oss << ",";
@@ -5643,7 +5976,7 @@ public:
           oss << "{"
               << "\"key_image\":\""
               << epee::string_tools::pod_to_hex(in_to_key.k_image) << "\","
-              << "\"transfer_index\":" << it->second << ","
+              << "\"transfer_index\":" << transfer_index << ","
               << "\"amount\":\"" << td.m_amount << "\","
               << "\"was_already_spent\":" << (td.m_spent ? "true" : "false")
               << "}";
@@ -5690,9 +6023,9 @@ public:
         const cryptonote::txin_to_key &in_to_key =
             boost::get<cryptonote::txin_to_key>(in);
 
-        auto it = m_wallet->m_key_images.find(in_to_key.k_image);
-        if (it != m_wallet->m_key_images.end()) {
-          auto &td = m_wallet->m_transfers[it->second];
+        size_t transfer_index = 0;
+        if (find_effective_transfer_index(in_to_key.k_image, transfer_index)) {
+          auto &td = m_wallet->m_transfers[transfer_index];
           if (!td.m_spent) {
             td.m_spent = true;
             td.m_spent_height = block_height;
@@ -5754,9 +6087,9 @@ public:
           continue;
         }
 
-        auto it = m_wallet->m_key_images.find(ki);
-        if (it != m_wallet->m_key_images.end()) {
-          auto &td = m_wallet->m_transfers[it->second];
+        size_t transfer_index = 0;
+        if (find_effective_transfer_index(ki, transfer_index)) {
+          auto &td = m_wallet->m_transfers[transfer_index];
           if (!td.m_spent) {
             td.m_spent = true;
             td.m_spent_height = height;
@@ -5904,12 +6237,11 @@ public:
           if (in.type() != typeid(cryptonote::txin_to_key))
             continue;
           const auto &in_to_key = boost::get<cryptonote::txin_to_key>(in);
-          auto it = m_wallet->m_key_images.find(in_to_key.k_image);
-          if (it == m_wallet->m_key_images.end())
+          size_t transfer_index = 0;
+          if (!find_effective_transfer_index(in_to_key.k_image,
+                                             transfer_index))
             continue;
-          if (it->second >= m_wallet->m_transfers.size())
-            continue;
-          const auto &td = m_wallet->m_transfers[it->second];
+          const auto &td = m_wallet->m_transfers[transfer_index];
           uint64_t amount = td.amount();
           tx_money_spent_in_ins += amount;
           if (source_asset.empty() || td.asset_type == source_asset)
@@ -6049,10 +6381,14 @@ public:
       // Iterate transfers; re-key AUDIT-type ones matched by (height, amount_burnt).
       for (size_t i = 0; i < m_wallet->m_transfers.size(); ++i) {
         auto &td = m_wallet->m_transfers[i];
-        if (td.m_tx.type != cryptonote::transaction_type::AUDIT)
+        if (tools::wallet::get_effective_transfer_type(td, *m_wallet) !=
+            cryptonote::transaction_type::AUDIT)
           continue;
+        const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+            td, *m_wallet);
         auto mit = by_height_burnt.find(
-            std::make_pair(td.m_block_height, (uint64_t)td.m_tx.amount_burnt));
+            std::make_pair(td.m_block_height,
+                           (uint64_t)effective_tx->amount_burnt));
         if (mit == by_height_burnt.end())
           continue;
         const crypto::hash old_txid = td.m_txid;
@@ -6242,7 +6578,8 @@ public:
     if (!m_initialized) return R"({"heights":[]})";
     std::set<uint64_t> heights;
     for (const auto &td : m_wallet->m_transfers) {
-      if (td.m_tx.type == cryptonote::transaction_type::AUDIT)
+      if (tools::wallet::get_effective_transfer_type(td, *m_wallet) ==
+          cryptonote::transaction_type::AUDIT)
         heights.insert(td.m_block_height);
     }
     std::ostringstream oss;
@@ -6272,7 +6609,11 @@ public:
               _clk::now() - _t0).count();
 
       std::vector<std::string> hashes;
-      hashes.reserve(64);
+      // The host fetches these in bounded batches and deduplicates across
+      // passes.  Keep the WASM candidate set lossless: a sparse transfer
+      // prefix may carry UNSET (or another stale) type even though its txid is
+      // required to recover the authoritative full transaction.
+      hashes.reserve(m_wallet->m_transfers.size());
       std::unordered_set<crypto::hash> seen;
 
       auto add_runtime_candidate = [&](const crypto::hash &txid) {
@@ -6294,40 +6635,42 @@ public:
       const auto &return_spend_metadata =
           m_wallet->get_account().get_return_spend_metadata_map_ref();
 
-      // Outgoing reconciliation needs the FULL spending tx (vin + rct fee) in
-      // m_runtime_full_txs. Every owned send/self-send tx created at least its change
-      // output here, so its txid is the m_txid of some owned transfer. Emit those (for
-      // spend-capable tx types) as hydration candidates so reconcile_outgoing_payments
-      // can reconstruct the out-leg + correct fee. Idempotent + deduped by add_runtime_candidate.
+      // Outgoing reconciliation and spend validation need the FULL transaction
+      // context (vin/rct fee, output keys, and authoritative type).  Do not gate
+      // this on td.m_tx.type: historical sparse prefixes can be UNSET while the
+      // txid is still the only route to the protocol/return transaction.
       for (const auto &td : m_wallet->m_transfers) {
-        switch (td.m_tx.type) {
-          case cryptonote::transaction_type::TRANSFER:
-          case cryptonote::transaction_type::CONVERT:
-          case cryptonote::transaction_type::BURN:
-          case cryptonote::transaction_type::STAKE:
-          case cryptonote::transaction_type::AUDIT:
-          case cryptonote::transaction_type::ROLLUP:
-            add_runtime_candidate(td.m_txid);
-            break;
-          default:
-            break;
+        add_runtime_candidate(td.m_txid);
+      }
+
+      // Return-origin links are persisted separately from transfer details in
+      // some wallet generations.  Include every indexed origin txid even when
+      // the payout's m_td_origin_idx was not restored.
+      for (const auto &entry : m_wallet->m_salvium_txs) {
+        const size_t origin_idx = entry.second;
+        if (origin_idx < m_wallet->m_transfers.size()) {
+          add_runtime_candidate(m_wallet->m_transfers[origin_idx].m_txid);
         }
       }
 
       for (const auto &td : m_wallet->m_transfers) {
-        if (td.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
-            td.m_tx.type != cryptonote::transaction_type::RETURN) {
+        const auto *effective_tx =
+            tools::wallet::get_effective_transfer_tx(td, *m_wallet);
+        const auto effective_type = effective_tx->type;
+        if (effective_type != cryptonote::transaction_type::PROTOCOL &&
+            effective_type != cryptonote::transaction_type::RETURN) {
           continue;
         }
 
         add_runtime_candidate(td.m_txid);
 
-        if (td.m_internal_output_index >= td.m_tx.vout.size()) {
+        if (td.m_internal_output_index >= effective_tx->vout.size()) {
           continue;
         }
 
         crypto::public_key output_key = crypto::null_pkey;
-        if (!get_output_public_key(td.m_tx.vout[td.m_internal_output_index],
+        if (!get_output_public_key(
+                effective_tx->vout[td.m_internal_output_index],
                                    output_key) ||
             output_key == crypto::null_pkey) {
           continue;
@@ -6360,13 +6703,8 @@ public:
 
         if (td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
             td.m_td_origin_idx < m_wallet->m_transfers.size()) {
-          const auto &origin_td = m_wallet->m_transfers[td.m_td_origin_idx];
-          if (origin_td.m_tx.type == cryptonote::transaction_type::TRANSFER ||
-              origin_td.m_tx.type == cryptonote::transaction_type::STAKE ||
-              origin_td.m_tx.type == cryptonote::transaction_type::AUDIT ||
-              origin_td.m_tx.type == cryptonote::transaction_type::CREATE_TOKEN) {
-            add_runtime_candidate(origin_td.m_txid);
-          }
+          add_runtime_candidate(
+              m_wallet->m_transfers[td.m_td_origin_idx].m_txid);
         }
       }
 
@@ -6421,6 +6759,13 @@ public:
       size_t offset = 8;
       size_t stored = 0;
       size_t parsed = 0;
+      std::vector<crypto::hash> stored_hashes;
+      struct sparse_rejection {
+        crypto::hash hash;
+        const char *reason;
+        int tx_type;
+      };
+      std::vector<sparse_rejection> rejected;
 
       for (uint32_t tx_index = 0; tx_index < tx_count && offset + 46 <= size;
            ++tx_index) {
@@ -6475,9 +6820,11 @@ public:
         crypto::hash tx_prefix_hash = crypto::null_hash;
         if (!cryptonote::parse_and_validate_tx_from_blob(
                 tx_blob, tx, parsed_tx_hash, tx_prefix_hash)) {
+          rejected.push_back({tx_hash, "parse_failed", -1});
           continue;
         }
         if (parsed_tx_hash != tx_hash) {
+          rejected.push_back({tx_hash, "hash_mismatch", static_cast<int>(tx.type)});
           continue;
         }
 
@@ -6492,6 +6839,7 @@ public:
           m_fresh_output_revalidation_txids.insert(tx_hash);
           m_fresh_output_revalidation_heights[tx_hash] = block_height;
         }
+        stored_hashes.push_back(tx_hash);
         ++stored;
       }
 
@@ -6512,7 +6860,21 @@ public:
       oss << "{\"success\":true,\"parsed\":" << parsed
           << ",\"stored\":" << stored
           << ",\"runtime_full_tx_count\":" << m_wallet->m_runtime_full_txs.size()
-          << "}";
+          << ",\"stored_hashes\":[";
+      for (size_t i = 0; i < stored_hashes.size(); ++i) {
+        if (i > 0) oss << ",";
+        oss << "\"" << epee::string_tools::pod_to_hex(stored_hashes[i]) << "\"";
+      }
+      oss << "],\"rejected_count\":" << rejected.size()
+          << ",\"rejected\":[";
+      for (size_t i = 0; i < rejected.size(); ++i) {
+        if (i > 0) oss << ",";
+        oss << "{\"hash\":\""
+            << epee::string_tools::pod_to_hex(rejected[i].hash)
+            << "\",\"reason\":\"" << rejected[i].reason
+            << "\",\"tx_type\":" << rejected[i].tx_type << "}";
+      }
+      oss << "]}";
       return oss.str();
     } catch (const std::exception &e) {
       return std::string(R"({"success":false,"error":")") + e.what() +
@@ -7476,15 +7838,13 @@ public:
 
               const cryptonote::txin_to_key &in_to_key =
                   boost::get<cryptonote::txin_to_key>(in);
-              auto ki_it = m_wallet->m_key_images.find(in_to_key.k_image);
-              if (ki_it != m_wallet->m_key_images.end()) {
-                size_t transfer_idx = ki_it->second;
-                if (transfer_idx < m_wallet->m_transfers.size()) {
-                  auto &spent_td = m_wallet->m_transfers[transfer_idx];
-                  if (!spent_td.m_spent) {
-                    spent_td.m_spent = true;
-                    spent_td.m_spent_height = block_height;
-                  }
+              size_t transfer_idx = 0;
+              if (find_effective_transfer_index(in_to_key.k_image,
+                                                 transfer_idx)) {
+                auto &spent_td = m_wallet->m_transfers[transfer_idx];
+                if (!spent_td.m_spent) {
+                  spent_td.m_spent = true;
+                  spent_td.m_spent_height = block_height;
                 }
               }
             }
@@ -7613,15 +7973,13 @@ public:
               const cryptonote::txin_to_key &in_to_key =
                   boost::get<cryptonote::txin_to_key>(in);
 
-              auto ki_it = m_wallet->m_key_images.find(in_to_key.k_image);
-              if (ki_it != m_wallet->m_key_images.end()) {
-                size_t transfer_idx = ki_it->second;
-                if (transfer_idx < m_wallet->m_transfers.size()) {
-                  auto &spent_td = m_wallet->m_transfers[transfer_idx];
-                  if (!spent_td.m_spent) {
-                    spent_td.m_spent = true;
-                    spent_td.m_spent_height = block_height;
-                  }
+              size_t transfer_idx = 0;
+              if (find_effective_transfer_index(in_to_key.k_image,
+                                                 transfer_idx)) {
+                auto &spent_td = m_wallet->m_transfers[transfer_idx];
+                if (!spent_td.m_spent) {
+                  spent_td.m_spent = true;
+                  spent_td.m_spent_height = block_height;
                 }
               }
             }
@@ -7778,6 +8136,7 @@ public:
       rebuild_wallet_derived_state();
       upgrade_return_metadata_maps_if_needed();
       repair_return_output_metadata_from_transfers();
+      normalize_effective_key_images();
       mark_derived_state_clean();
 
       uint64_t balance_after = m_wallet->balance(0, "SAL", false) +
@@ -8075,8 +8434,8 @@ public:
             if (in.type() != typeid(cryptonote::txin_to_key))
               continue;
             const auto &txin = boost::get<cryptonote::txin_to_key>(in);
-            if (m_wallet->m_key_images.find(txin.k_image) !=
-                m_wallet->m_key_images.end()) {
+            size_t transfer_index = 0;
+            if (find_effective_transfer_index(txin.k_image, transfer_index)) {
               return true;
             }
           }
@@ -8088,23 +8447,27 @@ public:
 
         for (size_t i = 0; i < transfer_count; ++i) {
           const auto &td = m_wallet->get_transfer_details(i);
+          const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+              td, *m_wallet);
           if (td.m_block_height < min_height || td.m_block_height > max_height)
             continue;
 
-          if (tx_spends_our_outputs(td.m_tx)) {
+          if (tx_spends_our_outputs(*effective_tx)) {
             our_outgoing_txids.insert(td.m_txid);
           }
         }
 
         for (size_t i = 0; i < transfer_count; ++i) {
           const auto &td = m_wallet->get_transfer_details(i);
+          const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+              td, *m_wallet);
           if (td.m_block_height < min_height || td.m_block_height > max_height)
             continue;
 
           bool is_stake_type =
-              (td.m_tx.type == cryptonote::transaction_type::STAKE ||
-               td.m_tx.type == cryptonote::transaction_type::AUDIT ||
-               static_cast<int>(td.m_tx.type) == 6);
+              (effective_tx->type == cryptonote::transaction_type::STAKE ||
+               effective_tx->type == cryptonote::transaction_type::AUDIT ||
+               static_cast<int>(effective_tx->type) == 6);
           if (!is_stake_type)
             continue;
 
@@ -8112,21 +8475,20 @@ public:
             continue;
 
           bool spends_locked_stake = false;
-          for (const auto &in : td.m_tx.vin) {
+          for (const auto &in : effective_tx->vin) {
             if (in.type() != typeid(cryptonote::txin_to_key))
               continue;
             const auto &txin = boost::get<cryptonote::txin_to_key>(in);
-            auto it = m_wallet->m_key_images.find(txin.k_image);
-            if (it != m_wallet->m_key_images.end()) {
-              size_t idx = it->second;
-              if (idx < m_wallet->get_num_transfer_details()) {
-                const auto &src_td = m_wallet->get_transfer_details(idx);
-                if ((src_td.m_tx.type == cryptonote::transaction_type::STAKE ||
-                     static_cast<int>(src_td.m_tx.type) == 6) &&
-                    src_td.m_amount == src_td.m_tx.amount_burnt) {
-                  spends_locked_stake = true;
-                  break;
-                }
+            size_t idx = 0;
+            if (find_effective_transfer_index(txin.k_image, idx)) {
+              const auto &src_td = m_wallet->get_transfer_details(idx);
+              const auto *src_tx = tools::wallet::get_effective_transfer_tx(
+                  src_td, *m_wallet);
+              if ((src_tx->type == cryptonote::transaction_type::STAKE ||
+                   static_cast<int>(src_tx->type) == 6) &&
+                  src_td.m_amount == src_tx->amount_burnt) {
+                spends_locked_stake = true;
+                break;
               }
             }
           }
@@ -8137,11 +8499,11 @@ public:
           }
 
           crypto::public_key return_addr = crypto::null_pkey;
-          if (td.m_tx.return_address != crypto::null_pkey) {
-            return_addr = td.m_tx.return_address;
-          } else if (td.m_tx.protocol_tx_data.return_address !=
+          if (effective_tx->return_address != crypto::null_pkey) {
+            return_addr = effective_tx->return_address;
+          } else if (effective_tx->protocol_tx_data.return_address !=
                      crypto::null_pkey) {
-            return_addr = td.m_tx.protocol_tx_data.return_address;
+            return_addr = effective_tx->protocol_tx_data.return_address;
           }
 
           bool is_our_stake = false;
@@ -8153,20 +8515,20 @@ public:
             }
           }
 
-          if (!is_our_stake && tx_spends_our_outputs(td.m_tx)) {
+          if (!is_our_stake && tx_spends_our_outputs(*effective_tx)) {
             is_our_stake = true;
           }
 
-          if (is_our_stake && td.m_tx.amount_burnt > 0) {
+          if (is_our_stake && effective_tx->amount_burnt > 0) {
 
             stake_txids.insert(td.m_txid);
 
             SyntheticStake stake;
             stake.txid = td.m_txid;
-            stake.amount_burnt = td.m_tx.amount_burnt;
+            stake.amount_burnt = effective_tx->amount_burnt;
             stake.block_height = td.m_block_height;
-            stake.unlock_time = td.m_tx.unlock_time;
-            stake.tx_type = static_cast<int>(td.m_tx.type);
+            stake.unlock_time = effective_tx->unlock_time;
+            stake.tx_type = static_cast<int>(effective_tx->type);
 
             auto ts_it = m_tx_timestamps.find(td.m_txid);
             stake.timestamp =
@@ -8179,6 +8541,8 @@ public:
         std::unordered_set<uint64_t> heights_with_spends;
         for (size_t i = 0; i < transfer_count; ++i) {
           const auto &td = m_wallet->get_transfer_details(i);
+          const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+              td, *m_wallet);
           if (td.m_spent && td.m_spent_height >= min_height &&
               td.m_spent_height <= max_height) {
             heights_with_spends.insert(td.m_spent_height);
@@ -8187,6 +8551,8 @@ public:
 
         for (size_t i = 0; i < transfer_count; ++i) {
           const auto &td = m_wallet->get_transfer_details(i);
+          const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+              td, *m_wallet);
           const uint64_t h = td.m_block_height;
           if (h < min_height || h > max_height)
             continue;
@@ -8212,17 +8578,17 @@ public:
 
           if (our_outgoing_txids.find(td.m_txid) != our_outgoing_txids.end()) {
 
-            if (td.m_tx.type == cryptonote::transaction_type::TRANSFER ||
-                td.m_tx.type == cryptonote::transaction_type::STAKE ||
-                static_cast<int>(td.m_tx.type) == 6) {
+            if (effective_tx->type == cryptonote::transaction_type::TRANSFER ||
+                effective_tx->type == cryptonote::transaction_type::STAKE ||
+                static_cast<int>(effective_tx->type) == 6) {
               continue;
             }
           }
 
           if (heights_with_spends.find(h) != heights_with_spends.end()) {
-            if (td.m_tx.type == cryptonote::transaction_type::TRANSFER ||
-                td.m_tx.type == cryptonote::transaction_type::STAKE ||
-                static_cast<int>(td.m_tx.type) == 6) {
+            if (effective_tx->type == cryptonote::transaction_type::TRANSFER ||
+                effective_tx->type == cryptonote::transaction_type::STAKE ||
+                static_cast<int>(effective_tx->type) == 6) {
               continue;
             }
           }
@@ -8231,10 +8597,10 @@ public:
           if (it == extra_by_txid.end()) {
             ExtraInAgg agg;
             agg.block_height = h;
-            agg.unlock_time = td.m_tx.unlock_time;
+            agg.unlock_time = effective_tx->unlock_time;
             agg.subaddr_major = td.m_subaddr_index.major;
             agg.subaddr_minor = td.m_subaddr_index.minor;
-            agg.tx_type = static_cast<int>(td.m_tx.type);
+            agg.tx_type = static_cast<int>(effective_tx->type);
 
             agg.asset_type = td.asset_type.empty() ? "SAL" : td.asset_type;
 
@@ -9380,7 +9746,7 @@ public:
         const auto& td = m_wallet->get_transfer_details(i);
         if (td.m_txid == target_txid) {
 
-          if (!td.m_spent && !td.m_frozen && m_wallet->is_transfer_unlocked(td)) {
+          if (tools::wallet::is_transfer_usable_for_return(td, *m_wallet)) {
             transfer_indices.push_back(i);
             std_cerr << "[WASM DEBUG] Found matching transfer at index " << i
                      << ", amount=" << td.amount() << std::endl;
@@ -10507,6 +10873,7 @@ public:
       upgrade_return_metadata_maps_if_needed();
 
       repair_return_output_metadata_from_transfers();
+      normalize_effective_key_images();
 
       std::set<uint32_t> subaddress_indices_needed;
       for (size_t i = 0; i < num_transfers; ++i) {
@@ -11906,13 +12273,11 @@ public:
 
                 trace_step = 844 + static_cast<int>(i % 100);
 
-                auto ki_it = m_wallet->m_key_images.find(in_to_key.k_image);
-
                 trace_step = 845 + static_cast<int>(i % 100);
 
-                if (ki_it != m_wallet->m_key_images.end()) {
-
-                  size_t transfer_idx = ki_it->second;
+                size_t transfer_idx = 0;
+                if (find_effective_transfer_index(in_to_key.k_image,
+                                                   transfer_idx)) {
 
                   if (is_stake) {
                     DEBUG_LOG("[FIX_DEBUG] Match FOUND in m_key_images! "
@@ -12085,6 +12450,7 @@ public:
         rebuild_wallet_derived_state();
         upgrade_return_metadata_maps_if_needed();
         repair_return_output_metadata_from_transfers();
+        normalize_effective_key_images();
         mark_derived_state_clean();
 
         balance_after = m_wallet->balance(0, "SAL", false) +
@@ -12281,18 +12647,17 @@ public:
           if (in.type() != typeid(cryptonote::txin_to_key))
             continue;
           const auto &txin = boost::get<cryptonote::txin_to_key>(in);
-          auto ki_it = m_wallet->m_key_images.find(txin.k_image);
-          if (ki_it == m_wallet->m_key_images.end())
+          size_t transfer_index = 0;
+          if (!find_effective_transfer_index(txin.k_image, transfer_index,
+                                             true))
             continue;
-          if (ki_it->second >= m_wallet->m_transfers.size())
-            continue;
-          auto &td = m_wallet->m_transfers[ki_it->second];
+          auto &td = m_wallet->m_transfers[transfer_index];
           if (td.m_spent && td.m_spent_height == 0) {
             td.m_spent = false;
             wasm_log(
                     "[WASM] reconcile_unconfirmed: released input %zu from "
                     "expired pending tx\n",
-                    (size_t)ki_it->second);
+                    transfer_index);
           }
         }
       }
@@ -12316,11 +12681,13 @@ public:
     std::ostringstream oss;
     bool first = true;
     for (const auto &td : m_wallet->m_transfers) {
-      if (td.m_spent && td.m_spent_height == 0 && td.m_key_image_known) {
+      crypto::key_image effective_key_image{};
+      if (td.m_spent && td.m_spent_height == 0 &&
+          get_authoritative_transfer_key_image(td, effective_key_image)) {
         if (!first)
           oss << ",";
         first = false;
-        oss << epee::string_tools::pod_to_hex(td.m_key_image);
+        oss << epee::string_tools::pod_to_hex(effective_key_image);
       }
     }
     return oss.str();
@@ -12336,11 +12703,10 @@ public:
       crypto::key_image ki;
       if (!epee::string_tools::hex_to_pod(item, ki))
         continue;
-      auto it = m_wallet->m_key_images.find(ki);
-      if (it == m_wallet->m_key_images.end() ||
-          it->second >= m_wallet->m_transfers.size())
+      size_t transfer_index = 0;
+      if (!find_effective_transfer_index(ki, transfer_index, true))
         continue;
-      auto &td = m_wallet->m_transfers[it->second];
+      auto &td = m_wallet->m_transfers[transfer_index];
       // Only optimistic flags are releasable; chain-confirmed spends never are.
       if (td.m_spent && td.m_spent_height == 0) {
         td.m_spent = false;
@@ -12348,7 +12714,7 @@ public:
         wasm_log(
                 "[WASM] reverse-audit: released optimistic spent flag on "
                 "transfer %zu (tx never seen on chain)\n",
-                (size_t)it->second);
+                transfer_index);
       }
     }
     if (released > 0) {
@@ -12393,25 +12759,29 @@ public:
       std::unordered_set<crypto::hash> seen_stake_txids;
       const auto &subaddr_map = m_wallet->m_subaddresses;
       for (const auto &td : m_wallet->m_transfers) {
+        const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+            td, *m_wallet);
         // STAKE only: converts/burns/audits also carry amount_burnt, and compensating
         // those falsely inflated the series (value genuinely left the wallet there).
-        if (td.m_tx.type != cryptonote::transaction_type::STAKE)
+        if (effective_tx->type != cryptonote::transaction_type::STAKE)
           continue;
-        if (td.m_tx.amount_burnt == 0)
+        if (effective_tx->amount_burnt == 0)
           continue;
         if (seen_stake_txids.count(td.m_txid))
           continue;
-        crypto::public_key return_addr = td.m_tx.return_address;
+        crypto::public_key return_addr = effective_tx->return_address;
         if (return_addr == crypto::null_pkey)
-          return_addr = td.m_tx.protocol_tx_data.return_address;
+          return_addr = effective_tx->protocol_tx_data.return_address;
         bool is_ours = return_addr != crypto::null_pkey &&
                        subaddr_map.find(return_addr) != subaddr_map.end();
         if (!is_ours) {
-          for (const auto &in : td.m_tx.vin) {
+          for (const auto &in : effective_tx->vin) {
             if (in.type() != typeid(cryptonote::txin_to_key))
               continue;
-            if (m_wallet->m_key_images.count(
-                    boost::get<cryptonote::txin_to_key>(in).k_image)) {
+            size_t transfer_index = 0;
+            if (find_effective_transfer_index(
+                    boost::get<cryptonote::txin_to_key>(in).k_image,
+                    transfer_index)) {
               is_ours = true;
               break;
             }
@@ -12420,9 +12790,9 @@ public:
         if (!is_ours)
           continue;
         seen_stake_txids.insert(td.m_txid);
-        events.emplace_back(td.m_block_height, (int64_t)td.m_tx.amount_burnt);
+        events.emplace_back(td.m_block_height, (int64_t)effective_tx->amount_burnt);
         events.emplace_back(td.m_block_height + lock_blocks,
-                            -(int64_t)td.m_tx.amount_burnt);
+                            -(int64_t)effective_tx->amount_burnt);
       }
     }
     if (events.empty())
@@ -12606,17 +12976,18 @@ public:
       // account's cached maps from the wallet-side maps BEFORE the derived
       // passes (byte-equivalence rig caveat fix).
       size_t spent_repairs = 0;
-      if (m_deferred_spent_repair_needed) {
-        spent_repairs = repair_spent_transfers_from_wallet_txs();
-        m_deferred_spent_repair_needed = false;
-      }
-      reconcile_unconfirmed_txs();
+      const bool deferred_spent_repair = m_deferred_spent_repair_needed;
+      m_deferred_spent_repair_needed = false;
       restore_account_cached_maps();
       const size_t repaired_asset_types =
           repair_transfer_asset_types_from_outputs();
       rebuild_wallet_derived_state();
       upgrade_return_metadata_maps_if_needed();
       repair_return_output_metadata_from_transfers();
+      normalize_effective_key_images();
+      reconcile_unconfirmed_txs();
+      if (deferred_spent_repair)
+        spent_repairs = repair_spent_transfers_from_wallet_txs();
       mark_derived_state_clean();
 
       const uint64_t balance_total = m_wallet->balance(0, "SAL", false) +
@@ -12927,8 +13298,10 @@ public:
 
       for (size_t i = 0; i < transfer_count; ++i) {
         const auto &td = m_wallet->get_transfer_details(i);
+        const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+            td, *m_wallet);
 
-        if (td.m_tx.type == cryptonote::transaction_type::STAKE) {
+        if (effective_tx->type == cryptonote::transaction_type::STAKE) {
           if (!first)
             oss << ",";
           first = false;
@@ -12938,7 +13311,7 @@ public:
           oss << "{\"idx\":" << i << ",\"txid\":\""
               << epee::string_tools::pod_to_hex(td.m_txid) << "\""
               << ",\"amount\":" << td.m_amount
-              << ",\"amount_burnt\":" << td.m_tx.amount_burnt
+              << ",\"amount_burnt\":" << effective_tx->amount_burnt
               << ",\"spent\":" << (td.m_spent ? "true" : "false")
               << ",\"height\":" << td.m_block_height << ",\"asset\":\""
               << td.asset_type << "\"}";
@@ -12954,7 +13327,8 @@ public:
 
       for (size_t i = 0; i < transfer_count; ++i) {
         const auto &td = m_wallet->get_transfer_details(i);
-        if (td.m_tx.type == cryptonote::transaction_type::PROTOCOL) {
+        if (tools::wallet::get_effective_transfer_type(td, *m_wallet) ==
+            cryptonote::transaction_type::PROTOCOL) {
           if (!first)
             oss << ",";
           first = false;
@@ -13018,13 +13392,15 @@ public:
         std::vector<size_t> linked_scan_hint_indices;
         std::vector<size_t> linked_roi_indices;
 
-        for (size_t i = 0; i < m_wallet->m_transfers.size(); ++i) {
+      for (size_t i = 0; i < m_wallet->m_transfers.size(); ++i) {
           const auto &td = m_wallet->m_transfers[i];
           if (td.asset_type != asset_type) {
             continue;
           }
-          if (td.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
-              td.m_tx.type != cryptonote::transaction_type::RETURN) {
+          const auto *effective_tx = tools::wallet::get_effective_transfer_tx(
+              td, *m_wallet);
+          if (effective_tx->type != cryptonote::transaction_type::PROTOCOL &&
+              effective_tx->type != cryptonote::transaction_type::RETURN) {
             continue;
           }
 
@@ -13036,7 +13412,7 @@ public:
           }
 
           crypto::public_key output_key;
-          if (!safe_output_pubkey(td, output_key))
+          if (!safe_output_pubkey(td, *m_wallet, output_key))
             continue;
           const auto scan_hint_it = m_wallet->m_return_scan_hints.find(output_key);
           if (scan_hint_it != m_wallet->m_return_scan_hints.end() &&
@@ -13068,9 +13444,11 @@ public:
               << "\"idx\":" << pub_it->second << ","
               << "\"txid\":\""
               << epee::string_tools::pod_to_hex(source_td->m_txid) << "\","
-              << "\"tx_type\":" << static_cast<int>(source_td->m_tx.type) << ","
+              << "\"tx_type\":" << static_cast<int>(
+                     tools::wallet::get_effective_transfer_type(*source_td, *m_wallet)) << ","
               << "\"amount\":\"" << source_td->amount() << "\","
-              << "\"amount_burnt\":\"" << source_td->m_tx.amount_burnt << "\","
+              << "\"amount_burnt\":\"" << tools::wallet::get_effective_transfer_tx(
+                     *source_td, *m_wallet)->amount_burnt << "\","
               << "\"spent\":" << (source_td->m_spent ? "true" : "false") << ","
               << "\"block_height\":" << source_td->m_block_height
               << "}";
@@ -13168,12 +13546,15 @@ public:
             << ",\"origin_idx\":" << td.m_td_origin_idx
             << ",\"amount\":" << td.m_amount;
 
+        const crypto::key_image effective_key_image =
+            tools::wallet::get_effective_transfer_key_image(td, *m_wallet);
         oss << ",\"our_ki\":\""
-            << epee::string_tools::pod_to_hex(td.m_key_image).substr(0, 16)
+            << epee::string_tools::pod_to_hex(effective_key_image).substr(0, 16)
             << "...\"";
 
-        bool ki_in_map = m_wallet->m_key_images.find(td.m_key_image) !=
-                         m_wallet->m_key_images.end();
+        size_t effective_index = 0;
+        bool ki_in_map = find_effective_transfer_index(effective_key_image,
+                                                       effective_index);
         oss << ",\"ki_in_map\":" << (ki_in_map ? "true" : "false");
 
         if (!td.m_tx.vin.empty() &&
@@ -13183,8 +13564,9 @@ public:
           oss << ",\"input0_ki\":\""
               << epee::string_tools::pod_to_hex(txin.k_image).substr(0, 16)
               << "...\"";
-          bool in0_in_map = m_wallet->m_key_images.find(txin.k_image) !=
-                            m_wallet->m_key_images.end();
+          size_t input_index = 0;
+          bool in0_in_map = find_effective_transfer_index(txin.k_image,
+                                                          input_index);
           oss << ",\"input0_ki_in_map\":" << (in0_in_map ? "true" : "false");
         }
 
@@ -13234,7 +13616,8 @@ public:
         bool has_key_image = td.m_key_image_known;
         bool partial_ki = td.m_key_image_partial;
         bool spendable = !is_spent && !is_frozen && is_unlocked &&
-                         has_key_image && !partial_ki;
+                         tools::wallet::has_transfer_spend_authority(
+                             td, *m_wallet);
         bool is_account0 = (td.m_subaddr_index.major == 0);
 
         if (is_sal1) {
@@ -13289,7 +13672,8 @@ public:
         bool has_key_image = td.m_key_image_known;
         bool partial_ki = td.m_key_image_partial;
         bool spendable = !is_spent && !is_frozen && is_unlocked &&
-                         has_key_image && !partial_ki;
+                         tools::wallet::has_transfer_spend_authority(
+                             td, *m_wallet);
 
         oss << "{\"idx\":" << i << ",\"asset\":\"" << td.asset_type << "\""
             << ",\"amount\":" << td.amount()
@@ -13803,8 +14187,8 @@ public:
         const bool is_spendable = !td.m_spent && td.amount() > 0 &&
                                   !td.m_frozen &&
                                   m_wallet->is_transfer_unlocked(td) &&
-                                  td.m_key_image_known &&
-                                  !td.m_key_image_partial;
+                                  tools::wallet::has_transfer_spend_authority(
+                                      td, *m_wallet);
         if (!is_spendable) {
           continue;
         }
@@ -14123,10 +14507,11 @@ public:
         const bool counted_in_balance = !is_spent_loose && !td.m_frozen;
         const bool counted_in_unlocked = counted_in_balance && is_unlocked;
         const bool debug_spend_openings_spendable =
-            counted_in_unlocked && td.amount() > 0 && td.m_key_image_known &&
-            !td.m_key_image_partial;
+            counted_in_unlocked && td.amount() > 0 &&
+            tools::wallet::has_transfer_spend_authority(td, *m_wallet);
         const bool create_tx_all_legacy_candidate =
-            !is_spent_loose && !td.m_frozen && !td.m_key_image_partial &&
+            !is_spent_loose && !td.m_frozen &&
+            tools::wallet::has_transfer_spend_authority(td, *m_wallet) &&
             td.is_rct() && is_unlocked && td.m_subaddr_index.major == 0 &&
             td.asset_type == asset_type;
         const auto locked_it = m_wallet->m_locked_coins.find(output_key);
@@ -14140,7 +14525,8 @@ public:
             locked_coin_hit && td.m_tx.type == cryptonote::transaction_type::AUDIT;
         const bool carrot_basic_candidate =
             !locked_audit_anchor && !td.m_spent && td.amount() > 0 &&
-            td.m_key_image_known && !td.m_key_image_partial && !td.m_frozen &&
+            tools::wallet::has_transfer_spend_authority(td, *m_wallet) &&
+            !td.m_frozen &&
             (top_block_index + 1 >= td.m_block_height + blocks_locked_for) &&
             td.m_subaddr_index.major == 0 && td.amount() >= 1 &&
             td.amount() <= MONEY_SUPPLY && td.asset_type == asset_type;
@@ -14427,7 +14813,8 @@ public:
                 m_wallet->m_locked_coins.end();
         const bool usable_for_selection =
             !locked_audit_anchor && !td.m_spent && td.amount() > 0 &&
-            td.m_key_image_known && !td.m_key_image_partial && !td.m_frozen &&
+            tools::wallet::has_transfer_spend_authority(td, *m_wallet) &&
+            !td.m_frozen &&
             (top_block_index + 1 >= td.m_block_height + blocks_locked_for) &&
             td.m_subaddr_index.major == 0 && td.amount() >= 1 &&
             td.amount() <= MONEY_SUPPLY && td.asset_type == asset_type;
@@ -14724,7 +15111,8 @@ public:
             m_wallet->m_locked_coins.find(output_pubkey_or_null(td)) !=
                 m_wallet->m_locked_coins.end();
         bool result = !is_locked_audit_anchor && !is_spent && has_amount &&
-                      ki_known && !ki_partial && !frozen && height_unlocked &&
+                      tools::wallet::has_transfer_spend_authority(td, *m_wallet) &&
+                      !frozen && height_unlocked &&
                       acct_match && subaddr_match && amt_ok && is_v10;
 
         if (result) {
@@ -18310,9 +18698,10 @@ scan_csp_batch_impl(uintptr_t csp_ptr, size_t csp_size,
         std::string ki_hex = std::get<3>(match);
         crypto::key_image ki;
         if (epee::string_tools::hex_to_pod(ki_hex, ki)) {
-          auto it = g_wallet_instance->m_key_images.find(ki);
-          if (it != g_wallet_instance->m_key_images.end()) {
-            auto &td = g_wallet_instance->m_transfers[it->second];
+          size_t transfer_index = 0;
+          if (find_transfer_index_by_effective_key_image(
+                  *g_wallet_instance, ki, transfer_index)) {
+            auto &td = g_wallet_instance->m_transfers[transfer_index];
             if (!td.m_spent) {
               td.m_spent = true;
               td.m_spent_height = std::get<1>(match);

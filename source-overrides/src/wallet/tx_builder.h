@@ -147,7 +147,7 @@ std::vector<carrot::CarrotTransactionProposalV1> make_carrot_transaction_proposa
     const std::set<uint32_t> &subaddr_indices);
 wallet2::pending_tx make_pending_carrot_tx(const carrot::CarrotTransactionProposalV1 &tx_proposal,
     const wallet2::transfer_container &transfers,
-    const carrot::carrot_and_legacy_account &account);
+    const wallet2 &w);
 
 cryptonote::transaction finalize_all_proofs_from_transfer_details(
     const carrot::CarrotTransactionProposalV1 &tx_proposal,
@@ -164,6 +164,58 @@ wallet2::pending_tx finalize_all_proofs_from_transfer_details_as_pending_tx(
     const wallet2 &w);
 
 crypto::key_image get_effective_transfer_key_image(
+    const wallet2::transfer_details &td,
+    const wallet2 &w);
+
+bool has_validated_transfer_spend_authority(
+    const wallet2::transfer_details &td,
+    const wallet2 &w);
+
+// Return true only when the transfer has a complete, non-zero key image
+// authority.  Partial multisig key images are never spend authorities.
+bool has_transfer_spend_authority(
+    const wallet2::transfer_details &td,
+    const wallet2 &w);
+
+// Return true when a transfer has a complete, non-zero key image that can be
+// used for ownership/spend tracking.  This deliberately does not imply spend
+// authority: watch-only wallets may track known key images without being able
+// to construct a spend.
+bool has_transfer_key_image(
+    const wallet2::transfer_details &td,
+    const wallet2 &w);
+
+// Return-path input eligibility shared by the wrapper and the lower-level
+// transaction constructor.  This keeps callers from bypassing spendability
+// checks when supplying explicit transfer indices.
+bool is_transfer_usable_for_return(
+    const wallet2::transfer_details &td,
+    wallet2 &w);
+
+// Return the complete transaction context available for a transfer.  Runtime
+// hydration is preferred, followed by the confirmed prefix and finally the
+// serialized transfer prefix.  When the result is a hydrated full transaction
+// its address is returned through full_tx_out for APIs that need full Carrot
+// extra data.
+const cryptonote::transaction_prefix *get_effective_transfer_tx(
+    const wallet2::transfer_details &td,
+    const wallet2 &w,
+    const cryptonote::transaction **full_tx_out = nullptr);
+
+cryptonote::transaction_type get_effective_transfer_type(
+    const wallet2::transfer_details &td,
+    const wallet2 &w);
+
+bool resolve_transfer_origin_data(
+    const wallet2::transfer_details &td,
+    const wallet2 &w,
+    cryptonote::origin_data &origin_tx_data);
+
+// Validate that an owned transfer still has a spend authority.  Carrot
+// outputs are checked through the canonical opening resolver; legacy outputs
+// are checked through the same key-image derivation used by the transaction
+// builder (including stake/return origin data).
+bool validate_transfer_spend_authority(
     const wallet2::transfer_details &td,
     const wallet2 &w);
 

@@ -71,6 +71,39 @@ static constexpr T div_ceil(T dividend, T divisor)
     return (dividend + divisor - 1) / divisor;
 }
 //-------------------------------------------------------------------------------------------------------------------
+const cryptonote::transaction_prefix *get_effective_transfer_tx(
+    const wallet2::transfer_details &td,
+    const wallet2 &w,
+    const cryptonote::transaction **full_tx_out)
+{
+    if (full_tx_out)
+        *full_tx_out = nullptr;
+
+    // Hydrated full transactions carry the authoritative type and Carrot
+    // extra.  A confirmed entry is only a transaction_prefix; use it next,
+    // then fall back to the serialized transfer prefix.
+    const auto runtime_it = w.m_runtime_full_txs.find(td.m_txid);
+    if (runtime_it != w.m_runtime_full_txs.end())
+    {
+        if (full_tx_out)
+            *full_tx_out = &runtime_it->second;
+        return &runtime_it->second;
+    }
+
+    const auto confirmed_it = w.m_confirmed_txs.find(td.m_txid);
+    if (confirmed_it != w.m_confirmed_txs.end())
+        return &confirmed_it->second.m_tx;
+
+    return &td.m_tx;
+}
+
+cryptonote::transaction_type get_effective_transfer_type(
+    const wallet2::transfer_details &td,
+    const wallet2 &w)
+{
+    return get_effective_transfer_tx(td, w)->type;
+}
+//-------------------------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------------------------
 static bool is_transfer_usable_for_input_selection(const wallet2::transfer_details &td,
                                                    const std::uint32_t from_account,
@@ -86,16 +119,23 @@ static bool is_transfer_usable_for_input_selection(const wallet2::transfer_detai
     const uint64_t last_locked_block_index = cryptonote::get_last_locked_block_index(
         td.m_tx.unlock_time, td.m_block_height);
     */
+    const cryptonote::transaction_type effective_type =
+        wallet ? get_effective_transfer_type(td, *wallet) : td.m_tx.type;
+
     // Reject locked outputs
     size_t blocks_locked_for = CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE;
-    if (td.m_tx.type == cryptonote::transaction_type::MINER || td.m_tx.type == cryptonote::transaction_type::PROTOCOL)
+    if (effective_type == cryptonote::transaction_type::MINER ||
+        effective_type == cryptonote::transaction_type::PROTOCOL)
       blocks_locked_for = CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW;
 
+    const bool authority_usable = wallet
+        ? has_transfer_spend_authority(td, *wallet)
+        : (!td.m_key_image_partial && td.m_key_image_known &&
+           td.m_key_image != crypto::key_image{});
     const bool basic_usable =
         !td.m_spent
         && td.amount() > 0
-        && td.m_key_image_known
-        && !td.m_key_image_partial
+        && authority_usable
         && !td.m_frozen
         && (top_block_index +1 >= td.m_block_height + blocks_locked_for)
         // && last_locked_block_index <= top_block_index
@@ -109,68 +149,27 @@ static bool is_transfer_usable_for_input_selection(const wallet2::transfer_detai
     if (!basic_usable)
         return false;
 
-    if (wallet && td.m_tx.type == cryptonote::transaction_type::AUDIT &&
-        wallet->m_locked_coins.find(td.get_public_key()) != wallet->m_locked_coins.end())
-        return false;
+    if (wallet && effective_type == cryptonote::transaction_type::AUDIT)
+    {
+        const cryptonote::transaction_prefix *tx =
+            get_effective_transfer_tx(td, *wallet);
+        crypto::public_key output_key = crypto::null_pkey;
+        if (td.m_internal_output_index >= tx->vout.size() ||
+            !get_output_public_key(
+                tx->vout[td.m_internal_output_index], output_key) ||
+            output_key == crypto::null_pkey)
+            return false;
+        if (wallet->m_locked_coins.find(output_key) != wallet->m_locked_coins.end())
+            return false;
+    }
 
     if (!wallet)
         return true;
 
-    if (td.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
-        td.m_tx.type != cryptonote::transaction_type::RETURN)
+    if (effective_type != cryptonote::transaction_type::PROTOCOL &&
+        effective_type != cryptonote::transaction_type::RETURN)
         return true;
-
-    cryptonote::tx_source_entry src;
-    src.amount = td.amount();
-    src.rct = td.is_rct();
-    src.carrot = td.is_carrot();
-    src.coinbase = !td.m_tx.vin.empty() &&
-                   td.m_tx.vin[0].type() == typeid(cryptonote::txin_gen);
-    src.block_index = td.m_block_height;
-    src.asset_type = td.asset_type;
-    src.mask = td.m_mask;
-    src.address_spend_pubkey = td.m_recovered_spend_pubkey;
-
-    if (td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
-        td.m_td_origin_idx < wallet->m_transfers.size())
-    {
-        const auto &td_origin = wallet->m_transfers[td.m_td_origin_idx];
-        src.origin_tx_data.tx_type = td_origin.m_tx.type;
-        src.origin_tx_data.tx_pub_key =
-            cryptonote::get_tx_pub_key_from_extra(td_origin.m_tx,
-                                                  td_origin.m_pk_index);
-        src.origin_tx_data.output_index = td_origin.m_internal_output_index;
-    }
-
-    cryptonote::tx_source_entry::output_entry real_oe;
-    real_oe.first = td.m_asset_type_output_index;
-    real_oe.second.dest = rct::pk2rct(td.get_public_key());
-    real_oe.second.mask = rct::commit(td.amount(), td.m_mask);
-    src.outputs.push_back(real_oe);
-    src.real_output = 0;
-    src.real_output_in_tx_index = td.m_internal_output_index;
-    src.real_out_tx_key =
-        cryptonote::get_tx_pub_key_from_extra(td.m_tx, td.m_pk_index);
-    src.real_out_additional_tx_keys =
-        cryptonote::get_additional_tx_pub_keys_from_extra(td.m_tx);
-    if (!td.m_tx.vin.empty() &&
-        td.m_tx.vin[0].type() == typeid(cryptonote::txin_to_key))
-    {
-        src.first_rct_key_image =
-            boost::get<cryptonote::txin_to_key>(td.m_tx.vin[0]).k_image;
-    }
-
-    crypto::secret_key x_out = crypto::null_skey;
-    crypto::secret_key y_out = crypto::null_skey;
-    const auto confirmed_it = wallet->m_confirmed_txs.find(td.m_txid);
-    if (confirmed_it != wallet->m_confirmed_txs.end())
-    {
-        return try_get_address_openings_x_y(
-            confirmed_it->second.m_tx, src, *wallet, x_out, y_out, nullptr);
-    }
-
-    return try_get_address_openings_x_y(
-        td.m_tx, src, *wallet, x_out, y_out, nullptr);
+    return validate_transfer_spend_authority(td, *wallet);
 }
 //-------------------------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------------------------
@@ -431,15 +430,17 @@ bool try_get_validated_return_spend_metadata(
     crypto::key_image *derived_key_image_out = nullptr)
 {
     metadata_out = nullptr;
-    if (td.m_tx.type != cryptonote::transaction_type::PROTOCOL &&
-        td.m_tx.type != cryptonote::transaction_type::RETURN)
+    const cryptonote::transaction_prefix *tx =
+        get_effective_transfer_tx(td, w);
+    if (tx->type != cryptonote::transaction_type::PROTOCOL &&
+        tx->type != cryptonote::transaction_type::RETURN)
         return false;
 
-    if (td.m_internal_output_index >= td.m_tx.vout.size())
+    if (td.m_internal_output_index >= tx->vout.size())
         return false;
 
     crypto::public_key output_key = crypto::null_pkey;
-    if (!get_output_public_key(td.m_tx.vout[td.m_internal_output_index], output_key))
+    if (!get_output_public_key(tx->vout[td.m_internal_output_index], output_key))
         return false;
     return try_get_validated_return_spend_metadata(
         output_key, w, metadata_out, derived_key_image_out);
@@ -456,13 +457,13 @@ size_t find_wallet_transfer_index_from_container_by_effective_key_image(
         const wallet2::transfer_details &td = container[idx];
         if (get_effective_transfer_key_image(td, w) != ki)
             continue;
-        if (td.m_key_image_known)
+        if (td.m_key_image_partial)
+            CHECK_AND_ASSERT_THROW_MES(false, "Transfer detail lookups are not allowed for multisig partial key images");
+        if (has_transfer_spend_authority(td, w))
         {
             selected_from_container = true;
             break;
         }
-        if (td.m_key_image_partial)
-            CHECK_AND_ASSERT_THROW_MES(false, "Transfer detail lookups are not allowed for multisig partial key images");
     }
 
     CHECK_AND_ASSERT_THROW_MES(selected_from_container, "Key image not found");
@@ -473,10 +474,10 @@ size_t find_wallet_transfer_index_from_container_by_effective_key_image(
         const wallet2::transfer_details &td = wallet_transfers[idx];
         if (get_effective_transfer_key_image(td, w) != ki)
             continue;
-        if (td.m_key_image_known)
-            return idx;
         if (td.m_key_image_partial)
             CHECK_AND_ASSERT_THROW_MES(false, "Transfer detail lookups are not allowed for multisig partial key images");
+        if (has_transfer_spend_authority(td, w))
+            return idx;
     }
 
     CHECK_AND_ASSERT_THROW_MES(false, "Key image not found");
@@ -496,6 +497,329 @@ crypto::key_image get_effective_transfer_key_image(
         return validated_key_image;
 
     return td.m_key_image;
+}
+
+bool has_validated_transfer_spend_authority(
+    const wallet2::transfer_details &td,
+    const wallet2 &w)
+{
+    if (td.m_key_image_partial)
+        return false;
+    const carrot::return_spend_metadata_t *metadata = nullptr;
+    crypto::key_image derived_key_image{};
+    return try_get_validated_return_spend_metadata(
+               td, w, metadata, &derived_key_image) &&
+           derived_key_image != crypto::key_image{};
+}
+
+bool has_transfer_spend_authority(
+    const wallet2::transfer_details &td,
+    const wallet2 &w)
+{
+    // View/watch-only wallets may derive tracking key images, but they do not
+    // possess spend authority.  Keep this policy boundary ahead of any
+    // metadata-derived or known-key-image acceptance.
+    if (w.watch_only())
+        return false;
+    if (td.m_key_image_partial)
+        return false;
+    if (!td.m_key_image_known &&
+        !has_validated_transfer_spend_authority(td, w))
+        return false;
+    return get_effective_transfer_key_image(td, w) != crypto::key_image{};
+}
+
+bool has_transfer_key_image(
+    const wallet2::transfer_details &td,
+    const wallet2 &w)
+{
+    if (td.m_key_image_partial)
+        return false;
+
+    const crypto::key_image effective_key_image =
+        get_effective_transfer_key_image(td, w);
+    if (effective_key_image == crypto::key_image{})
+        return false;
+
+    // A serialized key image is sufficient for tracking.  Otherwise accept
+    // only the validated metadata-derived key image path used by Carrot
+    // RETURN outputs.  Do not treat a merely non-zero sparse value as known.
+    return (td.m_key_image_known && td.m_key_image != crypto::key_image{}) ||
+           has_validated_transfer_spend_authority(td, w);
+}
+
+bool is_transfer_usable_for_return(
+    const wallet2::transfer_details &td,
+    wallet2 &w)
+{
+    if (td.m_key_image_partial)
+        return false;
+    if (w.is_spent(td, false) || td.m_frozen)
+        return false;
+    if (!has_transfer_spend_authority(td, w))
+        return false;
+    return w.is_transfer_unlocked(td);
+}
+//-------------------------------------------------------------------------------------------------------------------
+// Resolve the canonical origin metadata used by legacy PROTOCOL/RETURN key
+// image derivation.  Scanner order can leave m_td_origin_idx unset while the
+// originating STAKE/AUDIT transfer is already confirmed; in that case mirror
+// wallet2::process_new_scanned_transaction's exact return-address match.
+bool resolve_transfer_origin_data(
+    const wallet2::transfer_details &td,
+    const wallet2 &w,
+    cryptonote::origin_data &origin_tx_data)
+{
+    origin_tx_data = {};
+    origin_tx_data.tx_type = cryptonote::transaction_type::UNSET;
+    origin_tx_data.tx_pub_key = crypto::null_pkey;
+    origin_tx_data.output_index = 0;
+
+    const cryptonote::transaction_prefix *tx =
+        get_effective_transfer_tx(td, w);
+    if (tx->type != cryptonote::transaction_type::PROTOCOL &&
+        tx->type != cryptonote::transaction_type::RETURN)
+        return false;
+
+    if (td.m_internal_output_index >= tx->vout.size())
+        return false;
+
+    crypto::public_key output_key = crypto::null_pkey;
+    if (!cryptonote::get_output_public_key(
+            tx->vout[td.m_internal_output_index], output_key) ||
+        output_key == crypto::null_pkey)
+        return false;
+
+    // The scanner records the originating transfer in m_salvium_txs under
+    // this exact payout output key.  Prefer that canonical link, and read all
+    // origin fields from the same effective transaction view (runtime full,
+    // confirmed prefix, then stored prefix).
+    const auto populate_origin_from_index =
+        [&](const size_t origin_idx) -> bool
+    {
+        if (origin_idx >= w.m_transfers.size())
+            return false;
+        const auto &origin_td = w.m_transfers[origin_idx];
+        const cryptonote::transaction_prefix *origin_tx =
+            get_effective_transfer_tx(origin_td, w);
+        if (!origin_tx || origin_td.m_internal_output_index >= origin_tx->vout.size())
+            return false;
+        const crypto::public_key tx_pub_key =
+            cryptonote::get_tx_pub_key_from_extra(
+                *origin_tx, origin_td.m_pk_index);
+        if (origin_tx->type == cryptonote::transaction_type::UNSET ||
+            tx_pub_key == crypto::null_pkey)
+            return false;
+        origin_tx_data.tx_type = origin_tx->type;
+        origin_tx_data.tx_pub_key = tx_pub_key;
+        origin_tx_data.output_index = origin_td.m_internal_output_index;
+        return true;
+    };
+
+    const auto salvium_it = w.m_salvium_txs.find(output_key);
+    if (salvium_it != w.m_salvium_txs.end() &&
+        populate_origin_from_index(salvium_it->second))
+        return true;
+
+    // Keep an explicit serialized origin index as a secondary source when a
+    // wallet was materialized without the scanner's m_salvium_txs entry.
+    if (td.m_td_origin_idx != std::numeric_limits<uint64_t>::max() &&
+        populate_origin_from_index(td.m_td_origin_idx))
+        return true;
+
+    // Last-resort compatibility path for old/sparse wallets: mirror the
+    // scanner's exact return-address match.  Some restored caches contain the
+    // owned origin transfer and its hydrated transaction but neither a
+    // confirmed-prefix entry nor m_salvium_txs/m_td_origin_idx.  Resolve that
+    // transfer directly before falling back to the confirmed transaction map.
+    for (size_t origin_idx = 0; origin_idx < w.m_transfers.size(); ++origin_idx)
+    {
+        const auto &origin_td = w.m_transfers[origin_idx];
+        if (&origin_td == &td)
+            continue;
+        const cryptonote::transaction_prefix *candidate_tx =
+            get_effective_transfer_tx(origin_td, w);
+        if (!candidate_tx ||
+            (candidate_tx->type != cryptonote::transaction_type::CONVERT &&
+             candidate_tx->type != cryptonote::transaction_type::STAKE &&
+             candidate_tx->type != cryptonote::transaction_type::AUDIT &&
+             candidate_tx->type != cryptonote::transaction_type::CREATE_TOKEN))
+            continue;
+        crypto::public_key candidate_return = candidate_tx->return_address;
+        if (candidate_return == crypto::null_pkey)
+            candidate_return = candidate_tx->protocol_tx_data.return_address;
+        if (candidate_return != output_key)
+            continue;
+        if (populate_origin_from_index(origin_idx))
+            return true;
+    }
+
+    // Older confirmed-only caches predate the transfer linkage.  These legacy
+    // STAKE/AUDIT entries historically used output zero, so retain that exact
+    // confirmed-map fallback after the complete transfer-table search.
+    for (const auto &entry : w.m_confirmed_txs)
+    {
+        const cryptonote::transaction_prefix *candidate_tx = &entry.second.m_tx;
+        const auto runtime_candidate_it =
+            w.m_runtime_full_txs.find(entry.first);
+        if (runtime_candidate_it != w.m_runtime_full_txs.end())
+            candidate_tx = &runtime_candidate_it->second;
+        const cryptonote::transaction_prefix &candidate = *candidate_tx;
+        if (candidate.type != cryptonote::transaction_type::STAKE &&
+            candidate.type != cryptonote::transaction_type::AUDIT)
+            continue;
+        crypto::public_key candidate_return = candidate.return_address;
+        if (candidate_return == crypto::null_pkey)
+            candidate_return = candidate.protocol_tx_data.return_address;
+        if (candidate_return != output_key)
+            continue;
+        origin_tx_data.tx_pub_key =
+            cryptonote::get_tx_pub_key_from_extra(candidate);
+        origin_tx_data.output_index = 0;
+        origin_tx_data.tx_type = candidate.type;
+        if (origin_tx_data.tx_pub_key != crypto::null_pkey)
+            return true;
+    }
+    origin_tx_data = {};
+    origin_tx_data.tx_type = cryptonote::transaction_type::UNSET;
+    origin_tx_data.tx_pub_key = crypto::null_pkey;
+    origin_tx_data.output_index = 0;
+    return false;
+}
+//-------------------------------------------------------------------------------------------------------------------
+bool validate_transfer_spend_authority(
+    const wallet2::transfer_details &td,
+    const wallet2 &w)
+{
+    // A validator must never turn unknown, partial, or zero key-image state
+    // into a spendable output.  The caller may still use such a transfer for
+    // display, but selection and send validation fail closed.
+    const bool validated_metadata =
+        has_validated_transfer_spend_authority(td, w);
+    if ((!td.m_key_image_known && !validated_metadata) ||
+        td.m_key_image_partial ||
+        (td.m_key_image == crypto::key_image{} && !validated_metadata))
+        return false;
+
+    try
+    {
+        const cryptonote::transaction *full_tx = nullptr;
+        // The serialized transfer can be a sparse prefix.  Prefer the
+        // complete runtime transaction, then confirmed prefix, then storage;
+        // retain the full handle for Carrot's transaction overload.
+        const cryptonote::transaction_prefix *tx =
+            get_effective_transfer_tx(td, w, &full_tx);
+
+        if (td.m_internal_output_index >= tx->vout.size())
+            return false;
+
+        crypto::public_key output_key = crypto::null_pkey;
+        if (!cryptonote::get_output_public_key(
+                tx->vout[td.m_internal_output_index], output_key) ||
+            output_key == crypto::null_pkey)
+            return false;
+
+        cryptonote::tx_source_entry src;
+        src.amount = td.amount();
+        src.rct = td.is_rct();
+        src.carrot = tx->vout[td.m_internal_output_index].target.type() ==
+                     typeid(cryptonote::txout_to_carrot_v1);
+        src.coinbase = !tx->vin.empty() &&
+                       tx->vin[0].type() == typeid(cryptonote::txin_gen);
+        src.block_index = td.m_block_height;
+        src.asset_type = td.asset_type;
+        src.mask = td.m_mask;
+        src.address_spend_pubkey = td.m_recovered_spend_pubkey;
+        // Both legacy key-image derivation and ordinary Carrot address opening
+        // need the effective transaction's ephemeral keys.  Returned Carrot
+        // metadata can open without them, but normal Carrot outputs cannot.
+        src.real_out_tx_key =
+            cryptonote::get_tx_pub_key_from_extra(*tx, td.m_pk_index);
+        src.real_out_additional_tx_keys =
+            cryptonote::get_additional_tx_pub_keys_from_extra(*tx);
+        src.first_rct_key_image = crypto::key_image{};
+        if (!tx->vin.empty() &&
+            tx->vin[0].type() == typeid(cryptonote::txin_to_key))
+        {
+            src.first_rct_key_image =
+                boost::get<cryptonote::txin_to_key>(tx->vin[0]).k_image;
+        }
+
+        cryptonote::origin_data origin_tx_data{};
+        const bool have_origin_data =
+            resolve_transfer_origin_data(td, w, origin_tx_data);
+
+        cryptonote::tx_source_entry::output_entry real_oe;
+        real_oe.first = td.m_asset_type_output_index;
+        real_oe.second.dest = rct::pk2rct(output_key);
+        real_oe.second.mask = rct::commit(td.amount(), td.m_mask);
+        src.outputs.push_back(real_oe);
+        src.real_output = 0;
+        src.real_output_in_tx_index = td.m_internal_output_index;
+        src.origin_tx_data = origin_tx_data;
+
+        if (!src.carrot)
+        {
+            // Legacy key-image derivation needs the main/additional tx
+            // pubkeys and, for RingCT inputs, the first input context.  A
+            // Carrot opening check must not reject a valid transaction merely
+            // because its legacy tx pubkey is absent from a sparse prefix.
+            if (src.real_out_tx_key == crypto::null_pkey)
+                return false;
+
+            // Historical PROTOCOL/RETURN payouts are not ordinary legacy
+            // outputs: their spend key is derived from the originating STAKE,
+            // AUDIT, or CONVERT transaction.  Without the canonical origin
+            // link, the ordinary derivation must not claim authority.
+            if ((tx->type == cryptonote::transaction_type::PROTOCOL ||
+                 tx->type == cryptonote::transaction_type::RETURN) &&
+                !have_origin_data)
+                return false;
+
+            hw::device &hwdev = w.get_account().get_keys().get_device();
+            hw::reset_mode reset_mode(hwdev);
+            hwdev.set_mode(hw::device::TRANSACTION_PARSE);
+            cryptonote::keypair in_ephemeral;
+            crypto::key_image derived_key_image;
+            rct::salvium_input_data_t sid;
+            const bool generated = cryptonote::generate_key_image_helper(
+                w.get_account().get_keys(),
+                w.get_account().get_subaddress_map_cn(), output_key,
+                src.real_out_tx_key, src.real_out_additional_tx_keys,
+                src.real_output_in_tx_index, in_ephemeral, derived_key_image,
+                hwdev, have_origin_data, origin_tx_data, sid);
+            const crypto::key_image expected_key_image =
+                get_effective_transfer_key_image(td, w);
+            return generated && in_ephemeral.pub == output_key &&
+                   expected_key_image != crypto::key_image{} &&
+                   derived_key_image == expected_key_image;
+        }
+
+        crypto::secret_key x_out = crypto::null_skey;
+        crypto::secret_key y_out = crypto::null_skey;
+        const bool opened = full_tx
+            ? try_get_address_openings_x_y(
+                  *full_tx, src, w, x_out, y_out, nullptr)
+            : try_get_address_openings_x_y(
+                  *tx, src, w, x_out, y_out, nullptr);
+        if (!opened)
+            return false;
+
+        // Carrot authority is tied to the output's address opening, not to a
+        // persisted key-image flag.  Re-derive the image from the effective
+        // output context and require it to match the canonical/restored
+        // effective image before allowing the transfer to be spent.
+        crypto::key_image derived_key_image{};
+        crypto::generate_key_image(output_key, x_out, derived_key_image);
+        const crypto::key_image expected_key_image =
+            get_effective_transfer_key_image(td, w);
+        return expected_key_image != crypto::key_image{} &&
+               derived_key_image == expected_key_image;
+    }
+    catch (...)
+    {
+        return false;
+    }
 }
 //-------------------------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------------------------
@@ -610,10 +934,12 @@ std::unordered_map<crypto::key_image, size_t> collect_non_burned_transfers_by_ke
     for (size_t i = 0; i < transfers.size(); ++i)
     {
         const wallet2::transfer_details &td = transfers.at(i);
-        if (!td.m_key_image_known || td.m_key_image_partial)
+        if (!has_transfer_spend_authority(td, w))
             continue;
         const crypto::key_image effective_key_image =
             get_effective_transfer_key_image(td, w);
+        if (effective_key_image == crypto::key_image{})
+            continue;
         const auto it = best_transfer_index_by_ki.find(effective_key_image);
         if (it == best_transfer_index_by_ki.end())
         {
@@ -663,12 +989,14 @@ carrot::select_inputs_func_t make_wallet2_single_transfer_input_selector(
                                                    asset_type,
                                                    &w))
         {
+            const cryptonote::transaction_prefix *effective_tx =
+                get_effective_transfer_tx(td, w);
             input_candidates.push_back(carrot::InputCandidate{
                 .core = carrot::CarrotSelectedInput{
                     .amount = td.amount(),
                     .key_image = get_effective_transfer_key_image(td, w)
                 },
-                .is_pre_carrot = !carrot::is_carrot_transaction_v1(td.m_tx),
+                .is_pre_carrot = !carrot::is_carrot_transaction_v1(*effective_tx),
                 .is_external = true, //! @TODO: derive this info from field in transfer_details
                 .block_index = td.m_block_height
             });
@@ -766,20 +1094,44 @@ std::vector<cryptonote::tx_source_entry> get_sources(
         // Sanity check the asset_type for this TD is correct
         THROW_WALLET_EXCEPTION_IF(td.asset_type != source_asset, error::wallet_internal_error, "Input has wrong asset_type - expected " + source_asset + " but found " + td.asset_type);
 
+        const cryptonote::transaction_prefix *effective_tx =
+            get_effective_transfer_tx(td, w);
+        const cryptonote::transaction_type effective_type =
+            effective_tx->type;
+        THROW_WALLET_EXCEPTION_IF(
+            td.m_internal_output_index >= effective_tx->vout.size(),
+            error::wallet_internal_error,
+            "selected transfer output is missing from effective transaction");
+
+        crypto::public_key effective_output_key = crypto::null_pkey;
+        THROW_WALLET_EXCEPTION_IF(
+            !get_output_public_key(
+                effective_tx->vout[td.m_internal_output_index],
+                effective_output_key),
+            error::wallet_internal_error,
+            "selected transfer output has no public key in effective transaction");
+
         src.amount = td.amount();
         src.rct = td.is_rct();
-        src.carrot = td.is_carrot();
-        src.coinbase = td.m_tx.vin[0].type() == typeid(cryptonote::txin_gen);
+        src.carrot = effective_tx->vout[td.m_internal_output_index].target.type() ==
+                     typeid(cryptonote::txout_to_carrot_v1);
+        src.coinbase = !effective_tx->vin.empty() &&
+                       effective_tx->vin[0].type() == typeid(cryptonote::txin_gen);
         src.block_index = td.m_block_height;
         src.asset_type = td.asset_type;
 
-        // Create the origin TX data
-        if (td.m_td_origin_idx != (uint64_t)-1) {
-            THROW_WALLET_EXCEPTION_IF(td.m_td_origin_idx >= w.get_num_transfer_details(), error::wallet_internal_error, "cannot locate return_payment origin index in m_transfers");
-            const wallet2::transfer_details& td_origin = w.get_transfer_details(td.m_td_origin_idx);
-            src.origin_tx_data.tx_type    = td_origin.m_tx.type;
-            src.origin_tx_data.tx_pub_key   = cryptonote::get_tx_pub_key_from_extra(td_origin.m_tx);
-            src.origin_tx_data.output_index = td_origin.m_internal_output_index;
+        // Create origin data through the same canonical resolver used by
+        // spend validation.  This includes the scanner-compatible confirmed
+        // STAKE/AUDIT fallback when scan order left m_td_origin_idx unset.
+        const bool have_origin_data =
+            resolve_transfer_origin_data(td, w, src.origin_tx_data);
+        if (!src.carrot &&
+            (effective_type == cryptonote::transaction_type::PROTOCOL ||
+             effective_type == cryptonote::transaction_type::RETURN))
+        {
+            THROW_WALLET_EXCEPTION_IF(
+                !have_origin_data, error::wallet_internal_error,
+                "cannot locate legacy return_payment origin data");
         }
 
         //paste mixin transaction
@@ -808,11 +1160,11 @@ std::vector<cryptonote::tx_source_entry> get_sources(
         });
         if (it_to_replace == src.outputs.end())
         {
-            const crypto::public_key real_key = td.get_public_key();
             const rct::key real_mask = rct::commit(td.amount(), td.m_mask);
             it_to_replace = std::find_if(src.outputs.begin(), src.outputs.end(), [&](const tx_output_entry& a)
             {
-                return rct::rct2pk(a.second.dest) == real_key && a.second.mask == real_mask;
+                return rct::rct2pk(a.second.dest) == effective_output_key &&
+                       a.second.mask == real_mask;
             });
         }
         THROW_WALLET_EXCEPTION_IF(it_to_replace == src.outputs.end(), error::wallet_internal_error,
@@ -824,11 +1176,13 @@ std::vector<cryptonote::tx_source_entry> get_sources(
         //real_oe.first = td.m_global_output_index;
         real_oe.first = it_to_replace->first;
         // LAND AHOY!!!
-        real_oe.second.dest = rct::pk2rct(td.get_public_key());
+        real_oe.second.dest = rct::pk2rct(effective_output_key);
         real_oe.second.mask = rct::commit(td.amount(), td.m_mask);
         *it_to_replace = real_oe;
-        src.real_out_tx_key = get_tx_pub_key_from_extra(td.m_tx, td.m_pk_index);
-        src.real_out_additional_tx_keys = get_additional_tx_pub_keys_from_extra(td.m_tx);
+        src.real_out_tx_key =
+            get_tx_pub_key_from_extra(*effective_tx, td.m_pk_index);
+        src.real_out_additional_tx_keys =
+            get_additional_tx_pub_keys_from_extra(*effective_tx);
         src.real_output = it_to_replace - src.outputs.begin();
         src.real_output_in_tx_index = td.m_internal_output_index;
         src.mask = td.m_mask;
@@ -841,8 +1195,10 @@ std::vector<cryptonote::tx_source_entry> get_sources(
             // payout output, treat the payout itself as authoritative.
             src.origin_tx_data = {};
         }
-        if (td.m_tx.vin[0].type() == typeid(cryptonote::txin_to_key)) {
-            src.first_rct_key_image = boost::get<cryptonote::txin_to_key>(td.m_tx.vin[0]).k_image;
+        if (!effective_tx->vin.empty() &&
+            effective_tx->vin[0].type() == typeid(cryptonote::txin_to_key)) {
+            src.first_rct_key_image =
+                boost::get<cryptonote::txin_to_key>(effective_tx->vin[0]).k_image;
         }
 
         if (false) // w.m_multisig // TODO:
@@ -1414,6 +1770,12 @@ bool try_get_address_openings_x_y_impl(
     const cryptonote::transaction *tx_full,
     std::string *failure_reason)
 {
+    if (src.real_output >= src.outputs.size())
+    {
+        if (failure_reason)
+            *failure_reason = "invalid_real_output";
+        return false;
+    }
     const crypto::public_key return_output_key =
         rct::rct2pk(src.outputs[src.real_output].second.dest);
     const auto &return_scan_hints = w.get_account().get_return_scan_hint_map_ref();
@@ -1518,16 +1880,18 @@ bool try_get_address_openings_x_y_impl(
             for (size_t idx = 0; idx < w.m_transfers.size(); ++idx)
             {
                 const auto &candidate_td = w.m_transfers[idx];
-                if (candidate_td.m_tx.type != tx_type)
+                const cryptonote::transaction_prefix *candidate_tx =
+                    get_effective_transfer_tx(candidate_td, w);
+                if (candidate_tx->type != tx_type)
                     continue;
                 if (candidate_td.m_internal_output_index != output_index)
                     continue;
 
                 const crypto::public_key candidate_tx_pub_key =
-                    cryptonote::get_tx_pub_key_from_extra(candidate_td.m_tx,
+                    cryptonote::get_tx_pub_key_from_extra(*candidate_tx,
                                                           candidate_td.m_pk_index);
                 const crypto::public_key candidate_tx_pub_key_default =
-                    cryptonote::get_tx_pub_key_from_extra(candidate_td.m_tx);
+                    cryptonote::get_tx_pub_key_from_extra(*candidate_tx);
                 if (candidate_tx_pub_key == tx_pub_key ||
                     candidate_tx_pub_key_default == tx_pub_key)
                 {
@@ -1555,42 +1919,61 @@ bool try_get_address_openings_x_y_impl(
         if (change_idx < w.m_transfers.size())
         {
             const auto &change_td = w.m_transfers[change_idx];
-            if (change_td.get_public_key() != rct::rct2pk(src.outputs[src.real_output].second.dest))
+            const cryptonote::transaction *change_tx_full = nullptr;
+            const cryptonote::transaction_prefix *change_tx =
+                get_effective_transfer_tx(change_td, w, &change_tx_full);
+            crypto::public_key change_output_key = crypto::null_pkey;
+            const bool change_output_valid =
+                change_td.m_internal_output_index < change_tx->vout.size() &&
+                cryptonote::get_output_public_key(
+                    change_tx->vout[change_td.m_internal_output_index],
+                    change_output_key) &&
+                change_output_key != crypto::null_pkey;
+            if (change_output_valid &&
+                change_output_key !=
+                    rct::rct2pk(src.outputs[src.real_output].second.dest))
             {
                 cryptonote::tx_source_entry change_src;
                 change_src.amount = change_td.amount();
                 change_src.rct = change_td.is_rct();
-                change_src.carrot = change_td.is_carrot();
-                change_src.coinbase = !change_td.m_tx.vin.empty() &&
-                                      change_td.m_tx.vin[0].type() == typeid(cryptonote::txin_gen);
+                change_src.carrot =
+                    change_tx->vout[change_td.m_internal_output_index].target.type() ==
+                    typeid(cryptonote::txout_to_carrot_v1);
+                change_src.coinbase = !change_tx->vin.empty() &&
+                                      change_tx->vin[0].type() == typeid(cryptonote::txin_gen);
                 change_src.block_index = change_td.m_block_height;
                 change_src.asset_type = change_td.asset_type;
                 change_src.mask = change_td.m_mask;
                 change_src.address_spend_pubkey = change_td.m_recovered_spend_pubkey;
                 cryptonote::tx_source_entry::output_entry change_oe;
                 change_oe.first = change_td.m_asset_type_output_index;
-                change_oe.second.dest = rct::pk2rct(change_td.get_public_key());
+                change_oe.second.dest = rct::pk2rct(change_output_key);
                 change_oe.second.mask = rct::commit(change_td.amount(), change_td.m_mask);
                 change_src.outputs.push_back(change_oe);
                 change_src.real_output = 0;
                 change_src.real_output_in_tx_index = change_td.m_internal_output_index;
                 change_src.real_out_tx_key =
-                    cryptonote::get_tx_pub_key_from_extra(change_td.m_tx, change_td.m_pk_index);
+                    cryptonote::get_tx_pub_key_from_extra(*change_tx, change_td.m_pk_index);
                 change_src.real_out_additional_tx_keys =
-                    cryptonote::get_additional_tx_pub_keys_from_extra(change_td.m_tx);
-                if (!change_td.m_tx.vin.empty() &&
-                    change_td.m_tx.vin[0].type() == typeid(cryptonote::txin_to_key))
+                    cryptonote::get_additional_tx_pub_keys_from_extra(*change_tx);
+                if (!change_tx->vin.empty() &&
+                    change_tx->vin[0].type() == typeid(cryptonote::txin_to_key))
                 {
                     change_src.first_rct_key_image =
-                        boost::get<cryptonote::txin_to_key>(change_td.m_tx.vin[0]).k_image;
+                        boost::get<cryptonote::txin_to_key>(change_tx->vin[0]).k_image;
                 }
 
                 crypto::secret_key change_x = crypto::null_skey;
                 crypto::secret_key change_y = crypto::null_skey;
                 std::string ignored_reason;
-                if (try_get_address_openings_x_y(
-                        change_td.m_tx, change_src, w, change_x, change_y,
-                        &ignored_reason))
+                const bool change_opened = change_tx_full
+                    ? try_get_address_openings_x_y(
+                          *change_tx_full, change_src, w, change_x, change_y,
+                          &ignored_reason)
+                    : try_get_address_openings_x_y(
+                          *change_tx, change_src, w, change_x, change_y,
+                          &ignored_reason);
+                if (change_opened)
                 {
                     bool recomputed_match = false;
                     std::string exact_scan_trace;
@@ -1705,7 +2088,7 @@ bool try_get_address_openings_x_y_impl(
                         canonical_spend_candidates.push_back(
                             change_td.m_recovered_spend_pubkey);
                         canonical_spend_candidates.push_back(
-                            change_td.get_public_key());
+                            change_output_key);
                         const auto roi_it_local =
                             return_output_map.find(return_output_key);
                         if (roi_it_local != return_output_map.end())
@@ -1859,23 +2242,23 @@ bool try_get_address_openings_x_y_impl(
                     const auto roi_it = return_output_map.find(return_output_key);
                     if (roi_it != return_output_map.end() &&
                         roi_it->second.K_change != crypto::null_pkey &&
-                        roi_it->second.K_change == change_td.get_public_key())
+                        roi_it->second.K_change == change_output_key)
                     {
                         carrot::input_context_t repaired_origin_input_context =
                             carrot::gen_input_context();
                         const bool have_repaired_origin_input_context =
                             derive_input_context_from_tx(
-                                change_td.m_tx, repaired_origin_input_context);
+                                *change_tx, repaired_origin_input_context);
                         for (size_t origin_output_index = 0;
-                             origin_output_index < change_td.m_tx.vout.size();
+                             origin_output_index < change_tx->vout.size();
                              ++origin_output_index)
                         {
                             crypto::public_key origin_output_key = crypto::null_pkey;
                             if (!cryptonote::get_output_public_key(
-                                    change_td.m_tx.vout[origin_output_index],
+                                    change_tx->vout[origin_output_index],
                                     origin_output_key) ||
                                 origin_output_key == crypto::null_pkey ||
-                                origin_output_key == change_td.get_public_key())
+                                origin_output_key == change_output_key)
                             {
                                 continue;
                             }
@@ -1973,6 +2356,13 @@ bool try_get_address_openings_x_y_impl(
         }
 
         crypto::hash s_sender_receiver;
+        if (main_derivations.empty() &&
+            src.real_output_in_tx_index >= additional_derivations.size())
+        {
+            if (failure_reason)
+                *failure_reason = "missing_additional_derivation";
+            return false;
+        }
         const crypto::key_derivation &kd = main_derivations.size()
             ? main_derivations[0]
             : additional_derivations[src.real_output_in_tx_index];
@@ -1988,6 +2378,12 @@ bool try_get_address_openings_x_y_impl(
 
         const bool shared_ephemeral_pubkey = enote_ephemeral_pubkeys.size() == 1;
         const size_t ephemeral_pubkey_index = shared_ephemeral_pubkey ? 0 : src.real_output_in_tx_index;
+        if (ephemeral_pubkey_index >= enote_ephemeral_pubkeys.size())
+        {
+            if (failure_reason)
+                *failure_reason = "missing_ephemeral_pubkey";
+            return false;
+        }
 
         // input_context
         carrot::input_context_t input_context;
@@ -2078,17 +2474,18 @@ bool try_get_address_openings_x_y_impl(
         for (size_t cidx = 0; cidx < w.m_transfers.size() && !r; ++cidx)
         {
             const auto &cand = w.m_transfers[cidx];
-            const crypto::public_key K_change = cand.get_public_key();
-            if (K_change == crypto::null_pkey || K_change == ret_key)
+            const cryptonote::transaction *cand_tx_full = nullptr;
+            const cryptonote::transaction_prefix *cand_tx =
+                get_effective_transfer_tx(cand, w, &cand_tx_full);
+            crypto::public_key K_change = crypto::null_pkey;
+            if (cand.m_internal_output_index >= cand_tx->vout.size() ||
+                !cryptonote::get_output_public_key(
+                    cand_tx->vout[cand.m_internal_output_index], K_change) ||
+                K_change == crypto::null_pkey || K_change == ret_key)
                 continue;
             carrot::input_context_t cand_ic = carrot::gen_input_context();
-            if (!deterministic_input_context_from_tx(cand.m_tx, cand_ic))
+            if (!deterministic_input_context_from_tx(*cand_tx, cand_ic))
                 continue;
-            // Prefer the hydrated full origin tx (all output keys) when available.
-            const cryptonote::transaction_prefix *cand_tx = &cand.m_tx;
-            const auto cand_rt = w.m_runtime_full_txs.find(cand.m_txid);
-            if (cand_rt != w.m_runtime_full_txs.end())
-                cand_tx = &cand_rt->second;
             crypto::secret_key matched_k_return = crypto::null_skey;
             bool found_origin = false;
             for (size_t oi = 0; oi < cand_tx->vout.size() && !found_origin; ++oi)
@@ -2116,9 +2513,11 @@ bool try_get_address_openings_x_y_impl(
             cryptonote::tx_source_entry cand_src;
             cand_src.amount = cand.amount();
             cand_src.rct = cand.is_rct();
-            cand_src.carrot = cand.is_carrot();
-            cand_src.coinbase = !cand.m_tx.vin.empty() &&
-                                cand.m_tx.vin[0].type() == typeid(cryptonote::txin_gen);
+            cand_src.carrot =
+                cand_tx->vout[cand.m_internal_output_index].target.type() ==
+                typeid(cryptonote::txout_to_carrot_v1);
+            cand_src.coinbase = !cand_tx->vin.empty() &&
+                                cand_tx->vin[0].type() == typeid(cryptonote::txin_gen);
             cand_src.block_index = cand.m_block_height;
             cand_src.asset_type = cand.asset_type;
             cand_src.mask = cand.m_mask;
@@ -2131,17 +2530,23 @@ bool try_get_address_openings_x_y_impl(
             cand_src.real_output = 0;
             cand_src.real_output_in_tx_index = cand.m_internal_output_index;
             cand_src.real_out_tx_key =
-                cryptonote::get_tx_pub_key_from_extra(cand.m_tx, cand.m_pk_index);
+                cryptonote::get_tx_pub_key_from_extra(*cand_tx, cand.m_pk_index);
             cand_src.real_out_additional_tx_keys =
-                cryptonote::get_additional_tx_pub_keys_from_extra(cand.m_tx);
-            if (!cand.m_tx.vin.empty() &&
-                cand.m_tx.vin[0].type() == typeid(cryptonote::txin_to_key))
+                cryptonote::get_additional_tx_pub_keys_from_extra(*cand_tx);
+            if (!cand_tx->vin.empty() &&
+                cand_tx->vin[0].type() == typeid(cryptonote::txin_to_key))
                 cand_src.first_rct_key_image =
-                    boost::get<cryptonote::txin_to_key>(cand.m_tx.vin[0]).k_image;
+                    boost::get<cryptonote::txin_to_key>(cand_tx->vin[0]).k_image;
             crypto::secret_key change_x = crypto::null_skey;
             crypto::secret_key change_y = crypto::null_skey;
             std::string det_ignored;
-            if (!try_get_address_openings_x_y(cand.m_tx, cand_src, w, change_x, change_y, &det_ignored))
+            const bool cand_opened = cand_tx_full
+                ? try_get_address_openings_x_y(
+                      *cand_tx_full, cand_src, w, change_x, change_y,
+                      &det_ignored)
+                : try_get_address_openings_x_y(
+                      *cand_tx, cand_src, w, change_x, change_y, &det_ignored);
+            if (!cand_opened)
                 continue;
             // K_r = k_return*G + K_change = (k_return + change_x)*G + change_y*T
             crypto::secret_key det_x = crypto::null_skey;
@@ -2551,8 +2956,9 @@ cryptonote::transaction finalize_all_proofs_from_transfer_details(
 //-------------------------------------------------------------------------------------------------------------------
 wallet2::pending_tx make_pending_carrot_tx(const carrot::CarrotTransactionProposalV1 &tx_proposal,
     const wallet2::transfer_container &transfers,
-    const carrot::carrot_and_legacy_account &account)
+    const wallet2 &w)
 {
+    const carrot::carrot_and_legacy_account &account = w.get_account();
     const std::size_t n_inputs = tx_proposal.key_images_sorted.size();
     const std::size_t n_outputs = tx_proposal.normal_payment_proposals.size() +
         tx_proposal.selfsend_payment_proposals.size();
@@ -2593,8 +2999,17 @@ wallet2::pending_tx make_pending_carrot_tx(const carrot::CarrotTransactionPropos
 
         auto transfer_it = std::find_if(
             transfers.begin(), transfers.end(),
-            [&source_output_key](const wallet2::transfer_details &td) {
-              return td.get_public_key() == source_output_key;
+            [&w, &source_output_key](const wallet2::transfer_details &td) {
+              const cryptonote::transaction_prefix *effective_tx =
+                  get_effective_transfer_tx(td, w);
+              if (!effective_tx || td.m_internal_output_index >= effective_tx->vout.size())
+                  return false;
+              crypto::public_key effective_output_key = crypto::null_pkey;
+              if (!cryptonote::get_output_public_key(
+                      effective_tx->vout[td.m_internal_output_index],
+                      effective_output_key))
+                  return false;
+              return effective_output_key == source_output_key;
             });
         CHECK_AND_ASSERT_THROW_MES(transfer_it != transfers.end(),
             "make_pending_carrot_tx: source output not found in transfers");
@@ -2710,7 +3125,7 @@ wallet2::pending_tx finalize_all_proofs_from_transfer_details_as_pending_tx(
 {
     wallet2::pending_tx ptx = make_pending_carrot_tx(tx_proposal,
         transfers,
-        w.get_account());
+        w);
 
     ptx.tx = finalize_all_proofs_from_transfer_details(
         tx_proposal,
