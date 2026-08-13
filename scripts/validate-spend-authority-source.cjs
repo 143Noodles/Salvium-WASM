@@ -262,6 +262,10 @@ requireText(hydration, 'stored_hashes', 'hydration stored hash telemetry');
 requireText(hydration, 'rejected_count', 'hydration rejection count telemetry');
 requireText(hydration, '"parse_failed"', 'hydration parse-failure reason');
 requireText(hydration, '"hash_mismatch"', 'hydration hash-mismatch reason');
+requireText(hydration, '"SPR7"', 'canonical prunable-hash sparse format');
+requireText(hydration, 'parse_and_validate_tx_base_from_blob', 'legacy base transaction parser fallback');
+requireText(hydration, 'get_pruned_transaction_hash', 'pruned transaction hash reconstruction');
+requireText(hydration, 'base_fallbacks', 'legacy base-parser telemetry');
 
 const candidateHashes = bindings.slice(
   bindings.indexOf('std::string get_runtime_full_tx_candidate_hashes()'),

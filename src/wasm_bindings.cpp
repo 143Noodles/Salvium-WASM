@@ -6743,22 +6743,31 @@ public:
     try {
       const uint8_t *data = reinterpret_cast<const uint8_t *>(ptr);
       if (!(memcmp(data, "SPR3", 4) == 0 || memcmp(data, "SPR4", 4) == 0 ||
-            memcmp(data, "SPR5", 4) == 0 || memcmp(data, "SPR6", 4) == 0)) {
+            memcmp(data, "SPR5", 4) == 0 || memcmp(data, "SPR6", 4) == 0 ||
+            memcmp(data, "SPR7", 4) == 0)) {
         return R"({"success":false,"error":"Unsupported sparse format"})";
       }
 
       const bool has_timestamp = (memcmp(data, "SPR5", 4) == 0 ||
-                                  memcmp(data, "SPR6", 4) == 0);
+                                  memcmp(data, "SPR6", 4) == 0 ||
+                                  memcmp(data, "SPR7", 4) == 0);
       const bool has_block_version = (memcmp(data, "SPR6", 4) == 0);
+      // SPR7 is emitted only by the canonical by-hash route.  It carries the
+      // daemon-provided prunable hash so legacy transactions whose obsolete
+      // proof encoding cannot be expanded can still be parsed as a base tx and
+      // cryptographically tied to the canonical transaction id.
+      const bool has_prunable_hash = (memcmp(data, "SPR7", 4) == 0);
       const bool has_asset_indices = (memcmp(data, "SPR4", 4) == 0 ||
                                       memcmp(data, "SPR5", 4) == 0 ||
-                                      memcmp(data, "SPR6", 4) == 0);
+                                      memcmp(data, "SPR6", 4) == 0 ||
+                                      memcmp(data, "SPR7", 4) == 0);
       uint32_t tx_count = 0;
       memcpy(&tx_count, data + 4, 4);
 
       size_t offset = 8;
       size_t stored = 0;
       size_t parsed = 0;
+      size_t base_fallbacks = 0;
       std::vector<crypto::hash> stored_hashes;
       struct sparse_rejection {
         crypto::hash hash;
@@ -6787,6 +6796,13 @@ public:
         crypto::hash tx_hash = crypto::null_hash;
         memcpy(&tx_hash, data + offset, 32);
         offset += 32;
+
+        crypto::hash prunable_hash = crypto::null_hash;
+        if (has_prunable_hash) {
+          if (offset + 32 > size) break;
+          memcpy(&prunable_hash, data + offset, 32);
+          offset += 32;
+        }
 
         if (offset + 2 > size) break;
         uint16_t output_count = 0;
@@ -6818,15 +6834,33 @@ public:
         cryptonote::transaction tx;
         crypto::hash parsed_tx_hash = crypto::null_hash;
         crypto::hash tx_prefix_hash = crypto::null_hash;
+        bool used_base_fallback = false;
         if (!cryptonote::parse_and_validate_tx_from_blob(
                 tx_blob, tx, parsed_tx_hash, tx_prefix_hash)) {
-          rejected.push_back({tx_hash, "parse_failed", -1});
-          continue;
+          cryptonote::transaction base_tx;
+          if (!has_prunable_hash ||
+              !cryptonote::parse_and_validate_tx_base_from_blob(tx_blob,
+                                                                 base_tx) ||
+              base_tx.version <= 1) {
+            rejected.push_back({tx_hash, "parse_failed", -1});
+            continue;
+          }
+          try {
+            parsed_tx_hash = cryptonote::get_pruned_transaction_hash(
+                base_tx, prunable_hash);
+          } catch (...) {
+            rejected.push_back(
+                {tx_hash, "pruned_hash_failed", static_cast<int>(base_tx.type)});
+            continue;
+          }
+          tx = std::move(base_tx);
+          used_base_fallback = true;
         }
         if (parsed_tx_hash != tx_hash) {
           rejected.push_back({tx_hash, "hash_mismatch", static_cast<int>(tx.type)});
           continue;
         }
+        if (used_base_fallback) ++base_fallbacks;
 
         // Store PRUNED (drop bulletproofs/CLSAGs): every consumer needs only the prefix
         // (vin/vout/extra) + rct_signatures.txnFee, and the v5 wallet-cache persistence
@@ -6859,6 +6893,7 @@ public:
       std::ostringstream oss;
       oss << "{\"success\":true,\"parsed\":" << parsed
           << ",\"stored\":" << stored
+          << ",\"base_fallbacks\":" << base_fallbacks
           << ",\"runtime_full_tx_count\":" << m_wallet->m_runtime_full_txs.size()
           << ",\"stored_hashes\":[";
       for (size_t i = 0; i < stored_hashes.size(); ++i) {
